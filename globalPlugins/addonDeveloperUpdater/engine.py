@@ -7,11 +7,14 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
 RELEASES_URL = "https://api.github.com/repos/nvaccess/nvda/releases?per_page=30"
+RELEASES_FEED_URL = "https://github.com/nvaccess/nvda/releases.atom"
 TAG_PATTERN = re.compile(r"(?:release-)?(20\d{2})\.(\d+)(?:\.(\d+))?(?:(?:alpha|beta|rc)\d+)?", re.I)
 LAST_TESTED = re.compile(r"^(\s*lastTestedNVDAVersion\s*=\s*)([^\r\n#;]+)(.*)$", re.I | re.M)
 VALUE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.*)$", re.M)
@@ -19,6 +22,7 @@ PRUNE_NAMES = {
     "$recycle.bin", "system volume information", "windows", "program files", "program files (x86)",
     "programdata", "appdata", "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache",
     ".pytest_cache", "build", "dist", "outputs", "backups", ".nvdaaddonupdaterbackups",
+    "runtime tests",
 }
 
 
@@ -59,13 +63,39 @@ def parse_release(item: dict) -> Release | None:
 
 def latest_release(include_prereleases: bool = True) -> Release:
     request = urllib.request.Request(RELEASES_URL, headers={"Accept": "application/vnd.github+json", "User-Agent": "NVDA-Addon-Developer-Updater/0.1"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        items = json.load(response)
-    for item in items:
-        release = parse_release(item)
-        if release and (include_prereleases or not release.prerelease):
-            return release
-    raise RuntimeError("No matching NVDA release was returned.")
+    last_error = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                items = json.load(response)
+            for item in items:
+                release = parse_release(item)
+                if release and (include_prereleases or not release.prerelease):
+                    return release
+            raise RuntimeError("No matching NVDA release was returned by the API.")
+        except Exception as error:
+            last_error = error
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    try:
+        feed_request = urllib.request.Request(RELEASES_FEED_URL, headers={"User-Agent": "NVDA-Addon-Developer-Updater/0.1"})
+        with urllib.request.urlopen(feed_request, timeout=30) as response:
+            root = ET.parse(response).getroot()
+        namespace = {"atom": "http://www.w3.org/2005/Atom"}
+        for entry in root.findall("atom:entry", namespace):
+            title = entry.findtext("atom:title", default="", namespaces=namespace).strip()
+            link_node = entry.find("atom:link", namespace)
+            item = {
+                "tag_name": title,
+                "prerelease": bool(re.search(r"(?:alpha|beta|rc)\d*", title, re.I)),
+                "html_url": link_node.get("href", "") if link_node is not None else "",
+            }
+            release = parse_release(item)
+            if release and (include_prereleases or not release.prerelease):
+                return release
+    except Exception as feed_error:
+        raise RuntimeError(f"GitHub API and releases feed failed: {last_error}; {feed_error}") from feed_error
+    raise RuntimeError(f"No matching NVDA release was found; API error: {last_error}")
 
 
 def drive_roots() -> list[Path]:
@@ -102,6 +132,11 @@ def is_offline(path: Path) -> bool:
         return False
 
 
+def should_prune(name: str) -> bool:
+    lowered = name.lower()
+    return lowered in PRUNE_NAMES or lowered.startswith("nvda-addon-test-")
+
+
 def is_developer_manifest(path: Path) -> bool:
     if path.parent.name.lower() == "locale":
         return False
@@ -127,7 +162,7 @@ def discover_manifests(roots: list[Path], cancelled=lambda: False) -> list[Path]
                 if cancelled():
                     return sorted(found)
                 base = Path(directory)
-                dirnames[:] = [d for d in dirnames if d.lower() not in PRUNE_NAMES and not is_offline(base / d)]
+                dirnames[:] = [d for d in dirnames if not should_prune(d) and not is_offline(base / d)]
                 if "manifest.ini" in filenames:
                     manifest = base / "manifest.ini"
                     try:

@@ -31,6 +31,14 @@ class EngineTests(unittest.TestCase):
             path.write_text("name = demo\nlastTestedNVDAVersion = 2026.1\n", encoding="utf-8")
             self.assertEqual([], engine.discover_manifests([Path(folder)]))
 
+    def test_runtime_test_tree_is_ignored(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project = Path(folder) / "Runtime Tests" / "copy"
+            project.mkdir(parents=True)
+            (project / ".git").mkdir()
+            (project / "manifest.ini").write_text("name = demo\nlastTestedNVDAVersion = 2026.2\n", encoding="utf-8")
+            self.assertEqual([], engine.discover_manifests([Path(folder)]))
+
 
 if __name__ == "__main__":
     unittest.main()
