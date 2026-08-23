@@ -13,7 +13,8 @@ addonHandler.initTranslation()
 SCRIPT_CATEGORY = _("Add-on Developer Updater")
 config.conf.spec["addonDeveloperUpdater"] = {
     "automaticChecks": "boolean(default=True)",
-    "intervalMinutes": "integer(default=30,min=15,max=1440)",
+    # Accept legacy 5-minute values so startup can migrate them to the new 15-minute minimum.
+    "intervalMinutes": "integer(default=30,min=5,max=1440)",
     "includePrereleases": "boolean(default=True)",
     "automaticManifestUpdates": "boolean(default=False)",
     "scanFixedDrives": "boolean(default=False)",
