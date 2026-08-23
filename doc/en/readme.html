@@ -1,7 +1,7 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"><title>Add-on Developer Updater</title></head>
 <body><h1>Add-on Developer Updater</h1>
-<p>This add-on checks official NVDA releases and finds NVDA add-on development projects on accessible drives and in locally synchronized cloud folders.</p>
+<p>This add-on checks official NVDA releases and safely monitors approved NVDA add-on development projects in configured folders and locally synchronized cloud storage.</p>
 <h2>Commands</h2><p>Press NVDA+Alt+Shift+U to start a manual check. The command can be changed or removed under Add-on Developer Updater in NVDA's Input Gestures dialog. An unassigned cancel command is also available there.</p>
-<h2>Safety</h2><p>Only projects containing Git metadata or recognized NVDA build files are changed. Installed add-ons, packages, output folders, system folders, caches, translations, and cloud-only placeholders are ignored. Required metadata and Python syntax are validated first, and every changed manifest is backed up in the active NVDA configuration folder.</p>
-<h2>Settings</h2><p>Use NVDA Settings, Add-on Developer Updater to control automatic checks, prereleases, automatic changes, drive scanning, and the check interval.</p>
+<h2>Safety</h2><p>Automatic changes are disabled by default. A manual scan approves the projects it finds; projects first found by background discovery wait for manual approval. Only projects containing Git metadata or recognized NVDA build files are eligible. Installed add-ons, packages, output folders, system folders, caches, translations, runtime tests, and cloud-only placeholders are ignored. Required metadata and Python syntax are validated first. Every changed manifest receives a project-specific backup in the active NVDA configuration folder.</p>
+<h2>Settings</h2><p>Use NVDA Settings, Add-on Developer Updater to control automatic checks, prereleases, opt-in automatic changes, additional approved roots, full-drive manual discovery, release intervals, and periodic rescanning.</p>
 </body></html>
