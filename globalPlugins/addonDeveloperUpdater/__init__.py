@@ -52,7 +52,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         except ValueError: pass
         super().terminate()
     @scriptHandler.script(description=_("Check approved NVDA add-on projects for compatibility updates"), gesture="kb:NVDA+alt+shift+u", category=SCRIPT_CATEGORY)
-    def script_checkAddonProjects(self, gesture): self._startCheck(manual=True, full_system=False)
+    def script_checkAddonProjects(self, gesture): self._startCheck(manual=True, full_system=bool(config.conf["addonDeveloperUpdater"]["scanFixedDrives"]))
     @scriptHandler.script(description=_("Discover NVDA add-on projects across all accessible drives"), category=SCRIPT_CATEGORY)
     def script_discoverAddonProjects(self, gesture): self._startCheck(manual=True, full_system=True)
     @scriptHandler.script(description=_("Cancel the running add-on developer update scan"), category=SCRIPT_CATEGORY)
@@ -69,7 +69,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _roots(self, full_system=False):
         settings = config.conf["addonDeveloperUpdater"]; roots = list(engine.default_development_roots())
         roots.extend(Path(value.strip()).expanduser() for value in settings["scanRoots"].split(";") if value.strip())
-        if full_system or settings["scanFixedDrives"]: roots.extend(engine.drive_roots())
+        if full_system: roots.extend(engine.drive_roots())
         unique = {}
         for root in roots:
             try:
