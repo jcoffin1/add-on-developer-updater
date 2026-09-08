@@ -647,13 +647,18 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             storedPaths = [str(path) for path in engine.approved_manifest_paths(state)]
             request = {"mode": self._workerMode(manual, state, settings["periodicRescanHours"]), "includePrereleases": bool(settings["includePrereleases"]), "fullSystem": bool(full_system), "roots": self._rootStrings(), "manifestPaths": storedPaths}
             engine.atomic_json_write(requestPath, request)
-            command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(Path(__file__).with_name("worker.ps1")), "-RequestPath", str(requestPath), "-OutputPath", str(outputPath)]
+            workerPath = Path(__file__).with_name("worker.ps1")
+            if not workerPath.is_file(): raise RuntimeError("The external scan worker is missing. Reinstall Add-on Developer Updater.")
+            command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(workerPath), "-RequestPath", str(requestPath), "-OutputPath", str(outputPath)]
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
             self._workerProcess = subprocess.Popen(command, creationflags=flags)
             returnCode = self._workerProcess.wait(); self._workerProcess = None
             workerResult = engine.read_json(outputPath, {})
             if cancelled(): wx.CallAfter(ui.message, _("Add-on developer scan cancelled. No completion state was saved.")); return
-            if returnCode or not workerResult.get("ok"): raise RuntimeError(workerResult.get("error") or f"External worker exited with code {returnCode}")
+            if returnCode or not workerResult.get("ok"):
+                detail = workerResult.get("error")
+                if not detail: detail = f"External worker stopped before returning details (Windows status 0x{returnCode & 0xFFFFFFFF:08X})"
+                raise RuntimeError(detail)
             release = engine.Release(str(workerResult["releaseTag"]), str(workerResult["manifestVersion"]), bool(workerResult.get("prerelease")), str(workerResult.get("releaseUrl", "")))
             if not manual and state.get("releaseTag") == release.tag and not self._rescanDue(state, settings["periodicRescanHours"]): return
             manifests = [Path(path) for path in workerResult.get("manifests", []) if isinstance(path, str)]

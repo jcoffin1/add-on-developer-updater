@@ -112,4 +112,16 @@ class EngineTests(unittest.TestCase):
         )
         self.assertEqual(list(report.store_guideline_issues), publisher.store_readiness_reasons(report))
 
+    def test_external_scan_worker_is_present_and_packaged(self):
+        root = Path(__file__).parent
+        worker = root / "globalPlugins" / "addonDeveloperUpdater" / "worker.ps1"
+        self.assertTrue(worker.is_file())
+        plugin = (worker.parent / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn('if not workerPath.is_file()', plugin)
+        item = {"name": "addonDeveloperUpdater", "version": "2026.2.24", "manifest": str(root / "manifest.ini")}
+        with tempfile.TemporaryDirectory() as folder:
+            package = publisher.build_package(item, Path(folder))
+            with zipfile.ZipFile(package) as archive:
+                self.assertIn("globalPlugins/addonDeveloperUpdater/worker.ps1", archive.namelist())
+
 if __name__ == "__main__": unittest.main()
