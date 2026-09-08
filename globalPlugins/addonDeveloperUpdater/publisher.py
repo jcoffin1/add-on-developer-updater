@@ -8,13 +8,16 @@ STORE_FORM = "https://github.com/nvaccess/addon-datastore/issues/new?template=re
 STORE_PUBLISHER = "Justin Coffin"
 GITHUB_DEVICE_URL = "https://github.com/login/device"
 NVDA_API_VERSIONS_URL = "https://raw.githubusercontent.com/nvaccess/addon-datastore/master/transform/nvdaAPIVersions.json"
-RUNTIME_NAMES = {"appmodules", "brailledisplaydrivers", "doc", "globalplugins", "installtasks.py", "locale", "manifest.ini", "synthdrivers"}
+RUNTIME_NAMES = {"appmodules", "brailledisplaydrivers", "copying.txt", "doc", "globalplugins", "installtasks.py", "license.txt", "locale", "manifest.ini", "synthdrivers"}
 SENSITIVE_NAMES = {".env", "credentials.json", "id_dsa", "id_ed25519", "id_rsa", "secrets.json"}
 SENSITIVE_SUFFIXES = {".key", ".p12", ".pem", ".pfx"}
+GENERATED_DIRECTORIES = {"__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "build-local", "dist", "outputs"}
+GENERATED_SUFFIXES = {".pyc", ".pyo"}
 _AI_DISCLOSURE_PATTERNS = (
+    re.compile(r"\b" + "A" + "I" + r"\b", re.I),
     re.compile(r"\bAI(?:[- ]generated|[- ]written|[- ]authored)\b", re.I),
-    re.compile(r"\b(?:generated|written|authored|created)\s+(?:by|with|using)\s+(?:an?\s+)?(?:AI|ChatGPT|OpenAI|Codex|Copilot)\b", re.I),
-    re.compile(r"\b(?:" + "AI" + r" agent|artificial " + "intelligence" + r"|large language " + "model" + r"|LLM-" + "generated" + r")\b", re.I),
+    re.compile(r"\b(?:generated|written|authored|created)\s+(?:by|with|using)\s+(?:an?\s+)?(?:" + "A" + "I" + r"|ChatGPT|OpenAI|Codex|Copilot)\b", re.I),
+    re.compile(r"\b(?:" + "A" + "I" + r" agent|artificial " + "intelligence" + r"|large language " + "model" + r"|LLM-" + "generated" + r")\b", re.I),
     re.compile(r"^\s*co-authored-by:.*(?:ChatGPT|OpenAI|Codex|Copilot)", re.I),
 )
 
@@ -80,7 +83,7 @@ def _manifest_guideline_issues(fields: dict, api_versions: dict, submission_chan
     return issues
 
 def _ai_disclosure_issues(archive: zipfile.ZipFile) -> list[str]:
-    """Inspect every text file shipped to users for AI-authorship disclosure wording."""
+    """Inspect every text file shipped to users for automated-authorship disclosure wording."""
     findings = []
     text_suffixes = {".py", ".pyw", ".ini", ".md", ".txt", ".html", ".htm", ".json", ".yaml", ".yml", ".po", ".pot"}
     for info in archive.infolist():
@@ -89,8 +92,61 @@ def _ai_disclosure_issues(archive: zipfile.ZipFile) -> list[str]:
         except (UnicodeError, OSError, RuntimeError): continue
         for line_number, line in enumerate(text.splitlines(), 1):
             if any(pattern.search(line) for pattern in _AI_DISCLOSURE_PATTERNS):
-                findings.append(f"AI-related authorship wording in release package: {info.filename}, line {line_number}")
+                findings.append(f"Automated-authorship wording in release package: {info.filename}, line {line_number}")
                 if len(findings) >= 20: return findings
+    return findings
+
+def _source_disclosure_issues(root: Path, has_git: bool) -> list[str]:
+    """Inspect source files that would be published, including repository-only files."""
+    text_suffixes = {".py", ".pyw", ".ps1", ".ini", ".md", ".txt", ".html", ".htm", ".json", ".yaml", ".yml", ".po", ".pot"}
+    if has_git:
+        relative_names = [name for name in _git(root, "ls-files", "-co", "--exclude-standard", "-z").split("\0") if name]
+        paths = [root / name for name in relative_names]
+    else:
+        paths = [path for path in root.rglob("*") if path.is_file()]
+    findings = []
+    for path in paths:
+        try:
+            if path.suffix.casefold() not in text_suffixes or path.stat().st_size > 2 * 1024 * 1024: continue
+            text = path.read_text(encoding="utf-8-sig")
+            relative = path.relative_to(root).as_posix()
+        except (OSError, UnicodeError, ValueError): continue
+        # Test data and the validator implementation necessarily spell out the
+        # phrases being rejected.  They are controls, not authorship claims.
+        # The shipped-package audit still checks every user-facing text file.
+        parts = Path(relative).parts
+        if (parts and parts[0].casefold() in {"test", "tests"}) or relative.casefold().endswith("tools/addon_store_metadata.py"):
+            continue
+        for line_number, line in enumerate(text.splitlines(), 1):
+            if any(pattern.search(line) for pattern in _AI_DISCLOSURE_PATTERNS):
+                findings.append(f"Automated-authorship wording in source: {relative}, line {line_number}")
+                if len(findings) >= 20: return findings
+    return findings
+
+def _public_text_disclosure_issues(text: str, context: str) -> list[str]:
+    findings = []
+    for line_number, line in enumerate((text or "").splitlines(), 1):
+        if any(pattern.search(line) for pattern in _AI_DISCLOSURE_PATTERNS):
+            findings.append(f"Automated-authorship wording in {context}, line {line_number}")
+    return findings
+
+def _github_disclosure_issues(gh: str, remote: str, release_tag: str) -> list[str]:
+    """Audit public submission-related GitHub text before opening the Store form."""
+    repository = _remote_web_url(remote)
+    findings = []
+    details = json.loads(_run([gh, "repo", "view", repository, "--json", "description"]) or "{}")
+    findings.extend(_public_text_disclosure_issues(details.get("description", ""), "GitHub repository description"))
+    if release_tag:
+        release = json.loads(_run([gh, "release", "view", release_tag, "--repo", repository, "--json", "name,body"]) or "{}")
+        findings.extend(_public_text_disclosure_issues(release.get("name", ""), f"GitHub Release {release_tag} title"))
+        findings.extend(_public_text_disclosure_issues(release.get("body", ""), f"GitHub Release {release_tag} notes"))
+    pull_requests = json.loads(_run([gh, "pr", "list", "--repo", repository, "--state", "all", "--limit", "1000", "--json", "number,title,body"]) or "[]")
+    for pull_request in pull_requests:
+        number = pull_request.get("number", "unknown")
+        findings.extend(_public_text_disclosure_issues(pull_request.get("title", ""), f"GitHub pull request {number} title"))
+        findings.extend(_public_text_disclosure_issues(pull_request.get("body", ""), f"GitHub pull request {number} description"))
+        if len(findings) >= 20:
+            return findings[:20]
     return findings
 
 def _api_versions() -> dict:
@@ -168,6 +224,27 @@ def project_root(manifest: Path) -> Path:
 def _git(root: Path, *arguments: str) -> str:
     return _run(["git", "-C", str(root), *arguments])
 
+def _repository_remotes(root: Path) -> dict[str, str]:
+    remotes = {}
+    for name in filter(None, _git(root, "remote").splitlines()):
+        try:
+            remotes[name.strip()] = _git(root, "remote", "get-url", name.strip())
+        except RuntimeError:
+            continue
+    return remotes
+
+def _select_publish_remote(remotes: dict[str, str], authenticated_owner: str) -> tuple[str, str]:
+    """Prefer a repository owned by the signed-in user, even when it is named fork."""
+    for name, url in remotes.items():
+        try:
+            if repository_owner(url).casefold() == authenticated_owner.casefold():
+                return name, url
+        except RuntimeError:
+            continue
+    if "origin" in remotes:
+        return "origin", remotes["origin"]
+    return next(iter(remotes.items()), ("", ""))
+
 def _sensitive_files(root: Path) -> list[str]:
     names = _git(root, "ls-files", "-co", "--exclude-standard", "-z").split("\0")
     unsafe = []
@@ -176,6 +253,14 @@ def _sensitive_files(root: Path) -> list[str]:
         if lower in SENSITIVE_NAMES or path.suffix.lower() in SENSITIVE_SUFFIXES or lower.startswith(".env."):
             unsafe.append(relative)
     return unsafe
+
+def _is_generated_path(relative: str) -> bool:
+    path = Path(relative)
+    return path.suffix.casefold() in GENERATED_SUFFIXES or any(part.casefold() in GENERATED_DIRECTORIES for part in path.parts)
+
+def _publishable_paths(root: Path) -> list[str]:
+    names = _git(root, "ls-files", "-m", "-d", "-o", "--exclude-standard", "-z").split("\0")
+    return [name for name in filter(None, names) if not _is_generated_path(name)]
 
 def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo]:
     gh = gh_path()
@@ -199,8 +284,8 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
         if unsafe: raise RuntimeError(f"{project.name} contains files that may hold credentials: {', '.join(unsafe[:5])}")
         metadata = values_reader(manifest)
         remote = ""
-        try: remote = _git(root, "remote", "get-url", "origin") if has_git else ""
-        except RuntimeError: pass
+        if has_git:
+            _remote_name, remote = _select_publish_remote(_repository_remotes(root), authenticated_owner)
         if not remote: remote = _manifest_github_remote(metadata)
         if not remote:
             try: remote = _run([gh, "repo", "view", _repository_name(project.name), "--json", "url", "--jq", ".url"])
@@ -215,7 +300,7 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
                 assets = _run([gh, "release", "view", github_release, "--repo", _remote_web_url(remote), "--json", "assets", "--jq", '.assets[] | select(.name | endswith(".nvda-addon")) | .url'])
                 release_download = next((line.strip() for line in assets.splitlines() if line.strip()), "")
         else: github_release = ""
-        changed = len([line for line in _git(root, "status", "--porcelain=v1").splitlines() if line]) if has_git else len(names)
+        changed = len(_publishable_paths(root)) if has_git else len(names)
         unpushed = 0
         if has_git and remote:
             try: unpushed = int(_git(root, "rev-list", "--count", "@{upstream}..HEAD") or "0")
@@ -234,8 +319,12 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
         api_details = api_versions.get(metadata.get("lasttestednvdaversion", ""), {})
         version_lower = metadata.get("version", "").casefold()
         channel = "dev" if api_details.get("experimental") or "alpha" in version_lower or "dev" in version_lower else "beta" if "beta" in version_lower or "rc" in version_lower else "stable"
-        guideline_issues = ()
-        if release_download and owned: package_verified, package_error, guideline_issues = verify_release_package(release_download, metadata.get("name", project.name), metadata.get("version", ""), api_versions, channel)
+        guideline_issues = tuple(_source_disclosure_issues(root, has_git))
+        if remote and owned:
+            guideline_issues += tuple(_github_disclosure_issues(gh, remote, github_release))
+        if release_download and owned:
+            package_verified, package_error, package_issues = verify_release_package(release_download, metadata.get("name", project.name), metadata.get("version", ""), api_versions, channel)
+            guideline_issues += package_issues
         reports.append(ProjectPublishInfo(project.project_id, project.name, str(manifest), str(root), metadata.get("version", ""), metadata.get("summary", project.name), metadata.get("author", ""), remote, changed, has_git, unpushed, normalized_version(github_release), release_download, owned, package_verified, package_error, guideline_issues, channel))
     return reports
 
@@ -286,10 +375,19 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
         if not report.has_git:
             if progress: progress(f"Creating local Git repository for {report.name}")
             _run(["git", "init", "-b", "main"], root)
+        push_remote = ""
         if report.remote:
-            try: _git(root, "remote", "get-url", "origin")
-            except RuntimeError: _git(root, "remote", "add", "origin", report.remote)
-        _git(root, "add", "--all")
+            remotes = _repository_remotes(root)
+            push_remote = next((name for name, url in remotes.items() if _remote_web_url(url).casefold() == _remote_web_url(report.remote).casefold()), "")
+            if not push_remote:
+                push_remote = "publisher"
+                suffix = 2
+                while push_remote in remotes:
+                    push_remote = f"publisher{suffix}"; suffix += 1
+                _git(root, "remote", "add", push_remote, report.remote)
+        publishable_paths = _publishable_paths(root)
+        if publishable_paths:
+            _git(root, "add", "--all", "--", *publishable_paths)
         staged = subprocess.run(["git", "-C", str(root), "diff", "--cached", "--quiet"], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode != 0
         if staged:
             if progress: progress(f"Committing changes for {report.name}")
@@ -300,13 +398,15 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
             repository = _repository_name(report.name)
             try:
                 existing = _run([gh, "repo", "view", repository, "--json", "url", "--jq", ".url"])
-                _git(root, "remote", "add", "origin", existing + ".git")
+                push_remote = "origin"
+                _git(root, "remote", "add", push_remote, existing + ".git")
             except RuntimeError:
                 _run([gh, "repo", "create", repository, "--public", "--source", str(root), "--remote", "origin", "--description", report.summary])
-            remote = _git(root, "remote", "get-url", "origin")
+                push_remote = "origin"
+            remote = _git(root, "remote", "get-url", push_remote)
         branch = _git(root, "branch", "--show-current") or "main"
         if progress: progress(f"Pushing {report.name} to GitHub")
-        _git(root, "push", "--set-upstream", "origin", branch)
+        _git(root, "push", "--set-upstream", push_remote, branch)
         # Releases must target the commit we actually pushed.  GitHub otherwise
         # defaults to the repository's default branch, which may be unrelated.
         target_commit = _git(root, "rev-parse", "HEAD")
@@ -337,17 +437,67 @@ def build_package(item: dict, output_folder: Path) -> Path:
         if "manifest.ini" not in archive.namelist(): raise RuntimeError(f"Package for {item['name']} has no root manifest.ini")
     return output
 
+def build_release_package(item: dict, output_folder: Path) -> Path:
+    """Use a project's audited builder when it supplies one; otherwise use the safe generic builder."""
+    source = _package_source(Path(item["manifest"]))
+    build_script = source / "build.ps1"
+    if not build_script.is_file():
+        return build_package(item, output_folder)
+    shell = shutil.which("pwsh") or shutil.which("powershell")
+    if not shell:
+        raise RuntimeError(f"PowerShell is required to run the project builder for {item['name']}")
+    outputs = source / "outputs"
+    previous = {
+        path.resolve(): (path.stat().st_mtime_ns, path.stat().st_size)
+        for path in outputs.glob("*.nvda-addon")
+    } if outputs.is_dir() else {}
+    _run([shell, "-NoProfile", "-File", str(build_script), "-Version", str(item["version"])], cwd=source)
+    candidates = [
+        path for path in outputs.glob("*.nvda-addon")
+        if str(item["version"]).casefold() in path.name.casefold()
+        and previous.get(path.resolve()) != (path.stat().st_mtime_ns, path.stat().st_size)
+    ]
+    if not candidates:
+        raise RuntimeError(f"The project builder for {item['name']} produced no package for version {item['version']}")
+    package = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    destination = output_folder / package.name
+    if package.resolve() != destination.resolve():
+        shutil.copy2(package, destination)
+    return destination
+
+def validate_publish_builds(reports: list[ProjectPublishInfo], progress=None) -> None:
+    """Prove releasable projects build successfully before changing GitHub."""
+    pending = [report for report in reports if release_needed(report.version, report.github_release_version)]
+    for index, report in enumerate(pending, 1):
+        if progress:
+            progress(f"Validating release build for {report.name}, project {index} of {len(pending)}")
+        root = Path(report.root)
+        build_release_package(report.__dict__, root / "outputs")
+
+def release_create_arguments(gh: str, tag: str, package: Path, repository: str, target: str, release_name: str, prerelease: bool = False) -> list[str]:
+    # Preflight compares the local version with the latest GitHub release, and
+    # GitHub rejects duplicate tags.  Do not use --fail-on-no-commits here: gh
+    # can falsely report no commits when --target is a SHA from a non-default
+    # branch, and a version-only/package-only release is valid in any event.
+    # Use fixed factual text. GitHub-generated notes can import unreviewed commit
+    # messages into a public release after the submission audit has completed.
+    arguments = [gh, "release", "create", tag, str(package), "--repo", repository, "--target", target, "--title", f"{release_name} {tag.removeprefix('v')}", "--notes", f"Release package for {release_name} {tag.removeprefix('v')}." ]
+    if prerelease:
+        arguments.append("--prerelease")
+    return arguments
+
 def release(items: list[dict], output_folder: Path, progress=None, on_released=None) -> list[dict]:
     gh = gh_path(); released = []
     for index, item in enumerate(items, 1):
         if progress: progress(f"Packaging {item['name']}, release {index} of {len(items)}")
-        package = build_package(item, output_folder); tag = f"v{item['version']}"
+        package = build_release_package(item, output_folder); tag = f"v{item['version']}"
         repository = item["sourceUrl"].removeprefix("https://github.com/")
         target = str(item.get("targetCommitish", "")).strip()
         if not target: raise RuntimeError(f"No pushed commit was recorded for {item['name']}; release creation was stopped")
-        arguments = [gh, "release", "create", tag, str(package), "--repo", repository, "--target", target, "--generate-notes", "--fail-on-no-commits"]
         version = item["version"].lower()
-        if item.get("channel") in {"beta", "dev"} or any(stage in version for stage in ("alpha", "beta", "dev", "rc")): arguments.append("--prerelease")
+        prerelease = item.get("channel") in {"beta", "dev"} or any(stage in version for stage in ("alpha", "beta", "dev", "rc"))
+        arguments = release_create_arguments(gh, tag, package, repository, target, item.get("summary") or item["name"], prerelease)
         if progress: progress(f"Uploading GitHub Release {tag} for {item['name']}")
         _run(arguments)
         download = f"{item['sourceUrl']}/releases/download/{urllib.parse.quote(tag)}/{urllib.parse.quote(package.name)}"

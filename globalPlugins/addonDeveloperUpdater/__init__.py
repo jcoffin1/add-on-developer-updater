@@ -352,7 +352,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._showGitHubResult(_("No add-ons are ready for store submission. Reasons: %s. Press OK to exit.") % "; ".join(blocked)); return
         names = self._limitedDetails([entry[1] for entry in eligible], lambda item: publisher.repository_name(item["sourceUrl"]))
         blockedText = _(" Add-ons not ready: %s.") % "; ".join(blocked) if blocked else ""
-        message = _("Verified ready for store submission: %s.%s Submit the ready add-ons to the NVDA Add-on Store now? Select Yes to open only their prefilled submission forms, or No to exit without opening the store.") % (names, blockedText)
+        message = _("Verified ready for store submission: %s.%s Select Yes to open only their prefilled submission forms. Review every field and submit each form manually; the updater never submits a store issue or pull request. Select No to exit without opening the store.") % (names, blockedText)
         def submit():
             results = [engine.ProjectResult(report.project_id, report.name, report.manifest, "GitHub release verified") for report, _item in eligible]
             urls = [publisher.store_url(item) for _report, item in eligible]
@@ -581,6 +581,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _githubPush(self, reports):
         callback = None; arguments = ()
         try:
+            publisher.validate_publish_builds(reports, self._githubProgress)
             published = publisher.push(reports, self._githubProgress); callback, arguments = self._offerGitHubRelease, (published,)
         except Exception as error:
             log.exception("GitHub publishing failed"); callback, arguments = self._showGitHubResult, (_("GitHub publishing failed: %s. Press OK to exit.") % error,)
