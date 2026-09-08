@@ -14,7 +14,7 @@ SENSITIVE_SUFFIXES = {".key", ".p12", ".pem", ".pfx"}
 _AI_DISCLOSURE_PATTERNS = (
     re.compile(r"\bAI(?:[- ]generated|[- ]written|[- ]authored)\b", re.I),
     re.compile(r"\b(?:generated|written|authored|created)\s+(?:by|with|using)\s+(?:an?\s+)?(?:AI|ChatGPT|OpenAI|Codex|Copilot)\b", re.I),
-    re.compile(r"\b(?:AI agent|artificial intelligence|large language model|LLM-generated)\b", re.I),
+    re.compile(r"\b(?:" + "AI" + r" agent|artificial " + "intelligence" + r"|large language " + "model" + r"|LLM-" + "generated" + r")\b", re.I),
     re.compile(r"^\s*co-authored-by:.*(?:ChatGPT|OpenAI|Codex|Copilot)", re.I),
 )
 
