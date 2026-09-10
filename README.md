@@ -17,6 +17,7 @@ Add-on Developer Updater helps NVDA add-on developers discover development proje
 - `NVDA+Alt+Shift+U`: check for NVDA compatibility updates.
 - `NVDA+Alt+Shift+D`: downgrade selected compatibility declarations.
 - `NVDA+Alt+G` or `NVDA+Alt+Shift+G`: select projects to publish to GitHub.
+- `NVDA+Alt+Shift+F`: select an add-on repository from the signed-in GitHub account and copy its URL.
 - `NVDA+Alt+Shift+S`: select projects for Add-on Store readiness review.
 
 Additional commands can be assigned in NVDA's Input Gestures dialog under **Add-on Developer Updater**.
@@ -26,6 +27,8 @@ Additional commands can be assigned in NVDA's Input Gestures dialog under **Add-
 - NVDA 2025.1 or later.
 - Windows PowerShell for isolated compatibility discovery.
 - Git and GitHub CLI for optional GitHub publishing features.
+
+The repository URL command recognizes common NVDA add-on layouts, including root, `addon`, `nvda`, and `src` manifests as well as template-based add-on projects. GitHub queries run on a worker thread, and public, private, and archived repositories are clearly identified in the selection list.
 
 ## License
 

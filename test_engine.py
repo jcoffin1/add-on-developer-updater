@@ -205,13 +205,15 @@ class EngineTests(unittest.TestCase):
                 outputs.mkdir()
                 (outputs / "public-name-1.0.nvda-addon").write_bytes(b"audited")
                 return ""
-            with mock.patch.object(publisher.shutil, "which", return_value="pwsh"), mock.patch.object(publisher, "_run", side_effect=run_builder):
+            with mock.patch.object(publisher.shutil, "which", return_value="pwsh"), mock.patch.object(publisher, "_run", side_effect=run_builder) as run:
                 package = publisher.build_release_package(
                     {"name": "demo", "version": "1.0", "manifest": str(manifest)},
                     Path(folder) / "packages",
                 )
             self.assertEqual("public-name-1.0.nvda-addon", package.name)
             self.assertEqual(b"audited", package.read_bytes())
+            self.assertIn("-ExecutionPolicy", run.call_args.args[0])
+            self.assertIn("Bypass", run.call_args.args[0])
 
     def test_project_builder_cannot_reuse_a_stale_package(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -276,5 +278,40 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(publisher._is_generated_path("outputs/demo.nvda-addon"))
         self.assertFalse(publisher._is_generated_path("synthDrivers/bestspeech.py"))
         self.assertFalse(publisher._is_generated_path("docs/building.md"))
+
+    def test_github_addon_repository_lookup_filters_and_paginates(self):
+        first_page = {
+            "data": {"viewer": {"login": "jcoffin1", "repositories": {
+                "nodes": [
+                    {"name": "demo", "nameWithOwner": "jcoffin1/demo", "url": "https://github.com/jcoffin1/demo", "description": "Demo add-on", "isPrivate": False, "isArchived": False, "manifest": {"__typename": "Blob"}},
+                    {"name": "ordinary", "nameWithOwner": "jcoffin1/ordinary", "url": "https://github.com/jcoffin1/ordinary", "description": "Not an add-on", "isPrivate": False, "isArchived": False},
+                ],
+                "pageInfo": {"hasNextPage": True, "endCursor": "next-page"},
+            }}},
+        }
+        second_page = {
+            "data": {"viewer": {"login": "jcoffin1", "repositories": {
+                "nodes": [
+                    {"name": "template-addon", "nameWithOwner": "jcoffin1/template-addon", "url": "https://github.com/jcoffin1/template-addon", "description": "Template project", "isPrivate": True, "isArchived": False, "buildVariables": {"__typename": "Blob"}},
+                ],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }}},
+        }
+        responses = iter(("authenticated", json.dumps(first_page), json.dumps(second_page)))
+        with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "_run", side_effect=lambda *_args, **_kwargs: next(responses)) as run:
+            owner, repositories = publisher.github_addon_repositories()
+        self.assertEqual("jcoffin1", owner)
+        self.assertEqual(["jcoffin1/demo", "jcoffin1/template-addon"], [repository.full_name for repository in repositories])
+        self.assertTrue(repositories[1].private)
+        self.assertIn("endCursor=next-page", run.call_args_list[-1].args[0])
+
+    def test_github_addon_repository_lookup_reports_missing_authentication(self):
+        with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "_run", side_effect=RuntimeError("gh failed: not logged into any GitHub hosts")):
+            with self.assertRaises(publisher.AuthenticationRequired): publisher.github_addon_repositories()
+
+    def test_repository_url_gesture_and_clipboard_action_are_present(self):
+        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn('gesture="kb:NVDA+alt+shift+f"', plugin)
+        self.assertIn("api.copyToClip(repository.url)", plugin)
 
 if __name__ == "__main__": unittest.main()

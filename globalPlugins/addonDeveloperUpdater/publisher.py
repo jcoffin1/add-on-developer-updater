@@ -45,6 +45,42 @@ class ProjectPublishInfo:
     store_guideline_issues: tuple[str, ...] = ()
     channel: str = ""
 
+@dataclass(frozen=True)
+class GitHubAddonRepository:
+    name: str
+    full_name: str
+    url: str
+    description: str = ""
+    private: bool = False
+    archived: bool = False
+
+_ADDON_REPOSITORIES_QUERY = r"""
+query($endCursor: String) {
+  viewer {
+    login
+    repositories(first: 100, after: $endCursor, ownerAffiliations: OWNER, orderBy: {field: NAME, direction: ASC}) {
+      nodes {
+        name
+        nameWithOwner
+        url
+        description
+        isPrivate
+        isArchived
+        manifest: object(expression: "HEAD:manifest.ini") { __typename }
+        addonManifest: object(expression: "HEAD:addon/manifest.ini") { __typename }
+        nvdaManifest: object(expression: "HEAD:nvda/manifest.ini") { __typename }
+        sourceManifest: object(expression: "HEAD:src/manifest.ini") { __typename }
+        manifestTemplate: object(expression: "HEAD:manifest.ini.tpl") { __typename }
+        addonManifestTemplate: object(expression: "HEAD:addon/manifest.ini.tpl") { __typename }
+        buildVariables: object(expression: "HEAD:buildVars.py") { __typename }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+_ADDON_REPOSITORY_MARKERS = ("manifest", "addonManifest", "nvdaManifest", "sourceManifest", "manifestTemplate", "addonManifestTemplate", "buildVariables")
+
 def store_readiness_reasons(report: ProjectPublishInfo) -> list[str]:
     """Explain every condition that prevents this local project being submitted."""
     reasons = []
@@ -215,6 +251,50 @@ def gh_path() -> str:
     candidate = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "GitHub CLI" / "gh.exe"
     if candidate.is_file(): return str(candidate)
     raise RuntimeError("GitHub CLI is not installed")
+
+def github_addon_repositories(progress=None) -> tuple[str, list[GitHubAddonRepository]]:
+    """List repositories owned by the active GitHub user that contain NVDA add-on project markers."""
+    gh = gh_path()
+    if progress: progress("Checking GitHub sign-in status")
+    try: _run([gh, "auth", "status", "--active", "--hostname", "github.com"])
+    except RuntimeError as error:
+        if "not logged" in str(error).casefold(): raise AuthenticationRequired("GitHub CLI is not signed in for NVDA") from error
+        raise
+    repositories = []
+    owner = ""
+    cursor = ""
+    seen_cursors = set()
+    page = 0
+    while True:
+        page += 1
+        if progress: progress(f"Loading NVDA add-on repositories from GitHub, page {page}")
+        arguments = [gh, "api", "graphql", "-f", f"query={_ADDON_REPOSITORIES_QUERY}"]
+        if cursor: arguments.extend(["-F", f"endCursor={cursor}"])
+        payload = json.loads(_run(arguments))
+        errors = payload.get("errors") or []
+        if errors:
+            details = "; ".join(str(error.get("message") or error) for error in errors if isinstance(error, dict))
+            raise RuntimeError(f"GitHub repository query failed: {details or 'unknown GraphQL error'}")
+        viewer = payload.get("data", {}).get("viewer", {})
+        if not isinstance(viewer, dict): raise RuntimeError("GitHub did not return the signed-in account")
+        owner = str(viewer.get("login") or owner)
+        connection = viewer.get("repositories") or {}
+        for repository in connection.get("nodes") or []:
+            if not isinstance(repository, dict) or not any(repository.get(marker) for marker in _ADDON_REPOSITORY_MARKERS): continue
+            url = str(repository.get("url") or "").strip()
+            full_name = str(repository.get("nameWithOwner") or "").strip()
+            if not url.startswith("https://github.com/") or not full_name: continue
+            repositories.append(GitHubAddonRepository(
+                str(repository.get("name") or full_name.rsplit("/", 1)[-1]), full_name, url,
+                str(repository.get("description") or "").strip(), bool(repository.get("isPrivate")), bool(repository.get("isArchived")),
+            ))
+        page_info = connection.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"): break
+        cursor = str(page_info.get("endCursor") or "")
+        if not cursor or cursor in seen_cursors: raise RuntimeError("GitHub repository pagination did not provide a new continuation cursor")
+        seen_cursors.add(cursor)
+    unique = {repository.full_name.casefold(): repository for repository in repositories}
+    return owner, sorted(unique.values(), key=lambda repository: repository.full_name.casefold())
 
 def project_root(manifest: Path) -> Path:
     for candidate in (manifest.parent, *manifest.parents):
@@ -451,7 +531,7 @@ def build_release_package(item: dict, output_folder: Path) -> Path:
         path.resolve(): (path.stat().st_mtime_ns, path.stat().st_size)
         for path in outputs.glob("*.nvda-addon")
     } if outputs.is_dir() else {}
-    _run([shell, "-NoProfile", "-File", str(build_script), "-Version", str(item["version"])], cwd=source)
+    _run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(build_script), "-Version", str(item["version"])], cwd=source)
     candidates = [
         path for path in outputs.glob("*.nvda-addon")
         if str(item["version"]).casefold() in path.name.casefold()

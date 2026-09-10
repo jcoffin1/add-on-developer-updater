@@ -4,7 +4,7 @@ import os, subprocess, threading, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import addonHandler, config, globalPluginHandler, globalVars, gui, scriptHandler, ui, wx
+import addonHandler, api, config, globalPluginHandler, globalVars, gui, scriptHandler, ui, wx
 from gui.nvdaControls import CustomCheckListBox
 from gui.settingsDialogs import SettingsPanel
 from logHandler import log
@@ -105,6 +105,34 @@ class StoreSubmissionDialog(GitHubPublishDialog):
         self.allSelectedMessage = _("All store-submission projects selected")
         self.publishButton.SetLabel(_("&Check selected"))
 
+class GitHubRepositoryUrlDialog(wx.Dialog):
+    def __init__(self, parent, owner, repositories):
+        super().__init__(parent, title=_("Copy an NVDA add-on repository URL"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.repositories = repositories; self.onCopy = None; mainSizer = wx.BoxSizer(wx.VERTICAL)
+        mainSizer.Add(wx.StaticText(self, label=_("Select an NVDA add-on repository owned by %s, then choose Copy URL. Press Enter to copy or Escape to close.") % owner), 0, wx.ALL, 10)
+        choices = []
+        for repository in repositories:
+            status = _("private") if repository.private else _("public")
+            if repository.archived: status += _(", archived")
+            description = repository.description or _("no description")
+            choices.append(_("%s; %s; %s; %s") % (repository.full_name, status, description, repository.url))
+        self.repositoryList = wx.ListBox(self, choices=choices, style=wx.LB_SINGLE)
+        if choices: self.repositoryList.SetSelection(0)
+        mainSizer.Add(self.repositoryList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        buttons = wx.BoxSizer(wx.HORIZONTAL); self.copyButton = wx.Button(self, label=_("&Copy URL")); self.closeButton = wx.Button(self, label=_("&Close")); self.copyButton.SetDefault()
+        buttons.Add(self.copyButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
+        self.SetSizer(mainSizer); self.SetMinSize((650, 320)); self.SetSize((850, 480)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
+    def selectedRepository(self):
+        index = self.repositoryList.GetSelection()
+        return self.repositories[index] if index != wx.NOT_FOUND else None
+    def _onKey(self, event):
+        key = event.GetKeyCode()
+        if key == wx.WXK_ESCAPE: self.Close(); return
+        if self.repositoryList.HasFocus() and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if self.onCopy is not None: self.onCopy()
+            return
+        event.Skip()
+
 class DowngradeDialog(GitHubPublishDialog):
     def __init__(self, parent, results):
         wx.Dialog.__init__(self, parent, title=_("Downgrade add-on compatibility versions"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
@@ -143,7 +171,7 @@ class OperationProgressDialog(wx.Dialog):
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     activeInstance = None
     def __init__(self):
-        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._reviewDialog = None; self._publishDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
+        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._reviewDialog = None; self._publishDialog = None; self._repositoryDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
         config_path = Path(globalVars.appArgs.configPath); self._statePath = config_path / "addonDeveloperUpdaterState.json"; self._releaseCachePath = config_path / "addonDeveloperUpdaterReleaseCache.json"; self._backupRoot = config_path / "addonDeveloperUpdaterBackups"
         if config.conf["addonDeveloperUpdater"]["intervalMinutes"] < 15: config.conf["addonDeveloperUpdater"]["intervalMinutes"] = 15
         if UpdaterSettingsPanel not in gui.settingsDialogs.NVDASettingsDialog.categoryClasses: gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(UpdaterSettingsPanel)
@@ -205,6 +233,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._reviewDialog.Destroy(); self._reviewDialog = None
         if self._publishDialog is not None:
             self._publishDialog.Destroy(); self._publishDialog = None
+        if self._repositoryDialog is not None:
+            self._repositoryDialog.Destroy(); self._repositoryDialog = None
         if self._downgradeDialog is not None:
             self._downgradeDialog.Destroy(); self._downgradeDialog = None
         if self._confirmDialog is not None:
@@ -376,6 +406,63 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if older:
             ui.message(_("Ignored %d older local add-on copies. Only the newest local version of each add-on is available for GitHub publishing.") % len(older))
         self._showGitHubPublishDialog(ready)
+    @scriptHandler.script(description=_("Copy the GitHub repository URL for an NVDA add-on"), gesture="kb:NVDA+alt+shift+f", category=SCRIPT_CATEGORY)
+    def script_copyGitHubAddonRepositoryUrl(self, gesture):
+        if self._repositoryDialog is not None:
+            self._repositoryDialog.Raise(); self._repositoryDialog.repositoryList.SetFocus(); return
+        self._beginGitHubRepositoryLookup()
+    def _beginGitHubRepositoryLookup(self):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Loading NVDA add-on repositories from the signed-in GitHub account")); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._loadGitHubRepositories, name="addonDeveloperGitHubRepositories", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub repository lookup"); ui.message(_("The GitHub repository list could not be loaded"))
+    def _loadGitHubRepositories(self):
+        callback = None; arguments = ()
+        try:
+            owner, repositories = publisher.github_addon_repositories(self._githubProgress)
+            if repositories: callback, arguments = self._showGitHubRepositoryDialog, (owner, repositories)
+            else: callback, arguments = self._showInformation, (_("No NVDA add-on repositories found"), _("No repositories containing recognized NVDA add-on project files were found in the signed-in GitHub account."))
+        except publisher.AuthenticationRequired:
+            callback, arguments = self._offerGitHubRepositoryLogin, ()
+        except Exception as error:
+            log.exception("GitHub repository lookup failed"); callback, arguments = self._showInformation, (_("GitHub repository lookup failed"), _("The NVDA add-on repository list could not be loaded: %s") % error)
+        finally:
+            self._scanLock.release()
+            if callback is not None: self._finishProgressThen(callback, *arguments)
+    def _showGitHubRepositoryDialog(self, owner, repositories):
+        if self._repositoryDialog is not None: self._repositoryDialog.Raise(); return
+        dialog = GitHubRepositoryUrlDialog(gui.mainFrame, owner, repositories); self._repositoryDialog = dialog
+        def close(_event=None):
+            if self._repositoryDialog is dialog: self._repositoryDialog = None
+            dialog.Destroy()
+        def copyUrl(_event=None):
+            repository = dialog.selectedRepository()
+            if repository is None: ui.message(_("No repository is selected")); return
+            try: copied = api.copyToClip(repository.url)
+            except Exception:
+                log.exception("Could not copy GitHub repository URL"); copied = False
+            if copied: ui.message(_("Copied repository URL for %s: %s") % (repository.name, repository.url))
+            else: ui.message(_("The repository URL could not be copied to the clipboard"))
+        dialog.onCopy = copyUrl; dialog.copyButton.Bind(wx.EVT_BUTTON, copyUrl); dialog.repositoryList.Bind(wx.EVT_LISTBOX_DCLICK, copyUrl); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
+        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.repositoryList.SetFocus)
+    def _offerGitHubRepositoryLogin(self):
+        self._showConfirmation(_("Sign in to GitHub"), _("GitHub CLI is not signed in for NVDA. Sign in now to load your NVDA add-on repositories? A one-time code will be copied to the clipboard and GitHub will open in your browser."), self._startGitHubRepositoryLogin, defaultYes=True, onNo=lambda: self._showInformation(_("Repository lookup canceled"), _("No GitHub repository URL was copied.")))
+    def _startGitHubRepositoryLogin(self):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Starting GitHub sign-in. Complete authorization in the browser.")); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._githubRepositoryLogin, name="addonDeveloperGitHubRepositoryLogin", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub sign-in"); ui.message(_("GitHub sign-in could not be started"))
+    def _githubRepositoryLogin(self):
+        callback = None; arguments = ()
+        try:
+            publisher.login(); callback, arguments = self._beginGitHubRepositoryLookup, ()
+        except Exception as error:
+            log.exception("GitHub sign-in failed"); callback, arguments = self._showInformation, (_("GitHub sign-in failed"), _("GitHub sign-in failed: %s") % error)
+        finally:
+            self._scanLock.release()
+            if callback is not None: self._finishProgressThen(callback, *arguments)
     def _showGitHubPublishDialog(self, ready):
         if self._publishDialog is not None:
             self._publishDialog.Raise(); self._publishDialog.checkList.SetFocus(); return
