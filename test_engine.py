@@ -427,6 +427,9 @@ class EngineTests(unittest.TestCase):
         self.assertIn("Save issue template to GitHub", plugin)
         self.assertIn("Delete GitHub issue template", plugin)
         self.assertIn("dialog.getContent()", plugin)
+        self.assertIn("Issue template display &name, shown in GitHub's New Issue menu", plugin)
+        self.assertIn("Short answer, one line", plugin)
+        self.assertIn("Require an answer before the issue can be submitted", plugin)
         self.assertIn("template.sha", (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "publisher.py").read_text(encoding="utf-8"))
 
 if __name__ == "__main__": unittest.main()
