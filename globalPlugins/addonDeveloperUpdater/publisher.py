@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import io, json, os, re, shutil, subprocess, time, urllib.parse, urllib.request, webbrowser, zipfile
+import base64, io, json, os, re, shutil, subprocess, time, urllib.parse, urllib.request, webbrowser, zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,6 +58,15 @@ class GitHubAddonRepository:
     asset_name: str = ""
     download_url: str = ""
     asset_size: int = 0
+    default_branch: str = ""
+    issues_enabled: bool = True
+
+@dataclass(frozen=True)
+class GitHubIssueTemplate:
+    path: str
+    name: str
+    sha: str = ""
+    content: str = ""
 
 _ADDON_REPOSITORIES_QUERY = r"""
 query($endCursor: String) {
@@ -87,6 +96,35 @@ query($endCursor: String) {
   }
 }
 """
+
+_ADDON_PROJECTS_QUERY = r"""
+query($endCursor: String) {
+  viewer {
+    login
+    repositories(first: 100, after: $endCursor, ownerAffiliations: OWNER, orderBy: {field: NAME, direction: ASC}) {
+      nodes {
+        name
+        nameWithOwner
+        url
+        description
+        isPrivate
+        isArchived
+        hasIssuesEnabled
+        defaultBranchRef { name }
+        manifest: object(expression: "HEAD:manifest.ini") { __typename }
+        addonManifest: object(expression: "HEAD:addon/manifest.ini") { __typename }
+        nvdaManifest: object(expression: "HEAD:nvda/manifest.ini") { __typename }
+        sourceManifest: object(expression: "HEAD:src/manifest.ini") { __typename }
+        manifestTemplate: object(expression: "HEAD:manifest.ini.tpl") { __typename }
+        addonManifestTemplate: object(expression: "HEAD:addon/manifest.ini.tpl") { __typename }
+        buildVariables: object(expression: "HEAD:buildVars.py") { __typename }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+_ADDON_REPOSITORY_MARKERS = ("manifest", "addonManifest", "nvdaManifest", "sourceManifest", "manifestTemplate", "addonManifestTemplate", "buildVariables")
 
 def store_readiness_reasons(report: ProjectPublishInfo) -> list[str]:
     """Explain every condition that prevents this local project being submitted."""
@@ -223,8 +261,8 @@ def _manifest_github_remote(metadata: dict) -> str:
         if value.startswith("https://github.com/") or value.startswith("git@github.com:"): return value
     return ""
 
-def _run(arguments: list[str], cwd: Path | None = None) -> str:
-    completed = subprocess.run(arguments, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+def _run(arguments: list[str], cwd: Path | None = None, input_text: str | None = None) -> str:
+    completed = subprocess.run(arguments, cwd=cwd, input=input_text, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if completed.returncode:
         detail = (completed.stderr or completed.stdout).strip()
         raise RuntimeError(f"{Path(arguments[0]).name} failed: {detail}"[:2000])
@@ -259,8 +297,7 @@ def gh_path() -> str:
     if candidate.is_file(): return str(candidate)
     raise RuntimeError("GitHub CLI is not installed")
 
-def github_addon_repositories(progress=None) -> tuple[str, list[GitHubAddonRepository]]:
-    """List newest downloadable NVDA add-on assets owned by the active GitHub user."""
+def _github_owned_repository_nodes(query: str, progress_message: str, progress=None) -> tuple[str, list[dict]]:
     gh = gh_path()
     if progress: progress("Checking GitHub sign-in status")
     try: _run([gh, "auth", "status", "--active", "--hostname", "github.com"])
@@ -274,8 +311,8 @@ def github_addon_repositories(progress=None) -> tuple[str, list[GitHubAddonRepos
     page = 0
     while True:
         page += 1
-        if progress: progress(f"Loading released NVDA add-on files from GitHub, page {page}")
-        arguments = [gh, "api", "graphql", "-f", f"query={_ADDON_REPOSITORIES_QUERY}"]
+        if progress: progress(f"{progress_message}, page {page}")
+        arguments = [gh, "api", "graphql", "-f", f"query={query}"]
         if cursor: arguments.extend(["-F", f"endCursor={cursor}"])
         payload = json.loads(_run(arguments))
         errors = payload.get("errors") or []
@@ -286,29 +323,89 @@ def github_addon_repositories(progress=None) -> tuple[str, list[GitHubAddonRepos
         if not isinstance(viewer, dict): raise RuntimeError("GitHub did not return the signed-in account")
         owner = str(viewer.get("login") or owner)
         connection = viewer.get("repositories") or {}
-        for repository in connection.get("nodes") or []:
-            if not isinstance(repository, dict): continue
-            url = str(repository.get("url") or "").strip()
-            full_name = str(repository.get("nameWithOwner") or "").strip()
-            if not url.startswith("https://github.com/") or not full_name: continue
-            for release in (repository.get("releases") or {}).get("nodes") or []:
-                if not isinstance(release, dict) or release.get("isDraft"): continue
-                assets = [asset for asset in (release.get("releaseAssets") or {}).get("nodes") or [] if isinstance(asset, dict) and str(asset.get("name") or "").casefold().endswith(".nvda-addon") and str(asset.get("downloadUrl") or "").startswith("https://github.com/")]
-                if not assets: continue
-                for asset in assets:
-                    repositories.append(GitHubAddonRepository(
-                        str(repository.get("name") or full_name.rsplit("/", 1)[-1]), full_name, url,
-                        str(repository.get("description") or "").strip(), bool(repository.get("isPrivate")), bool(repository.get("isArchived")),
-                        str(release.get("tagName") or ""), bool(release.get("isPrerelease")), str(asset.get("name") or ""), str(asset.get("downloadUrl") or ""), int(asset.get("size") or 0),
-                    ))
-                break
+        repositories.extend(repository for repository in connection.get("nodes") or [] if isinstance(repository, dict))
         page_info = connection.get("pageInfo") or {}
         if not page_info.get("hasNextPage"): break
         cursor = str(page_info.get("endCursor") or "")
         if not cursor or cursor in seen_cursors: raise RuntimeError("GitHub repository pagination did not provide a new continuation cursor")
         seen_cursors.add(cursor)
+    return owner, repositories
+
+def github_addon_repositories(progress=None) -> tuple[str, list[GitHubAddonRepository]]:
+    """List newest downloadable NVDA add-on assets owned by the active GitHub user."""
+    owner, nodes = _github_owned_repository_nodes(_ADDON_REPOSITORIES_QUERY, "Loading released NVDA add-on files from GitHub", progress)
+    repositories = []
+    for repository in nodes:
+        url = str(repository.get("url") or "").strip(); full_name = str(repository.get("nameWithOwner") or "").strip()
+        if not url.startswith("https://github.com/") or not full_name: continue
+        for release in (repository.get("releases") or {}).get("nodes") or []:
+            if not isinstance(release, dict) or release.get("isDraft"): continue
+            assets = [asset for asset in (release.get("releaseAssets") or {}).get("nodes") or [] if isinstance(asset, dict) and str(asset.get("name") or "").casefold().endswith(".nvda-addon") and str(asset.get("downloadUrl") or "").startswith("https://github.com/")]
+            if not assets: continue
+            for asset in assets:
+                repositories.append(GitHubAddonRepository(
+                    str(repository.get("name") or full_name.rsplit("/", 1)[-1]), full_name, url,
+                    str(repository.get("description") or "").strip(), bool(repository.get("isPrivate")), bool(repository.get("isArchived")),
+                    str(release.get("tagName") or ""), bool(release.get("isPrerelease")), str(asset.get("name") or ""), str(asset.get("downloadUrl") or ""), int(asset.get("size") or 0),
+                ))
+            break
     unique = {repository.download_url.casefold(): repository for repository in repositories}
     return owner, sorted(unique.values(), key=lambda repository: (repository.full_name.casefold(), repository.asset_name.casefold()))
+
+def github_addon_projects(progress=None) -> tuple[str, list[GitHubAddonRepository]]:
+    """List repositories owned by the active account that use a recognized NVDA add-on layout."""
+    owner, nodes = _github_owned_repository_nodes(_ADDON_PROJECTS_QUERY, "Loading NVDA add-on projects from GitHub", progress)
+    repositories = []
+    for repository in nodes:
+        if not any(repository.get(marker) for marker in _ADDON_REPOSITORY_MARKERS): continue
+        url = str(repository.get("url") or "").strip(); full_name = str(repository.get("nameWithOwner") or "").strip()
+        if not url.startswith("https://github.com/") or not full_name: continue
+        repositories.append(GitHubAddonRepository(
+            str(repository.get("name") or full_name.rsplit("/", 1)[-1]), full_name, url,
+            str(repository.get("description") or "").strip(), bool(repository.get("isPrivate")), bool(repository.get("isArchived")),
+            default_branch=str((repository.get("defaultBranchRef") or {}).get("name") or ""), issues_enabled=bool(repository.get("hasIssuesEnabled")),
+        ))
+    unique = {repository.full_name.casefold(): repository for repository in repositories}
+    return owner, sorted(unique.values(), key=lambda repository: repository.full_name.casefold())
+
+def _validated_repository(repository: GitHubAddonRepository) -> tuple[str, str]:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository.full_name): raise RuntimeError("GitHub repository name is invalid")
+    if not repository.default_branch: raise RuntimeError(f"{repository.full_name} has no default branch")
+    return repository.full_name, repository.default_branch
+
+def github_issue_templates(repository: GitHubAddonRepository) -> list[GitHubIssueTemplate]:
+    """List editable issue-template files from a repository's default branch."""
+    full_name, branch = _validated_repository(repository); gh = gh_path()
+    endpoint = f"repos/{full_name}/git/trees/{urllib.parse.quote(branch, safe='')}"
+    payload = json.loads(_run([gh, "api", "-X", "GET", endpoint, "-f", "recursive=1"]))
+    if payload.get("truncated"): raise RuntimeError("GitHub returned an incomplete repository tree")
+    prefix = ".github/ISSUE_TEMPLATE/"; templates = []
+    for item in payload.get("tree") or []:
+        path = str(item.get("path") or "") if isinstance(item, dict) and item.get("type") == "blob" else ""
+        relative = path[len(prefix):] if path.startswith(prefix) else ""
+        if not relative or "/" in relative or Path(relative).suffix.casefold() not in {".md", ".yml", ".yaml"}: continue
+        templates.append(GitHubIssueTemplate(path, relative))
+    return sorted(templates, key=lambda template: template.name.casefold())
+
+def load_github_issue_template(repository: GitHubAddonRepository, template: GitHubIssueTemplate) -> GitHubIssueTemplate:
+    full_name, branch = _validated_repository(repository)
+    if template.path not in {item.path for item in github_issue_templates(repository)}: raise RuntimeError("The selected issue template is no longer available")
+    endpoint = f"repos/{full_name}/contents/{urllib.parse.quote(template.path, safe='/')}"
+    payload = json.loads(_run([gh_path(), "api", "-X", "GET", endpoint, "-f", f"ref={branch}"]))
+    if payload.get("encoding") != "base64" or not payload.get("sha"): raise RuntimeError("GitHub returned an unsupported issue-template response")
+    raw = base64.b64decode(re.sub(r"\s+", "", str(payload.get("content") or "")), validate=True)
+    if len(raw) > 1024 * 1024: raise RuntimeError("The issue template exceeds the 1 MB editing limit")
+    return GitHubIssueTemplate(template.path, template.name, str(payload["sha"]), raw.decode("utf-8-sig"))
+
+def update_github_issue_template(repository: GitHubAddonRepository, template: GitHubIssueTemplate, content: str) -> None:
+    full_name, branch = _validated_repository(repository)
+    prefix = ".github/ISSUE_TEMPLATE/"; relative = template.path[len(prefix):] if template.path.startswith(prefix) else ""
+    if not template.sha or not relative or "/" in relative or "\\" in relative or Path(relative).suffix.casefold() not in {".md", ".yml", ".yaml"}: raise RuntimeError("Issue-template revision information is missing or invalid")
+    encoded = content.encode("utf-8")
+    if not encoded or len(encoded) > 1024 * 1024: raise RuntimeError("The issue template must contain between 1 byte and 1 MB of UTF-8 text")
+    request = json.dumps({"message": f"Update {template.name} issue template", "content": base64.b64encode(encoded).decode("ascii"), "sha": template.sha, "branch": branch})
+    endpoint = f"repos/{full_name}/contents/{urllib.parse.quote(template.path, safe='/')}"
+    _run([gh_path(), "api", "-X", "PUT", endpoint, "--input", "-"], input_text=request)
 
 def project_root(manifest: Path) -> Path:
     for candidate in (manifest.parent, *manifest.parents):

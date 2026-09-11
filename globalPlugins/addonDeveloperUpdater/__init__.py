@@ -133,6 +133,46 @@ class GitHubRepositoryUrlDialog(wx.Dialog):
             return
         event.Skip()
 
+class GitHubSingleSelectionDialog(wx.Dialog):
+    def __init__(self, parent, title, instruction, items, choices, actionLabel):
+        super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.items = items; self.onAction = None; mainSizer = wx.BoxSizer(wx.VERTICAL)
+        mainSizer.Add(wx.StaticText(self, label=instruction), 0, wx.ALL, 10)
+        self.itemList = wx.ListBox(self, choices=choices, style=wx.LB_SINGLE)
+        if choices: self.itemList.SetSelection(0)
+        mainSizer.Add(self.itemList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        buttons = wx.BoxSizer(wx.HORIZONTAL); self.actionButton = wx.Button(self, label=actionLabel); self.closeButton = wx.Button(self, label=_("&Close")); self.actionButton.SetDefault()
+        buttons.Add(self.actionButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
+        self.SetSizer(mainSizer); self.SetMinSize((650, 320)); self.SetSize((850, 480)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
+    def selectedItem(self):
+        index = self.itemList.GetSelection()
+        return self.items[index] if index != wx.NOT_FOUND else None
+    def _onKey(self, event):
+        key = event.GetKeyCode()
+        if key == wx.WXK_ESCAPE: self.Close(); return
+        if self.itemList.HasFocus() and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if self.onAction is not None: self.onAction()
+            return
+        event.Skip()
+
+class IssueTemplateEditorDialog(wx.Dialog):
+    def __init__(self, parent, repository, template):
+        super().__init__(parent, title=_("Edit GitHub issue template"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.onSave = None; mainSizer = wx.BoxSizer(wx.VERTICAL)
+        mainSizer.Add(wx.StaticText(self, label=_("Editing %s in %s on branch %s. Control+S saves after confirmation. Escape closes without saving.") % (template.name, repository.full_name, repository.default_branch)), 0, wx.ALL, 10)
+        self.editor = wx.TextCtrl(self, value=template.content, style=wx.TE_MULTILINE | wx.TE_RICH2 | wx.TE_DONTWRAP)
+        mainSizer.Add(self.editor, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        buttons = wx.BoxSizer(wx.HORIZONTAL); self.saveButton = wx.Button(self, label=_("&Save to GitHub")); self.closeButton = wx.Button(self, label=_("&Close without saving")); self.saveButton.SetDefault()
+        buttons.Add(self.saveButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
+        self.SetSizer(mainSizer); self.SetMinSize((700, 450)); self.SetSize((950, 680)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
+    def _onKey(self, event):
+        key = event.GetKeyCode()
+        if key == wx.WXK_ESCAPE: self.Close(); return
+        if event.ControlDown() and key in (ord("S"), ord("s")):
+            if self.onSave is not None: self.onSave()
+            return
+        event.Skip()
+
 class DowngradeDialog(GitHubPublishDialog):
     def __init__(self, parent, results):
         wx.Dialog.__init__(self, parent, title=_("Downgrade add-on compatibility versions"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
@@ -171,7 +211,7 @@ class OperationProgressDialog(wx.Dialog):
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     activeInstance = None
     def __init__(self):
-        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._reviewDialog = None; self._publishDialog = None; self._repositoryDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
+        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._reviewDialog = None; self._publishDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
         config_path = Path(globalVars.appArgs.configPath); self._statePath = config_path / "addonDeveloperUpdaterState.json"; self._releaseCachePath = config_path / "addonDeveloperUpdaterReleaseCache.json"; self._backupRoot = config_path / "addonDeveloperUpdaterBackups"
         if config.conf["addonDeveloperUpdater"]["intervalMinutes"] < 15: config.conf["addonDeveloperUpdater"]["intervalMinutes"] = 15
         if UpdaterSettingsPanel not in gui.settingsDialogs.NVDASettingsDialog.categoryClasses: gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(UpdaterSettingsPanel)
@@ -235,6 +275,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._publishDialog.Destroy(); self._publishDialog = None
         if self._repositoryDialog is not None:
             self._repositoryDialog.Destroy(); self._repositoryDialog = None
+        if self._githubSelectionDialog is not None:
+            self._githubSelectionDialog.Destroy(); self._githubSelectionDialog = None
+        if self._templateEditorDialog is not None:
+            self._templateEditorDialog.Destroy(); self._templateEditorDialog = None
         if self._downgradeDialog is not None:
             self._downgradeDialog.Destroy(); self._downgradeDialog = None
         if self._confirmDialog is not None:
@@ -458,6 +502,166 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         callback = None; arguments = ()
         try:
             publisher.login(); callback, arguments = self._beginGitHubRepositoryLookup, ()
+        except Exception as error:
+            log.exception("GitHub sign-in failed"); callback, arguments = self._showInformation, (_("GitHub sign-in failed"), _("GitHub sign-in failed: %s") % error)
+        finally:
+            self._scanLock.release()
+            if callback is not None: self._finishProgressThen(callback, *arguments)
+    @scriptHandler.script(description=_("Open the Issues page for an NVDA add-on repository"), gesture="kb:NVDA+alt+shift+i", category=SCRIPT_CATEGORY)
+    def script_openGitHubAddonIssues(self, gesture): self._beginGitHubProjectAction("issues")
+    @scriptHandler.script(description=_("Edit a GitHub issue template for an NVDA add-on repository"), gesture="kb:NVDA+alt+shift+t", category=SCRIPT_CATEGORY)
+    def script_editGitHubAddonIssueTemplate(self, gesture): self._beginGitHubProjectAction("templates")
+    def _beginGitHubProjectAction(self, action):
+        if action not in {"issues", "templates"}: return
+        if self._githubSelectionDialog is not None:
+            self._githubSelectionDialog.Raise(); self._githubSelectionDialog.itemList.SetFocus(); return
+        if self._templateEditorDialog is not None:
+            self._templateEditorDialog.Raise(); self._templateEditorDialog.editor.SetFocus(); return
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        message = _("Loading add-on repositories and Issues settings from GitHub") if action == "issues" else _("Loading add-on repositories and issue templates from GitHub")
+        ui.message(message); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._loadGitHubProjects, args=(action,), name="addonDeveloperGitHubProjects", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub project lookup"); ui.message(_("The GitHub add-on repository list could not be loaded"))
+    def _loadGitHubProjects(self, action):
+        callback = None; arguments = ()
+        try:
+            owner, repositories = publisher.github_addon_projects(self._githubProgress)
+            if repositories: callback, arguments = self._showGitHubProjectActionDialog, (owner, repositories, action)
+            else: callback, arguments = self._showInformation, (_("No NVDA add-on repositories found"), _("No repositories containing recognized NVDA add-on project files were found in the signed-in GitHub account."))
+        except publisher.AuthenticationRequired:
+            callback, arguments = self._offerGitHubProjectLogin, (action,)
+        except Exception as error:
+            log.exception("GitHub project lookup failed"); callback, arguments = self._showInformation, (_("GitHub repository lookup failed"), _("The NVDA add-on repository list could not be loaded: %s") % error)
+        finally:
+            self._scanLock.release()
+            if callback is not None: self._finishProgressThen(callback, *arguments)
+    def _showGitHubProjectActionDialog(self, owner, repositories, action):
+        if self._githubSelectionDialog is not None: self._githubSelectionDialog.Raise(); return
+        choices = []
+        for repository in repositories:
+            status = _("private") if repository.private else _("public")
+            if repository.archived: status += _(", archived")
+            if action == "issues" and not repository.issues_enabled: status += _(", Issues disabled")
+            choices.append(_("%s; %s; default branch %s") % (repository.full_name, status, repository.default_branch or _("none")))
+        title = _("Open an add-on repository's Issues page") if action == "issues" else _("Choose a repository whose issue template should be edited")
+        instruction = _("Select a repository owned by %s. Press Enter to continue or Escape to close.") % owner
+        actionLabel = _("&Open Issues") if action == "issues" else _("&Choose repository")
+        dialog = GitHubSingleSelectionDialog(gui.mainFrame, title, instruction, repositories, choices, actionLabel); self._githubSelectionDialog = dialog
+        def close(_event=None):
+            if self._githubSelectionDialog is dialog: self._githubSelectionDialog = None
+            dialog.Destroy()
+        def act(_event=None):
+            repository = dialog.selectedItem()
+            if repository is None: ui.message(_("No repository is selected")); return
+            if action == "issues":
+                if not repository.issues_enabled: ui.message(_("GitHub Issues are disabled for %s") % repository.full_name); return
+                close(); self._openGitHubUrl(repository.url.rstrip("/") + "/issues", repository.full_name)
+            else:
+                if repository.archived: ui.message(_("%s is archived and its issue templates cannot be changed") % repository.full_name); return
+                close(); self._beginIssueTemplateLookup(repository)
+        dialog.onAction = act; dialog.actionButton.Bind(wx.EVT_BUTTON, act); dialog.itemList.Bind(wx.EVT_LISTBOX_DCLICK, act); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
+        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.itemList.SetFocus)
+    def _openGitHubUrl(self, url, repositoryName):
+        def launch():
+            try:
+                if self._shutdown.wait(0.2): return
+                os.startfile(url)
+            except OSError:
+                log.exception("Could not open GitHub Issues page")
+                if not self._shutdown.is_set(): wx.CallAfter(ui.message, _("The Issues page for %s could not be opened") % repositoryName)
+        ui.message(_("Opening the Issues page for %s") % repositoryName)
+        try: threading.Thread(target=launch, name="addonDeveloperOpenGitHubIssues", daemon=True).start()
+        except Exception:
+            log.exception("Could not start GitHub Issues page launcher"); ui.message(_("The GitHub Issues page could not be opened"))
+    def _beginIssueTemplateLookup(self, repository):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Loading issue templates for %s") % repository.full_name); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._loadIssueTemplates, args=(repository,), name="addonDeveloperIssueTemplates", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start issue-template lookup"); ui.message(_("The issue-template list could not be loaded"))
+    def _loadIssueTemplates(self, repository):
+        callback = None; arguments = ()
+        try:
+            templates = publisher.github_issue_templates(repository)
+            if templates: callback, arguments = self._showIssueTemplateDialog, (repository, templates)
+            else: callback, arguments = self._showInformation, (_("No issue templates found"), _("%s has no editable Markdown or YAML files in .github/ISSUE_TEMPLATE on its default branch.") % repository.full_name)
+        except Exception as error:
+            log.exception("Issue-template lookup failed"); callback, arguments = self._showInformation, (_("Issue-template lookup failed"), _("Issue templates for %s could not be loaded: %s") % (repository.full_name, error))
+        finally:
+            self._scanLock.release()
+            if callback is not None: self._finishProgressThen(callback, *arguments)
+    def _showIssueTemplateDialog(self, repository, templates):
+        choices = [_('%s; path %s') % (template.name, template.path) for template in templates]
+        dialog = GitHubSingleSelectionDialog(gui.mainFrame, _("Choose a GitHub issue template"), _("Select an issue template from %s and press Enter to edit it.") % repository.full_name, templates, choices, _("&Edit template")); self._githubSelectionDialog = dialog
+        def close(_event=None):
+            if self._githubSelectionDialog is dialog: self._githubSelectionDialog = None
+            dialog.Destroy()
+        def edit(_event=None):
+            template = dialog.selectedItem()
+            if template is None: ui.message(_("No issue template is selected")); return
+            close(); self._beginIssueTemplateLoad(repository, template)
+        dialog.onAction = edit; dialog.actionButton.Bind(wx.EVT_BUTTON, edit); dialog.itemList.Bind(wx.EVT_LISTBOX_DCLICK, edit); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
+        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.itemList.SetFocus)
+    def _beginIssueTemplateLoad(self, repository, template):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Loading %s from GitHub") % template.name); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._loadIssueTemplate, args=(repository, template), name="addonDeveloperIssueTemplateLoad", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start issue-template load"); ui.message(_("The issue template could not be loaded"))
+    def _loadIssueTemplate(self, repository, template):
+        callback = None; arguments = ()
+        try: callback, arguments = self._showIssueTemplateEditor, (repository, publisher.load_github_issue_template(repository, template))
+        except Exception as error:
+            log.exception("Issue-template load failed"); callback, arguments = self._showInformation, (_("Issue-template load failed"), _("%s could not be loaded: %s") % (template.name, error))
+        finally:
+            self._scanLock.release()
+            if callback is not None: self._finishProgressThen(callback, *arguments)
+    def _showIssueTemplateEditor(self, repository, template):
+        if self._templateEditorDialog is not None: self._templateEditorDialog.Raise(); return
+        dialog = IssueTemplateEditorDialog(gui.mainFrame, repository, template); self._templateEditorDialog = dialog
+        def close(_event=None):
+            if self._templateEditorDialog is dialog: self._templateEditorDialog = None
+            dialog.Destroy()
+        def save(_event=None):
+            content = dialog.editor.GetValue()
+            if content == template.content: ui.message(_("The issue template has not changed")); return
+            if not content: ui.message(_("The issue template cannot be empty")); return
+            message = _("Commit these changes to %s on its %s branch? The existing file will be updated only if it has not changed on GitHub since it was loaded.") % (repository.full_name, repository.default_branch)
+            self._showConfirmation(_("Save issue template to GitHub"), message, lambda: self._startIssueTemplateSave(repository, template, content, dialog))
+        dialog.onSave = save; dialog.saveButton.Bind(wx.EVT_BUTTON, save); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
+        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.editor.SetFocus)
+    def _startIssueTemplateSave(self, repository, template, content, dialog):
+        if self._templateEditorDialog is not dialog: return
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        dialog.Disable(); ui.message(_("Saving %s to GitHub") % template.name); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._saveIssueTemplate, args=(repository, template, content, dialog), name="addonDeveloperIssueTemplateSave", daemon=True).start()
+        except Exception:
+            dialog.Enable(); self._stopProgress(); self._scanLock.release(); log.exception("Could not start issue-template save"); ui.message(_("The issue template could not be saved"))
+    def _saveIssueTemplate(self, repository, template, content, dialog):
+        succeeded = False; message = ""
+        try:
+            publisher.update_github_issue_template(repository, template, content); succeeded = True; message = _("Saved %s to %s on branch %s.") % (template.name, repository.full_name, repository.default_branch)
+        except Exception as error:
+            log.exception("Issue-template save failed"); message = _("The issue template was not saved: %s") % error
+        finally:
+            self._scanLock.release(); self._finishProgressThen(self._finishIssueTemplateSave, dialog, succeeded, message)
+    def _finishIssueTemplateSave(self, dialog, succeeded, message):
+        if self._templateEditorDialog is dialog:
+            if succeeded: self._templateEditorDialog = None; dialog.Destroy()
+            else: dialog.Enable(); dialog.Raise(); dialog.editor.SetFocus()
+        ui.message(message); self._showInformation(_("Issue template saved") if succeeded else _("Issue-template save failed"), message)
+    def _offerGitHubProjectLogin(self, action):
+        self._showConfirmation(_("Sign in to GitHub"), _("GitHub CLI is not signed in for NVDA. Sign in now to access add-on repository Issues and templates? A one-time code will be copied to the clipboard and GitHub will open in your browser."), lambda: self._startGitHubProjectLogin(action), defaultYes=True, onNo=lambda: self._showInformation(_("GitHub repository action canceled"), _("No GitHub page was opened and no issue template was changed.")))
+    def _startGitHubProjectLogin(self, action):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Starting GitHub sign-in. Complete authorization in the browser.")); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._githubProjectLogin, args=(action,), name="addonDeveloperGitHubProjectLogin", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub sign-in"); ui.message(_("GitHub sign-in could not be started"))
+    def _githubProjectLogin(self, action):
+        callback = None; arguments = ()
+        try: publisher.login(); callback, arguments = self._beginGitHubProjectAction, (action,)
         except Exception as error:
             log.exception("GitHub sign-in failed"); callback, arguments = self._showInformation, (_("GitHub sign-in failed"), _("GitHub sign-in failed: %s") % error)
         finally:

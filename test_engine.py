@@ -320,4 +320,61 @@ class EngineTests(unittest.TestCase):
         self.assertIn('gesture="kb:NVDA+alt+shift+f"', plugin)
         self.assertIn("api.copyToClip(repository.download_url)", plugin)
 
+    def test_github_addon_project_catalog_includes_unreleased_projects(self):
+        page = {"data": {"viewer": {"login": "owner", "repositories": {
+            "nodes": [
+                {"name": "addon", "nameWithOwner": "owner/addon", "url": "https://github.com/owner/addon", "description": "", "isPrivate": False, "isArchived": False, "hasIssuesEnabled": True, "defaultBranchRef": {"name": "main"}, "buildVariables": {"__typename": "Blob"}},
+                {"name": "ordinary", "nameWithOwner": "owner/ordinary", "url": "https://github.com/owner/ordinary", "description": "", "isPrivate": False, "isArchived": False, "hasIssuesEnabled": True, "defaultBranchRef": {"name": "main"}},
+            ],
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+        }}}}
+        responses = iter(("authenticated", json.dumps(page)))
+        with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "_run", side_effect=lambda *_args, **_kwargs: next(responses)):
+            owner, repositories = publisher.github_addon_projects()
+        self.assertEqual("owner", owner)
+        self.assertEqual(["owner/addon"], [repository.full_name for repository in repositories])
+        self.assertEqual("main", repositories[0].default_branch)
+        self.assertTrue(repositories[0].issues_enabled)
+
+    def test_issue_template_listing_accepts_only_direct_markdown_and_yaml_files(self):
+        repository = publisher.GitHubAddonRepository("addon", "owner/addon", "https://github.com/owner/addon", default_branch="main")
+        tree = {"truncated": False, "tree": [
+            {"type": "blob", "path": ".github/ISSUE_TEMPLATE/bug.yml"},
+            {"type": "blob", "path": ".github/ISSUE_TEMPLATE/config.yaml"},
+            {"type": "blob", "path": ".github/ISSUE_TEMPLATE/legacy.md"},
+            {"type": "blob", "path": ".github/ISSUE_TEMPLATE/readme.txt"},
+            {"type": "blob", "path": ".github/ISSUE_TEMPLATE/nested/hidden.yml"},
+            {"type": "blob", "path": "docs/bug.yml"},
+        ]}
+        with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "_run", return_value=json.dumps(tree)):
+            templates = publisher.github_issue_templates(repository)
+        self.assertEqual(["bug.yml", "config.yaml", "legacy.md"], [template.name for template in templates])
+
+    def test_issue_template_load_preserves_revision_and_utf8_content(self):
+        repository = publisher.GitHubAddonRepository("addon", "owner/addon", "https://github.com/owner/addon", default_branch="main")
+        template = publisher.GitHubIssueTemplate(".github/ISSUE_TEMPLATE/bug.yml", "bug.yml")
+        response = {"encoding": "base64", "sha": "abc123", "content": publisher.base64.b64encode("name: Bug\ndescription: Café\n".encode()).decode()}
+        with mock.patch.object(publisher, "github_issue_templates", return_value=[template]), mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "_run", return_value=json.dumps(response)):
+            loaded = publisher.load_github_issue_template(repository, template)
+        self.assertEqual("abc123", loaded.sha)
+        self.assertIn("Café", loaded.content)
+
+    def test_issue_template_update_uses_revision_and_stdin_json(self):
+        repository = publisher.GitHubAddonRepository("addon", "owner/addon", "https://github.com/owner/addon", default_branch="main")
+        template = publisher.GitHubIssueTemplate(".github/ISSUE_TEMPLATE/bug.yml", "bug.yml", "abc123", "old")
+        with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "_run", return_value="") as run:
+            publisher.update_github_issue_template(repository, template, "name: Updated\n")
+        arguments = run.call_args.args[0]; request = json.loads(run.call_args.kwargs["input_text"])
+        self.assertEqual(["--input", "-"], arguments[-2:])
+        self.assertEqual("abc123", request["sha"])
+        self.assertEqual("main", request["branch"])
+        self.assertEqual("name: Updated\n", publisher.base64.b64decode(request["content"]).decode())
+
+    def test_issue_and_template_gestures_are_registered(self):
+        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn('gesture="kb:NVDA+alt+shift+i"', plugin)
+        self.assertIn('gesture="kb:NVDA+alt+shift+t"', plugin)
+        self.assertIn("Save issue template to GitHub", plugin)
+        self.assertIn("template.sha", (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "publisher.py").read_text(encoding="utf-8"))
+
 if __name__ == "__main__": unittest.main()
