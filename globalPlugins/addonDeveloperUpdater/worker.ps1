@@ -40,7 +40,7 @@ function Test-DeveloperManifest([string]$ManifestPath) {
 }
 
 function Get-LatestRelease([bool]$IncludePrereleases) {
-	$headers = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'NVDA-Addon-Developer-Updater/2026.2.24' }
+	$headers = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'NVDA-Addon-Developer-Updater' }
 	$items = Invoke-RestMethod -Uri 'https://api.github.com/repos/nvaccess/nvda/releases?per_page=30' -Headers $headers -TimeoutSec 15
 	$releases = foreach ($item in $items) {
 		$tag = [string]$item.tag_name

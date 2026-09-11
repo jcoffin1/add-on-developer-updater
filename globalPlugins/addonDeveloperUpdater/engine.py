@@ -11,7 +11,7 @@ RELEASES_URL = "https://api.github.com/repos/nvaccess/nvda/releases?per_page=30"
 RELEASES_FEED_URL = "https://github.com/nvaccess/nvda/releases.atom"
 ALPHA_SNAPSHOTS_URL = "https://download.nvaccess.org/snapshots/alpha/"
 BUILD_VERSION_URL = "https://raw.githubusercontent.com/nvaccess/nvda/master/source/buildVersion.py"
-USER_AGENT = "NVDA-Addon-Developer-Updater/2026.2.22"
+USER_AGENT = "NVDA-Addon-Developer-Updater"
 TAG_PATTERN = re.compile(r"^(?:release-)?(20\d{2})\.(\d+)(?:\.(\d+))?(?:(alpha|beta|rc)(\d+))?$", re.I)
 LAST_TESTED = re.compile(r"^([ \t]*lastTestedNVDAVersion[ \t]*=[ \t]*)(?P<quote>[\"']?)(20\d{2}\.\d+(?:\.\d+)?)(?P=quote)(?P<suffix>[ \t]*(?:[#;].*)?)(?P<cr>\r?)$", re.I | re.M)
 VALUE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.*)$", re.M)
@@ -76,7 +76,8 @@ def version_tuple(value: str) -> tuple[int, int, int]:
 
 def parse_release(item: dict) -> Release | None:
     if not isinstance(item, dict): return None
-    tag = str(item.get("tag_name", "")).strip(); match = TAG_PATTERN.fullmatch(tag)
+    tag = str(item.get("tag_name", "")).strip()
+    match = TAG_PATTERN.fullmatch(tag)
     if not match: return None
     patch = int(match.group(3) or 0)
     manifest_version = f"{int(match.group(1))}.{int(match.group(2))}" + (f".{patch}" if patch else "")
@@ -375,7 +376,9 @@ def update(path: Path, release: Release, backup_root: Path, apply_changes: bool 
     current = metadata["lasttestednvdaversion"]
     if version_tuple(current) >= version_tuple(release.manifest_version): return ProjectResult(identifier, name, str(path), "current")
     if not apply_changes: return ProjectResult(identifier, name, str(path), f"update available: {current} to {release.manifest_version}")
-    raw = path.read_bytes(); original = raw[len(codecs.BOM_UTF8):].decode("utf-8") if raw.startswith(codecs.BOM_UTF8) else raw.decode("utf-8"); match = LAST_TESTED.search(original)
+    raw = path.read_bytes()
+    original = raw[len(codecs.BOM_UTF8):].decode("utf-8") if raw.startswith(codecs.BOM_UTF8) else raw.decode("utf-8")
+    match = LAST_TESTED.search(original)
     if not match: return ProjectResult(identifier, name, str(path), "validation failed: compatibility key not found")
     safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" .")[:80] or "add-on"
     safe_tag = re.sub(r"[^A-Za-z0-9._-]+", "_", release.tag).strip(".")[:80] or "release"
@@ -397,7 +400,9 @@ def downgrade(path: Path, target_version: str, backup_root: Path) -> ProjectResu
     if version_tuple(target_version) >= version_tuple(current): return ProjectResult(identifier, name, str(path), f"downgrade skipped: {target_version} is not older than {current}")
     minimum = metadata["minimumnvdaversion"]
     if version_tuple(target_version) < version_tuple(minimum): return ProjectResult(identifier, name, str(path), f"validation failed: {target_version} is older than minimumNVDAVersion {minimum}")
-    raw = path.read_bytes(); original = raw[len(codecs.BOM_UTF8):].decode("utf-8") if raw.startswith(codecs.BOM_UTF8) else raw.decode("utf-8"); match = LAST_TESTED.search(original)
+    raw = path.read_bytes()
+    original = raw[len(codecs.BOM_UTF8):].decode("utf-8") if raw.startswith(codecs.BOM_UTF8) else raw.decode("utf-8")
+    match = LAST_TESTED.search(original)
     if not match: return ProjectResult(identifier, name, str(path), "validation failed: compatibility key not found")
     safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" .")[:80] or "add-on"; safe_target = re.sub(r"[^A-Za-z0-9._-]+", "_", target_version).strip(".")[:80] or "target"
     backup_folder = backup_root / f"downgrade-{safe_target}" / f"{safe_name}-{identifier}"; backup_folder.mkdir(parents=True, exist_ok=True)

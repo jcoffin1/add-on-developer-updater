@@ -1,4 +1,4 @@
-import codecs, io, json, os, stat, tempfile, unittest, zipfile
+import codecs, io, json, os, stat, subprocess, tempfile, unittest, zipfile
 from pathlib import Path
 import sys
 from unittest import mock
@@ -17,10 +17,13 @@ class EngineTests(unittest.TestCase):
         release = engine.parse_release({"tag_name": "release-2026.2beta11", "prerelease": True}); self.assertEqual("2026.2", release.manifest_version)
         self.assertTrue(engine.parse_release({"tag_name": "RELEASE-2026.2RC1", "prerelease": False}).prerelease)
     def test_addon_version_follows_current_stable_nvda_family(self):
-        version = engine.values(Path(__file__).parent / "manifest.ini")["version"]
+        metadata = engine.values(Path(__file__).parent / "manifest.ini")
+        version = metadata["version"]
         self.assertTrue(version == CURRENT_RELEASE_FAMILY or version.startswith(CURRENT_RELEASE_FAMILY + "."))
         if version != CURRENT_RELEASE_FAMILY:
             self.assertGreaterEqual(int(version.rsplit(".", 1)[1]), 0)
+        self.assertEqual("2025.3.3", metadata["minimumnvdaversion"])
+        self.assertEqual("2026.2", metadata["lasttestednvdaversion"])
     def test_release_selection_does_not_trust_api_order(self):
         items = [{"tag_name": "release-2026.3beta9", "prerelease": True}, {"tag_name": "release-2026.2.0"}, {"tag_name": "release-2026.3beta11", "prerelease": True}]
         self.assertEqual("2026.3beta11", engine._select_release(items, True).tag); self.assertEqual("2026.2.0", engine._select_release(items, False).tag)
@@ -145,6 +148,35 @@ class EngineTests(unittest.TestCase):
         )
         self.assertEqual(list(report.store_guideline_issues), publisher.store_readiness_reasons(report))
 
+    def test_store_readiness_does_not_duplicate_an_outdated_release_mismatch(self):
+        report = publisher.ProjectPublishInfo(
+            "id", "Demo", "manifest.ini", ".", "2026.2.33", "Demo", "Justin Coffin",
+            "https://github.com/jcoffin1/demo", 0, True, 0, "2026.2.24",
+            "https://github.com/jcoffin1/demo/releases/download/v2026.2.24/demo.nvda-addon",
+            True, False, "release package version 2026.2.24 does not match local version 2026.2.33",
+        )
+        reasons = publisher.store_readiness_reasons(report)
+        self.assertEqual(["GitHub Release 2026.2.24 does not match local version 2026.2.33"], reasons)
+
+    def test_vendored_yaml_imports_without_site_packages(self):
+        module_folder = Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater"
+        script = (
+            "import sys; "
+            f"sys.path.insert(0, {str(module_folder)!r}); "
+            "import publisher; "
+            "template = publisher.GitHubIssueTemplate('.github/ISSUE_TEMPLATE/bug.yml', 'bug.yml', content='name: Bug\\ndescription: Report\\nbody: []\\n'); "
+            "assert publisher.parse_issue_template_document(template).data['name'] == 'Bug'"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-S", "-c", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
     def test_external_scan_worker_is_present_and_packaged(self):
         root = Path(__file__).parent
         worker = root / "globalPlugins" / "addonDeveloperUpdater" / "worker.ps1"
@@ -156,7 +188,14 @@ class EngineTests(unittest.TestCase):
             package = publisher.build_package(item, Path(folder))
             with zipfile.ZipFile(package) as archive:
                 self.assertIn("globalPlugins/addonDeveloperUpdater/worker.ps1", archive.namelist())
+                self.assertIn("globalPlugins/addonDeveloperUpdater/_vendor/yaml/__init__.py", archive.namelist())
+                self.assertIn("globalPlugins/addonDeveloperUpdater/_vendor/PyYAML-LICENSE.txt", archive.namelist())
                 self.assertIn("COPYING.txt", archive.namelist())
+
+    def test_documentation_does_not_advertise_nonexistent_automatic_changes(self):
+        documentation = (Path(__file__).parent / "doc" / "en" / "readme.html").read_text(encoding="utf-8")
+        self.assertNotIn("opt-in automatic changes", documentation)
+        self.assertIn("automatic manifest changes are not supported", documentation)
 
     def test_branch_targeted_release_does_not_use_unreliable_no_commit_flag(self):
         target = "af05c02f6b8d790fe6f41d3be5fd9f3fd5c27124"
@@ -250,6 +289,14 @@ class EngineTests(unittest.TestCase):
         validate_index = plugin.index("publisher.validate_publish_builds(reports")
         push_index = plugin.index("publisher.push(reports", validate_index)
         self.assertLess(validate_index, push_index)
+
+    def test_cancel_command_tracks_a_scan_instead_of_the_shared_operation_lock(self):
+        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        start = plugin.index("def script_cancelAddonProjectScan")
+        end = plugin.index("def script_submitUpdatedAddons", start)
+        command = plugin[start:end]
+        self.assertIn("self._scanActive.is_set()", command)
+        self.assertNotIn("self._scanLock.locked()", command)
 
     def test_store_submission_remains_a_manual_browser_action(self):
         plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")

@@ -4,7 +4,11 @@ import base64, io, json, os, re, shutil, subprocess, time, urllib.parse, urllib.
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
+try:
+    from ._vendor import yaml
+except ImportError:
+    # Unit tests also import this module directly from its folder.
+    from _vendor import yaml
 
 class _GitHubYamlLoader(yaml.SafeLoader):
     """Safe YAML loader whose booleans match GitHub's true/false form syntax."""
@@ -154,7 +158,8 @@ def store_readiness_reasons(report: ProjectPublishInfo) -> list[str]:
         if not report.github_release_version: reasons.append("no GitHub Release")
         elif release_needed(report.version, report.github_release_version): reasons.append(f"GitHub Release {report.github_release_version} does not match local version {report.version}")
         elif not report.github_release_download_url: reasons.append("matching release has no .nvda-addon asset")
-    if report.github_release_download_url and report.repository_owned_by_user and not report.release_package_verified:
+    release_matches_local = bool(report.github_release_version) and not release_needed(report.version, report.github_release_version)
+    if release_matches_local and report.github_release_download_url and report.repository_owned_by_user and not report.release_package_verified:
         reasons.append(report.release_package_error or "release package manifest could not be verified")
     if report.changed_files: reasons.append(f"{report.changed_files} local changed {'file is' if report.changed_files == 1 else 'files are'} not included in the release")
     if report.unpushed_commits: reasons.append(f"{report.unpushed_commits} local commits are not pushed")

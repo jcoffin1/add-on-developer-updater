@@ -349,7 +349,7 @@ class OperationProgressDialog(wx.Dialog):
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     activeInstance = None
     def __init__(self):
-        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._reviewDialog = None; self._publishDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
+        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._reviewDialog = None; self._publishDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
         config_path = Path(globalVars.appArgs.configPath); self._statePath = config_path / "addonDeveloperUpdaterState.json"; self._releaseCachePath = config_path / "addonDeveloperUpdaterReleaseCache.json"; self._backupRoot = config_path / "addonDeveloperUpdaterBackups"
         if config.conf["addonDeveloperUpdater"]["intervalMinutes"] < 15: config.conf["addonDeveloperUpdater"]["intervalMinutes"] = 15
         if UpdaterSettingsPanel not in gui.settingsDialogs.NVDASettingsDialog.categoryClasses: gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(UpdaterSettingsPanel)
@@ -490,7 +490,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self._showReviewDialog(available, engine.Release(str(state.get("releaseTag", "")), str(state.get("manifestVersion", "")), True, ""))
     @scriptHandler.script(description=_("Cancel the running add-on developer update scan"), category=SCRIPT_CATEGORY)
     def script_cancelAddonProjectScan(self, gesture):
-        if not self._scanLock.locked(): ui.message(_("No add-on developer scan is running")); return
+        if not self._scanActive.is_set(): ui.message(_("No add-on developer scan is running")); return
         self._scanCancel.set()
         if self._workerProcess is not None:
             try: self._workerProcess.terminate()
@@ -886,10 +886,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._wakeMonitor.wait(wait_seconds); self._wakeMonitor.clear()
     def _startCheck(self, manual=False, full_system=False):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer scan is already running")); return
-        self._scanCancel.clear(); ui.message(_("Checking for NVDA releases and add-on projects"))
+        self._scanCancel.clear(); self._scanActive.set(); ui.message(_("Checking for NVDA releases and add-on projects"))
         try: threading.Thread(target=self._runCheck, kwargs={"manual": manual, "full_system": full_system, "lock_acquired": True}, name="addonDeveloperManualScan", daemon=True).start()
         except Exception:
-            self._scanLock.release(); log.exception("Could not start add-on developer scan"); ui.message(_("The add-on developer scan could not be started"))
+            self._scanActive.clear(); self._scanLock.release(); log.exception("Could not start add-on developer scan"); ui.message(_("The add-on developer scan could not be started"))
     def _rootStrings(self):
         settings = config.conf["addonDeveloperUpdater"]
         roots = [str(Path.home() / "Documents" / "NVDA Add-on Development" / "Add-ons")]
@@ -1117,6 +1117,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if not self._shutdown.is_set(): wx.CallAfter(ui.message, _("One or more add-on folders or the submission form could not be opened"))
     def _runCheck(self, manual=False, full_system=False, lock_acquired=False):
         if not lock_acquired and not self._scanLock.acquire(blocking=False): return
+        self._scanActive.set()
         self._startProgress()
         cancelled = lambda: self._scanCancel.is_set() or self._shutdown.is_set()
         requestPath = self._statePath.with_name(f"addonDeveloperUpdaterRequest-{uuid.uuid4().hex}.json")
@@ -1180,4 +1181,4 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             for path in (requestPath, outputPath):
                 try: path.unlink(missing_ok=True)
                 except OSError: pass
-            self._stopProgress(); self._scanLock.release()
+            self._scanActive.clear(); self._stopProgress(); self._scanLock.release()

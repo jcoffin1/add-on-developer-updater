@@ -1,0 +1,9 @@
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["globalPlugins/addonDeveloperUpdater/_vendor"]
+builtins = ["_"]
+
+[tool.ruff.lint]
+# Keep CI focused on syntax, invalid control flow, and unresolved names while
+# the older compact modules are gradually reformatted.
+select = ["E9", "F63", "F7", "F82"]

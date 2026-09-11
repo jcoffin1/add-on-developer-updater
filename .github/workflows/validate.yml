@@ -1,0 +1,41 @@
+name: Validate NVDA add-on
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install static checker
+        run: python -m pip install ruff
+      - name: Run unit tests
+        run: python -m unittest -v
+      - name: Run critical static checks
+        run: python -m ruff check .
+      - name: Parse external worker
+        shell: powershell
+        run: '[void][scriptblock]::Create((Get-Content globalPlugins/addonDeveloperUpdater/worker.ps1 -Raw))'
+      - name: Build and audit package
+        run: python tools/build_addon.py
+      - name: Upload audited package
+        if: matrix.python-version == '3.13'
+        uses: actions/upload-artifact@v4
+        with:
+          name: addonDeveloperUpdater-package
+          path: outputs/*.nvda-addon
+          if-no-files-found: error
