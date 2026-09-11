@@ -433,6 +433,8 @@ class EngineTests(unittest.TestCase):
         self.assertIn("control.SetName(label.replace", plugin)
         self.assertIn("self.editor.SetName", plugin)
         self.assertIn("self.questionList.SetName", plugin)
+        self.assertIn("Markdown means ordinary text with optional formatting symbols", plugin)
+        self.assertIn("# for headings", plugin)
         self.assertIn("template.sha", (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "publisher.py").read_text(encoding="utf-8"))
 
 if __name__ == "__main__": unittest.main()
