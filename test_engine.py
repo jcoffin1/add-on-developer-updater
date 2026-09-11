@@ -283,8 +283,11 @@ class EngineTests(unittest.TestCase):
         first_page = {
             "data": {"viewer": {"login": "jcoffin1", "repositories": {
                 "nodes": [
-                    {"name": "demo", "nameWithOwner": "jcoffin1/demo", "url": "https://github.com/jcoffin1/demo", "description": "Demo add-on", "isPrivate": False, "isArchived": False, "manifest": {"__typename": "Blob"}},
-                    {"name": "ordinary", "nameWithOwner": "jcoffin1/ordinary", "url": "https://github.com/jcoffin1/ordinary", "description": "Not an add-on", "isPrivate": False, "isArchived": False},
+                    {"name": "demo", "nameWithOwner": "jcoffin1/demo", "url": "https://github.com/jcoffin1/demo", "description": "Demo add-on", "isPrivate": False, "isArchived": False, "releases": {"nodes": [
+                        {"tagName": "v2.0", "isDraft": True, "isPrerelease": False, "releaseAssets": {"nodes": [{"name": "demo-2.0.nvda-addon", "downloadUrl": "https://github.com/jcoffin1/demo/releases/download/v2.0/demo-2.0.nvda-addon", "size": 20}]}},
+                        {"tagName": "v1.0", "isDraft": False, "isPrerelease": False, "releaseAssets": {"nodes": [{"name": "demo-1.0.nvda-addon", "downloadUrl": "https://github.com/jcoffin1/demo/releases/download/v1.0/demo-1.0.nvda-addon", "size": 10}]}},
+                    ]}},
+                    {"name": "ordinary", "nameWithOwner": "jcoffin1/ordinary", "url": "https://github.com/jcoffin1/ordinary", "description": "No add-on package", "isPrivate": False, "isArchived": False, "releases": {"nodes": [{"tagName": "v1", "isDraft": False, "isPrerelease": False, "releaseAssets": {"nodes": [{"name": "source.zip", "downloadUrl": "https://github.com/jcoffin1/ordinary/releases/download/v1/source.zip", "size": 30}]}}]}},
                 ],
                 "pageInfo": {"hasNextPage": True, "endCursor": "next-page"},
             }}},
@@ -292,7 +295,7 @@ class EngineTests(unittest.TestCase):
         second_page = {
             "data": {"viewer": {"login": "jcoffin1", "repositories": {
                 "nodes": [
-                    {"name": "template-addon", "nameWithOwner": "jcoffin1/template-addon", "url": "https://github.com/jcoffin1/template-addon", "description": "Template project", "isPrivate": True, "isArchived": False, "buildVariables": {"__typename": "Blob"}},
+                    {"name": "template-addon", "nameWithOwner": "jcoffin1/template-addon", "url": "https://github.com/jcoffin1/template-addon", "description": "Template project", "isPrivate": True, "isArchived": False, "releases": {"nodes": [{"tagName": "v3beta1", "isDraft": False, "isPrerelease": True, "releaseAssets": {"nodes": [{"name": "template-3beta1.nvda-addon", "downloadUrl": "https://github.com/jcoffin1/template-addon/releases/download/v3beta1/template-3beta1.nvda-addon", "size": 40}]}}]}},
                 ],
                 "pageInfo": {"hasNextPage": False, "endCursor": None},
             }}},
@@ -302,16 +305,19 @@ class EngineTests(unittest.TestCase):
             owner, repositories = publisher.github_addon_repositories()
         self.assertEqual("jcoffin1", owner)
         self.assertEqual(["jcoffin1/demo", "jcoffin1/template-addon"], [repository.full_name for repository in repositories])
+        self.assertEqual("v1.0", repositories[0].release_tag)
+        self.assertTrue(repositories[0].download_url.endswith("demo-1.0.nvda-addon"))
         self.assertTrue(repositories[1].private)
+        self.assertTrue(repositories[1].prerelease)
         self.assertIn("endCursor=next-page", run.call_args_list[-1].args[0])
 
     def test_github_addon_repository_lookup_reports_missing_authentication(self):
         with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "_run", side_effect=RuntimeError("gh failed: not logged into any GitHub hosts")):
             with self.assertRaises(publisher.AuthenticationRequired): publisher.github_addon_repositories()
 
-    def test_repository_url_gesture_and_clipboard_action_are_present(self):
+    def test_download_url_gesture_and_clipboard_action_are_present(self):
         plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
         self.assertIn('gesture="kb:NVDA+alt+shift+f"', plugin)
-        self.assertIn("api.copyToClip(repository.url)", plugin)
+        self.assertIn("api.copyToClip(repository.download_url)", plugin)
 
 if __name__ == "__main__": unittest.main()

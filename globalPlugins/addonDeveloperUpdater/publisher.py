@@ -53,6 +53,11 @@ class GitHubAddonRepository:
     description: str = ""
     private: bool = False
     archived: bool = False
+    release_tag: str = ""
+    prerelease: bool = False
+    asset_name: str = ""
+    download_url: str = ""
+    asset_size: int = 0
 
 _ADDON_REPOSITORIES_QUERY = r"""
 query($endCursor: String) {
@@ -66,20 +71,22 @@ query($endCursor: String) {
         description
         isPrivate
         isArchived
-        manifest: object(expression: "HEAD:manifest.ini") { __typename }
-        addonManifest: object(expression: "HEAD:addon/manifest.ini") { __typename }
-        nvdaManifest: object(expression: "HEAD:nvda/manifest.ini") { __typename }
-        sourceManifest: object(expression: "HEAD:src/manifest.ini") { __typename }
-        manifestTemplate: object(expression: "HEAD:manifest.ini.tpl") { __typename }
-        addonManifestTemplate: object(expression: "HEAD:addon/manifest.ini.tpl") { __typename }
-        buildVariables: object(expression: "HEAD:buildVars.py") { __typename }
+        releases(first: 20, orderBy: {field: CREATED_AT, direction: DESC}) {
+          nodes {
+            tagName
+            isDraft
+            isPrerelease
+            releaseAssets(first: 100) {
+              nodes { name downloadUrl size }
+            }
+          }
+        }
       }
       pageInfo { hasNextPage endCursor }
     }
   }
 }
 """
-_ADDON_REPOSITORY_MARKERS = ("manifest", "addonManifest", "nvdaManifest", "sourceManifest", "manifestTemplate", "addonManifestTemplate", "buildVariables")
 
 def store_readiness_reasons(report: ProjectPublishInfo) -> list[str]:
     """Explain every condition that prevents this local project being submitted."""
@@ -253,7 +260,7 @@ def gh_path() -> str:
     raise RuntimeError("GitHub CLI is not installed")
 
 def github_addon_repositories(progress=None) -> tuple[str, list[GitHubAddonRepository]]:
-    """List repositories owned by the active GitHub user that contain NVDA add-on project markers."""
+    """List newest downloadable NVDA add-on assets owned by the active GitHub user."""
     gh = gh_path()
     if progress: progress("Checking GitHub sign-in status")
     try: _run([gh, "auth", "status", "--active", "--hostname", "github.com"])
@@ -267,7 +274,7 @@ def github_addon_repositories(progress=None) -> tuple[str, list[GitHubAddonRepos
     page = 0
     while True:
         page += 1
-        if progress: progress(f"Loading NVDA add-on repositories from GitHub, page {page}")
+        if progress: progress(f"Loading released NVDA add-on files from GitHub, page {page}")
         arguments = [gh, "api", "graphql", "-f", f"query={_ADDON_REPOSITORIES_QUERY}"]
         if cursor: arguments.extend(["-F", f"endCursor={cursor}"])
         payload = json.loads(_run(arguments))
@@ -280,21 +287,28 @@ def github_addon_repositories(progress=None) -> tuple[str, list[GitHubAddonRepos
         owner = str(viewer.get("login") or owner)
         connection = viewer.get("repositories") or {}
         for repository in connection.get("nodes") or []:
-            if not isinstance(repository, dict) or not any(repository.get(marker) for marker in _ADDON_REPOSITORY_MARKERS): continue
+            if not isinstance(repository, dict): continue
             url = str(repository.get("url") or "").strip()
             full_name = str(repository.get("nameWithOwner") or "").strip()
             if not url.startswith("https://github.com/") or not full_name: continue
-            repositories.append(GitHubAddonRepository(
-                str(repository.get("name") or full_name.rsplit("/", 1)[-1]), full_name, url,
-                str(repository.get("description") or "").strip(), bool(repository.get("isPrivate")), bool(repository.get("isArchived")),
-            ))
+            for release in (repository.get("releases") or {}).get("nodes") or []:
+                if not isinstance(release, dict) or release.get("isDraft"): continue
+                assets = [asset for asset in (release.get("releaseAssets") or {}).get("nodes") or [] if isinstance(asset, dict) and str(asset.get("name") or "").casefold().endswith(".nvda-addon") and str(asset.get("downloadUrl") or "").startswith("https://github.com/")]
+                if not assets: continue
+                for asset in assets:
+                    repositories.append(GitHubAddonRepository(
+                        str(repository.get("name") or full_name.rsplit("/", 1)[-1]), full_name, url,
+                        str(repository.get("description") or "").strip(), bool(repository.get("isPrivate")), bool(repository.get("isArchived")),
+                        str(release.get("tagName") or ""), bool(release.get("isPrerelease")), str(asset.get("name") or ""), str(asset.get("downloadUrl") or ""), int(asset.get("size") or 0),
+                    ))
+                break
         page_info = connection.get("pageInfo") or {}
         if not page_info.get("hasNextPage"): break
         cursor = str(page_info.get("endCursor") or "")
         if not cursor or cursor in seen_cursors: raise RuntimeError("GitHub repository pagination did not provide a new continuation cursor")
         seen_cursors.add(cursor)
-    unique = {repository.full_name.casefold(): repository for repository in repositories}
-    return owner, sorted(unique.values(), key=lambda repository: repository.full_name.casefold())
+    unique = {repository.download_url.casefold(): repository for repository in repositories}
+    return owner, sorted(unique.values(), key=lambda repository: (repository.full_name.casefold(), repository.asset_name.casefold()))
 
 def project_root(manifest: Path) -> Path:
     for candidate in (manifest.parent, *manifest.parents):
