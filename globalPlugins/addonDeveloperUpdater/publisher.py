@@ -4,6 +4,17 @@ import base64, io, json, os, re, shutil, subprocess, time, urllib.parse, urllib.
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
+
+class _GitHubYamlLoader(yaml.SafeLoader):
+    """Safe YAML loader whose booleans match GitHub's true/false form syntax."""
+
+_GitHubYamlLoader.yaml_implicit_resolvers = {
+    key: [resolver for resolver in value if resolver[0] != "tag:yaml.org,2002:bool"]
+    for key, value in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_GitHubYamlLoader.add_implicit_resolver("tag:yaml.org,2002:bool", re.compile(r"^(?:true|false)$", re.I), list("tTfF"))
+
 STORE_FORM = "https://github.com/nvaccess/addon-datastore/issues/new?template=registerAddon.yml"
 STORE_PUBLISHER = "Justin Coffin"
 GITHUB_DEVICE_URL = "https://github.com/login/device"
@@ -67,6 +78,13 @@ class GitHubIssueTemplate:
     name: str
     sha: str = ""
     content: str = ""
+
+@dataclass
+class IssueTemplateDocument:
+    """A parsed GitHub issue form or legacy Markdown issue template."""
+    kind: str
+    data: dict
+    markdown_body: str = ""
 
 _ADDON_REPOSITORIES_QUERY = r"""
 query($endCursor: String) {
@@ -406,6 +424,73 @@ def update_github_issue_template(repository: GitHubAddonRepository, template: Gi
     request = json.dumps({"message": f"Update {template.name} issue template", "content": base64.b64encode(encoded).decode("ascii"), "sha": template.sha, "branch": branch})
     endpoint = f"repos/{full_name}/contents/{urllib.parse.quote(template.path, safe='/')}"
     _run([gh_path(), "api", "-X", "PUT", endpoint, "--input", "-"], input_text=request)
+
+def delete_github_issue_template(repository: GitHubAddonRepository, template: GitHubIssueTemplate) -> None:
+    """Delete an issue template only at the exact revision that was loaded."""
+    full_name, branch = _validated_repository(repository)
+    prefix = ".github/ISSUE_TEMPLATE/"; relative = template.path[len(prefix):] if template.path.startswith(prefix) else ""
+    if not template.sha or not relative or "/" in relative or "\\" in relative or Path(relative).suffix.casefold() not in {".md", ".yml", ".yaml"}: raise RuntimeError("Issue-template revision information is missing or invalid")
+    request = json.dumps({"message": f"Delete {template.name} issue template", "sha": template.sha, "branch": branch})
+    endpoint = f"repos/{full_name}/contents/{urllib.parse.quote(template.path, safe='/')}"
+    _run([gh_path(), "api", "-X", "DELETE", endpoint, "--input", "-"], input_text=request)
+
+def parse_issue_template_document(template: GitHubIssueTemplate, content: str | None = None) -> IssueTemplateDocument:
+    """Parse the editable parts of a GitHub issue form without discarding unknown keys."""
+    text = template.content if content is None else content
+    suffix = Path(template.name).suffix.casefold()
+    if suffix in {".yml", ".yaml"}:
+        data = yaml.load(text, Loader=_GitHubYamlLoader)
+        if not isinstance(data, dict): raise ValueError("The YAML issue template must contain a mapping at its top level")
+        if template.name.casefold() not in {"config.yml", "config.yaml"}:
+            body = data.get("body", [])
+            if not isinstance(body, list) or any(not isinstance(item, dict) for item in body): raise ValueError("The YAML issue form body must be a list of form elements")
+        return IssueTemplateDocument("yaml", data)
+    if suffix != ".md": raise ValueError("Only Markdown and YAML issue templates can be edited")
+    data = {}; body = text
+    if text.startswith("---"):
+        match = re.match(r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)", text, re.S)
+        if not match: raise ValueError("The Markdown issue template has an unterminated YAML header")
+        parsed = yaml.load(match.group(1), Loader=_GitHubYamlLoader) or {}
+        if not isinstance(parsed, dict): raise ValueError("The Markdown issue-template header must contain a mapping")
+        data = parsed; body = text[match.end():]
+    return IssueTemplateDocument("markdown", data, body)
+
+def render_issue_template_document(document: IssueTemplateDocument) -> str:
+    """Render a form document as valid UTF-8 GitHub template text."""
+    if document.kind == "yaml":
+        return yaml.safe_dump(document.data, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    if document.kind != "markdown": raise ValueError("Unknown issue-template format")
+    header = yaml.safe_dump(document.data, allow_unicode=True, sort_keys=False, default_flow_style=False).rstrip()
+    return f"---\n{header}\n---\n{document.markdown_body}"
+
+def validate_issue_template_document(template: GitHubIssueTemplate, document: IssueTemplateDocument) -> None:
+    """Reject form edits that GitHub's issue-form schema cannot accept."""
+    if document.kind == "markdown": return
+    if template.name.casefold() in {"config.yml", "config.yaml"}: return
+    data = document.data
+    for key in ("name", "description"):
+        if not isinstance(data.get(key), str) or not data[key].strip(): raise ValueError(f"The issue form requires a non-empty {key} field")
+    body = data.get("body")
+    if not isinstance(body, list) or not body: raise ValueError("The issue form requires at least one form question")
+    identifiers = set(); supported = {"input", "textarea", "dropdown", "checkboxes", "markdown"}
+    for index, item in enumerate(body, 1):
+        kind = item.get("type"); attributes = item.get("attributes")
+        if kind not in supported: raise ValueError(f"Question {index} has unsupported type {kind!r}")
+        if not isinstance(attributes, dict): raise ValueError(f"Question {index} requires an attributes section")
+        if kind == "markdown":
+            if not isinstance(attributes.get("value"), str) or not attributes["value"].strip(): raise ValueError(f"Markdown item {index} requires text")
+            continue
+        identifier = item.get("id")
+        if not isinstance(identifier, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", identifier): raise ValueError(f"Question {index} requires a unique ID containing only letters, numbers, hyphens, or underscores")
+        if identifier.casefold() in identifiers: raise ValueError(f"Question ID {identifier} is used more than once")
+        identifiers.add(identifier.casefold())
+        if not isinstance(attributes.get("label"), str) or not attributes["label"].strip(): raise ValueError(f"Question {index} requires a label")
+        if kind in {"dropdown", "checkboxes"}:
+            options = attributes.get("options")
+            if not isinstance(options, list) or not options: raise ValueError(f"Question {index} requires at least one option")
+            for option in options:
+                label = option.get("label") if isinstance(option, dict) else option
+                if not isinstance(label, str) or not label.strip(): raise ValueError(f"Question {index} contains an empty option")
 
 def project_root(manifest: Path) -> Path:
     for candidate in (manifest.parent, *manifest.parents):

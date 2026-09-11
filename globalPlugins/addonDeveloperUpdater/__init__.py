@@ -156,15 +156,146 @@ class GitHubSingleSelectionDialog(wx.Dialog):
         event.Skip()
 
 class IssueTemplateEditorDialog(wx.Dialog):
-    def __init__(self, parent, repository, template):
+    def __init__(self, parent, repository, template, document):
         super().__init__(parent, title=_("Edit GitHub issue template"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.onSave = None; mainSizer = wx.BoxSizer(wx.VERTICAL)
-        mainSizer.Add(wx.StaticText(self, label=_("Editing %s in %s on branch %s. Control+S saves after confirmation. Escape closes without saving.") % (template.name, repository.full_name, repository.default_branch)), 0, wx.ALL, 10)
-        self.editor = wx.TextCtrl(self, value=template.content, style=wx.TE_MULTILINE | wx.TE_RICH2 | wx.TE_DONTWRAP)
-        mainSizer.Add(self.editor, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
-        buttons = wx.BoxSizer(wx.HORIZONTAL); self.saveButton = wx.Button(self, label=_("&Save to GitHub")); self.closeButton = wx.Button(self, label=_("&Close without saving")); self.saveButton.SetDefault()
-        buttons.Add(self.saveButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
-        self.SetSizer(mainSizer); self.SetMinSize((700, 450)); self.SetSize((950, 680)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
+        self.template = template; self.onSave = None; self.onDelete = None; self._questionIndex = -1
+        self.document = document
+        self.formSupported = self.document is not None and len(template.content.encode("utf-8")) <= 256 * 1024 and template.name.casefold() not in {"config.yml", "config.yaml"}
+        if self.formSupported and self.document.kind == "yaml": self.formSupported = all(item.get("type") in {"input", "textarea", "dropdown", "checkboxes", "markdown"} for item in self.document.data.get("body", []))
+        mainSizer = wx.BoxSizer(wx.VERTICAL)
+        mainSizer.Add(wx.StaticText(self, label=_("Editing %s in %s on branch %s. Use the Form tab for common fields or Raw text for advanced changes. Control+S saves after confirmation; Escape closes without saving.") % (template.name, repository.full_name, repository.default_branch)), 0, wx.ALL, 10)
+        self.notebook = wx.Notebook(self)
+        if self.formSupported: self._createFormPage()
+        rawPage = wx.Panel(self.notebook); rawSizer = wx.BoxSizer(wx.VERTICAL)
+        rawSizer.Add(wx.StaticText(rawPage, label=_("Complete template text. Changes are checked before the Form tab can be reopened.")), 0, wx.ALL, 8)
+        self.editor = wx.TextCtrl(rawPage, value=template.content, style=wx.TE_MULTILINE | wx.TE_RICH2 | wx.TE_DONTWRAP)
+        rawSizer.Add(self.editor, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8); rawPage.SetSizer(rawSizer)
+        self.rawPageIndex = self.notebook.GetPageCount(); self.notebook.AddPage(rawPage, _("Raw &text"), select=not self.formSupported)
+        if self.formSupported: self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGING, self._onPageChanging)
+        mainSizer.Add(self.notebook, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        buttons = wx.BoxSizer(wx.HORIZONTAL); self.saveButton = wx.Button(self, label=_("&Save to GitHub")); self.deleteButton = wx.Button(self, label=_("&Delete template")); self.closeButton = wx.Button(self, label=_("&Close without saving")); self.saveButton.SetDefault()
+        buttons.Add(self.saveButton, 0, wx.RIGHT, 8); buttons.Add(self.deleteButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
+        self.SetSizer(mainSizer); self.SetMinSize((760, 540)); self.SetSize((1050, 760)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
+    def _addLabeled(self, panel, sizer, label, control):
+        sizer.Add(wx.StaticText(panel, label=label), 0, wx.ALIGN_CENTER_VERTICAL); sizer.Add(control, 1, wx.EXPAND)
+    def _createFormPage(self):
+        panel = wx.Panel(self.notebook); outer = wx.BoxSizer(wx.VERTICAL)
+        outer.Add(wx.StaticText(panel, label=_("The form preserves unrecognized properties, but it may normalize YAML formatting and comments. Use Raw text when exact formatting matters.")), 0, wx.EXPAND | wx.ALL, 8)
+        metadata = wx.FlexGridSizer(cols=2, hgap=8, vgap=6); metadata.AddGrowableCol(1, 1)
+        self.formName = wx.TextCtrl(panel); self.formDescription = wx.TextCtrl(panel); self.formTitle = wx.TextCtrl(panel); self.formLabels = wx.TextCtrl(panel); self.formAssignees = wx.TextCtrl(panel)
+        self._addLabeled(panel, metadata, _("Template &name:"), self.formName); self._addLabeled(panel, metadata, _("&Description:"), self.formDescription); self._addLabeled(panel, metadata, _("Default issue &title:"), self.formTitle); self._addLabeled(panel, metadata, _("&Labels, separated by commas:"), self.formLabels); self._addLabeled(panel, metadata, _("&Assignees, separated by commas:"), self.formAssignees)
+        outer.Add(metadata, 0, wx.EXPAND | wx.ALL, 8)
+        if self.document.kind == "markdown":
+            outer.Add(wx.StaticText(panel, label=_("Issue instructions and questions:")), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+            self.markdownBody = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_RICH2)
+            outer.Add(self.markdownBody, 1, wx.EXPAND | wx.ALL, 8)
+        else:
+            questionSizer = wx.BoxSizer(wx.HORIZONTAL); left = wx.BoxSizer(wx.VERTICAL)
+            left.Add(wx.StaticText(panel, label=_("Form questions:")), 0, wx.BOTTOM, 4); self.questionList = wx.ListBox(panel, style=wx.LB_SINGLE); left.Add(self.questionList, 1, wx.EXPAND)
+            questionButtons = wx.BoxSizer(wx.HORIZONTAL); self.addQuestionButton = wx.Button(panel, label=_("&Add")); self.removeQuestionButton = wx.Button(panel, label=_("&Remove")); self.moveUpButton = wx.Button(panel, label=_("Move &up")); self.moveDownButton = wx.Button(panel, label=_("Move &down"))
+            for button in (self.addQuestionButton, self.removeQuestionButton, self.moveUpButton, self.moveDownButton): questionButtons.Add(button, 0, wx.RIGHT, 5)
+            left.Add(questionButtons, 0, wx.TOP, 6); questionSizer.Add(left, 1, wx.EXPAND | wx.RIGHT, 10)
+            details = wx.FlexGridSizer(cols=2, hgap=8, vgap=6); details.AddGrowableCol(1, 1)
+            self.questionType = wx.Choice(panel, choices=["input", "textarea", "dropdown", "checkboxes", "markdown"]); self.questionId = wx.TextCtrl(panel); self.questionLabel = wx.TextCtrl(panel); self.questionDescription = wx.TextCtrl(panel); self.questionPlaceholder = wx.TextCtrl(panel); self.questionRendered = wx.TextCtrl(panel); self.questionValue = wx.TextCtrl(panel, style=wx.TE_MULTILINE); self.questionOptions = wx.TextCtrl(panel, style=wx.TE_MULTILINE); self.questionMultiple = wx.CheckBox(panel, label=_("Allow multiple selections")); self.questionRequired = wx.CheckBox(panel, label=_("Response required"))
+            self._addLabeled(panel, details, _("Question &type:"), self.questionType); self._addLabeled(panel, details, _("Question &ID:"), self.questionId); self._addLabeled(panel, details, _("Question label:"), self.questionLabel); self._addLabeled(panel, details, _("Help text:"), self.questionDescription); self._addLabeled(panel, details, _("Placeholder:"), self.questionPlaceholder); self._addLabeled(panel, details, _("Rendered language:"), self.questionRendered); self._addLabeled(panel, details, _("Default value or Markdown text:"), self.questionValue); self._addLabeled(panel, details, _("Options, one per line:"), self.questionOptions); details.AddSpacer(1); details.Add(self.questionMultiple, 0); details.AddSpacer(1); details.Add(self.questionRequired, 0)
+            questionSizer.Add(details, 2, wx.EXPAND); outer.Add(questionSizer, 1, wx.EXPAND | wx.ALL, 8)
+            self.questionList.Bind(wx.EVT_LISTBOX, self._onQuestionSelected); self.questionType.Bind(wx.EVT_CHOICE, lambda _event: self._enableQuestionFields()); self.addQuestionButton.Bind(wx.EVT_BUTTON, self._addQuestion); self.removeQuestionButton.Bind(wx.EVT_BUTTON, self._removeQuestion); self.moveUpButton.Bind(wx.EVT_BUTTON, lambda _event: self._moveQuestion(-1)); self.moveDownButton.Bind(wx.EVT_BUTTON, lambda _event: self._moveQuestion(1))
+        panel.SetSizer(outer); self.formPage = panel; self.notebook.AddPage(panel, _("&Form"), select=True); self._populateForm()
+    @staticmethod
+    def _listText(value):
+        if isinstance(value, list): return ", ".join(str(item) for item in value)
+        return str(value or "")
+    @staticmethod
+    def _splitList(value): return [item.strip() for item in value.split(",") if item.strip()]
+    def _populateForm(self):
+        data = self.document.data
+        self.formName.SetValue(str(data.get("name") or "")); self.formDescription.SetValue(str(data.get("description", data.get("about", "")) or "")); self.formTitle.SetValue(str(data.get("title") or "")); self.formLabels.SetValue(self._listText(data.get("labels"))); self.formAssignees.SetValue(self._listText(data.get("assignees")))
+        if self.document.kind == "markdown": self.markdownBody.SetValue(self.document.markdown_body); return
+        self._questionIndex = -1; self._refreshQuestionList(0)
+    def _setValue(self, data, key, value):
+        if value or key in data: data[key] = value
+    def _storeMetadata(self):
+        data = self.document.data; self._setValue(data, "name", self.formName.GetValue().strip()); descriptionKey = "about" if self.document.kind == "markdown" else "description"; self._setValue(data, descriptionKey, self.formDescription.GetValue().strip()); self._setValue(data, "title", self.formTitle.GetValue())
+        labels = self._splitList(self.formLabels.GetValue()); assignees = self._splitList(self.formAssignees.GetValue())
+        self._setValue(data, "labels", ", ".join(labels) if self.document.kind == "markdown" else labels); self._setValue(data, "assignees", ", ".join(assignees) if self.document.kind == "markdown" else assignees)
+        if self.document.kind == "markdown": self.document.markdown_body = self.markdownBody.GetValue()
+    def _questions(self): return self.document.data.setdefault("body", [])
+    def _questionSummary(self, item, index):
+        kind = str(item.get("type") or "unknown"); attributes = item.get("attributes") if isinstance(item.get("attributes"), dict) else {}; label = str(attributes.get("label") or attributes.get("value") or item.get("id") or "").replace("\n", " ").strip(); return _("%d. %s; %s") % (index + 1, kind, label[:80] or _("unnamed"))
+    def _refreshQuestionList(self, selection=0):
+        questions = self._questions(); self.questionList.Set([self._questionSummary(item, index) for index, item in enumerate(questions)])
+        if questions:
+            selection = min(max(selection, 0), len(questions) - 1); self.questionList.SetSelection(selection); self._questionIndex = selection; self._loadQuestion(questions[selection])
+        else: self._questionIndex = -1; self._clearQuestion()
+    def _clearQuestion(self):
+        self.questionType.SetSelection(wx.NOT_FOUND)
+        for control in (self.questionId, self.questionLabel, self.questionDescription, self.questionPlaceholder, self.questionRendered, self.questionValue, self.questionOptions): control.SetValue(""); control.Disable()
+        self.questionType.Disable(); self.questionMultiple.SetValue(False); self.questionMultiple.Disable(); self.questionRequired.SetValue(False); self.questionRequired.Disable()
+    def _loadQuestion(self, item):
+        self.questionType.Enable(); kind = str(item.get("type") or "input"); selection = self.questionType.FindString(kind); self.questionType.SetSelection(selection if selection != wx.NOT_FOUND else 0)
+        attributes = item.get("attributes") if isinstance(item.get("attributes"), dict) else {}; validations = item.get("validations") if isinstance(item.get("validations"), dict) else {}; options = attributes.get("options") if isinstance(attributes.get("options"), list) else []
+        optionLabels = [str(option.get("label") or "") if isinstance(option, dict) else str(option) for option in options]
+        self.questionId.SetValue(str(item.get("id") or "")); self.questionLabel.SetValue(str(attributes.get("label") or "")); self.questionDescription.SetValue(str(attributes.get("description") or "")); self.questionPlaceholder.SetValue(str(attributes.get("placeholder") or "")); self.questionRendered.SetValue(str(attributes.get("render") or "")); self.questionValue.SetValue(str(attributes.get("value") or "")); self.questionOptions.SetValue("\n".join(optionLabels)); self.questionMultiple.SetValue(bool(attributes.get("multiple"))); self.questionRequired.SetValue(bool(validations.get("required"))); self._enableQuestionFields()
+    def _enableQuestionFields(self):
+        kind = self.questionType.GetStringSelection(); markdown = kind == "markdown"; options = kind in {"dropdown", "checkboxes"}
+        self.questionId.Enable(bool(kind) and not markdown); self.questionLabel.Enable(bool(kind) and not markdown); self.questionDescription.Enable(bool(kind) and not markdown); self.questionPlaceholder.Enable(kind in {"input", "textarea"}); self.questionRendered.Enable(kind == "textarea"); self.questionValue.Enable(kind in {"input", "textarea", "markdown"}); self.questionOptions.Enable(options); self.questionMultiple.Enable(kind == "dropdown"); self.questionRequired.Enable(bool(kind) and not markdown)
+    def _storeQuestion(self):
+        if self._questionIndex < 0: return
+        item = self._questions()[self._questionIndex]; kind = self.questionType.GetStringSelection() or str(item.get("type") or "input"); item["type"] = kind
+        if kind != "markdown": item["id"] = self.questionId.GetValue().strip()
+        attributes = item.setdefault("attributes", {}); validations = item.setdefault("validations", {})
+        if not isinstance(attributes, dict): attributes = {}; item["attributes"] = attributes
+        if not isinstance(validations, dict): validations = {}; item["validations"] = validations
+        knownAttributes = {"label", "description", "placeholder", "render", "value", "options", "multiple"}
+        allowedAttributes = {
+            "input": {"label", "description", "placeholder", "value"}, "textarea": {"label", "description", "placeholder", "render", "value"},
+            "dropdown": {"label", "description", "options", "multiple"}, "checkboxes": {"label", "description", "options"}, "markdown": {"value"},
+        }[kind]
+        for key in knownAttributes - allowedAttributes: attributes.pop(key, None)
+        if kind == "markdown":
+            item.pop("id", None); item.pop("validations", None); attributes["value"] = self.questionValue.GetValue()
+        else:
+            self._setValue(attributes, "label", self.questionLabel.GetValue()); self._setValue(attributes, "description", self.questionDescription.GetValue()); self._setValue(attributes, "placeholder", self.questionPlaceholder.GetValue()); self._setValue(attributes, "render", self.questionRendered.GetValue()); self._setValue(attributes, "value", self.questionValue.GetValue()); validations["required"] = self.questionRequired.IsChecked()
+            if kind in {"dropdown", "checkboxes"}:
+                values = [line.strip() for line in self.questionOptions.GetValue().splitlines() if line.strip()]; old = attributes.get("options") if isinstance(attributes.get("options"), list) else []; updated = []
+                for index, value in enumerate(values):
+                    if kind == "checkboxes":
+                        option = dict(old[index]) if index < len(old) and isinstance(old[index], dict) else {}; option["label"] = value; updated.append(option)
+                    else: updated.append(value)
+                attributes["options"] = updated
+            if kind == "dropdown" and (self.questionMultiple.IsChecked() or "multiple" in attributes): attributes["multiple"] = self.questionMultiple.IsChecked()
+    def _onQuestionSelected(self, event):
+        newIndex = event.GetSelection()
+        if self._questionIndex >= 0: self._storeQuestion()
+        self._questionIndex = newIndex; self._loadQuestion(self._questions()[newIndex]); self.questionList.Set([self._questionSummary(item, index) for index, item in enumerate(self._questions())]); self.questionList.SetSelection(newIndex)
+    def _addQuestion(self, _event):
+        self._storeQuestion(); questions = self._questions(); identifier = "question_%d" % (len(questions) + 1); questions.append({"type": "textarea", "id": identifier, "attributes": {"label": _("New question"), "description": ""}, "validations": {"required": False}}); self._refreshQuestionList(len(questions) - 1); self.questionLabel.SetFocus()
+    def _removeQuestion(self, _event):
+        if self._questionIndex < 0: ui.message(_("No form question is selected")); return
+        index = self._questionIndex; del self._questions()[index]; self._refreshQuestionList(max(0, index - 1)); ui.message(_("Question removed from the unsaved template"))
+    def _moveQuestion(self, offset):
+        if self._questionIndex < 0: ui.message(_("No form question is selected")); return
+        self._storeQuestion(); questions = self._questions(); target = self._questionIndex + offset
+        if target < 0 or target >= len(questions): ui.message(_("The question cannot be moved farther")); return
+        questions[self._questionIndex], questions[target] = questions[target], questions[self._questionIndex]; self._refreshQuestionList(target); self.questionList.SetFocus()
+    def _renderForm(self):
+        self._storeMetadata()
+        if self.document.kind == "yaml": self._storeQuestion()
+        return publisher.render_issue_template_document(self.document)
+    def _onPageChanging(self, event):
+        if event.GetOldSelection() == 0 and event.GetSelection() == self.rawPageIndex:
+            self.editor.SetValue(self._renderForm())
+        elif event.GetOldSelection() == self.rawPageIndex and event.GetSelection() == 0:
+            if len(self.editor.GetValue().encode("utf-8")) > 256 * 1024:
+                ui.message(_("This template is too large for the form editor. Continue editing it as raw text.")); event.Veto(); return
+            try: document = publisher.parse_issue_template_document(self.template, self.editor.GetValue())
+            except (TypeError, ValueError) as error:
+                ui.message(_("The raw template cannot be shown as a form: %s") % error); event.Veto(); return
+            self.document = document; self._populateForm()
+        event.Skip()
+    def getContent(self):
+        return self.editor.GetValue() if not self.formSupported or self.notebook.GetSelection() == self.rawPageIndex else self._renderForm()
+    def initialFocus(self): return self.formName if self.formSupported else self.editor
     def _onKey(self, event):
         key = event.GetKeyCode()
         if key == wx.WXK_ESCAPE: self.Close(); return
@@ -516,7 +647,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if self._githubSelectionDialog is not None:
             self._githubSelectionDialog.Raise(); self._githubSelectionDialog.itemList.SetFocus(); return
         if self._templateEditorDialog is not None:
-            self._templateEditorDialog.Raise(); self._templateEditorDialog.editor.SetFocus(); return
+            self._templateEditorDialog.Raise(); self._templateEditorDialog.initialFocus().SetFocus(); return
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
         message = _("Loading add-on repositories and Issues settings from GitHub") if action == "issues" else _("Loading add-on repositories and issue templates from GitHub")
         ui.message(message); self._startProgress(keepFocus=True)
@@ -611,26 +742,55 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._stopProgress(); self._scanLock.release(); log.exception("Could not start issue-template load"); ui.message(_("The issue template could not be loaded"))
     def _loadIssueTemplate(self, repository, template):
         callback = None; arguments = ()
-        try: callback, arguments = self._showIssueTemplateEditor, (repository, publisher.load_github_issue_template(repository, template))
+        try:
+            loaded = publisher.load_github_issue_template(repository, template)
+            try: document = publisher.parse_issue_template_document(loaded)
+            except (TypeError, ValueError): document = None
+            callback, arguments = self._showIssueTemplateEditor, (repository, loaded, document)
         except Exception as error:
             log.exception("Issue-template load failed"); callback, arguments = self._showInformation, (_("Issue-template load failed"), _("%s could not be loaded: %s") % (template.name, error))
         finally:
             self._scanLock.release()
             if callback is not None: self._finishProgressThen(callback, *arguments)
-    def _showIssueTemplateEditor(self, repository, template):
+    def _showIssueTemplateEditor(self, repository, template, document):
         if self._templateEditorDialog is not None: self._templateEditorDialog.Raise(); return
-        dialog = IssueTemplateEditorDialog(gui.mainFrame, repository, template); self._templateEditorDialog = dialog
+        dialog = IssueTemplateEditorDialog(gui.mainFrame, repository, template, document); self._templateEditorDialog = dialog
         def close(_event=None):
             if self._templateEditorDialog is dialog: self._templateEditorDialog = None
             dialog.Destroy()
         def save(_event=None):
-            content = dialog.editor.GetValue()
+            content = dialog.getContent()
             if content == template.content: ui.message(_("The issue template has not changed")); return
             if not content: ui.message(_("The issue template cannot be empty")); return
-            message = _("Commit these changes to %s on its %s branch? The existing file will be updated only if it has not changed on GitHub since it was loaded.") % (repository.full_name, repository.default_branch)
-            self._showConfirmation(_("Save issue template to GitHub"), message, lambda: self._startIssueTemplateSave(repository, template, content, dialog))
-        dialog.onSave = save; dialog.saveButton.Bind(wx.EVT_BUTTON, save); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
-        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.editor.SetFocus)
+            self._beginIssueTemplateSaveValidation(repository, template, content, dialog)
+        def delete(_event=None):
+            message = _("Delete %s from %s on its %s branch? This creates a deletion commit and cannot be undone from this dialog. The file will be deleted only if it has not changed on GitHub since it was loaded.") % (template.name, repository.full_name, repository.default_branch)
+            self._showConfirmation(_("Delete GitHub issue template"), message, lambda: self._startIssueTemplateDelete(repository, template, dialog))
+        dialog.onSave = save; dialog.onDelete = delete; dialog.saveButton.Bind(wx.EVT_BUTTON, save); dialog.deleteButton.Bind(wx.EVT_BUTTON, delete); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
+        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.initialFocus().SetFocus)
+    def _beginIssueTemplateSaveValidation(self, repository, template, content, dialog):
+        if self._templateEditorDialog is not dialog: return
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        dialog.Disable(); ui.message(_("Checking %s before saving") % template.name); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._validateIssueTemplateForSave, args=(repository, template, content, dialog), name="addonDeveloperIssueTemplateValidation", daemon=True).start()
+        except Exception:
+            dialog.Enable(); self._stopProgress(); self._scanLock.release(); log.exception("Could not start issue-template validation"); ui.message(_("The issue template could not be checked"))
+    def _validateIssueTemplateForSave(self, repository, template, content, dialog):
+        valid = False; errorMessage = ""
+        try:
+            publisher.validate_issue_template_document(template, publisher.parse_issue_template_document(template, content)); valid = True
+        except (TypeError, ValueError) as error: errorMessage = str(error)
+        except Exception as error:
+            log.exception("Issue-template validation failed"); errorMessage = str(error)
+        finally:
+            self._scanLock.release(); self._finishProgressThen(self._finishIssueTemplateValidation, repository, template, content, dialog, valid, errorMessage)
+    def _finishIssueTemplateValidation(self, repository, template, content, dialog, valid, errorMessage):
+        if self._templateEditorDialog is not dialog: return
+        dialog.Enable()
+        if not valid:
+            dialog.Raise(); dialog.initialFocus().SetFocus(); self._showInformation(_("Issue template is not valid"), _("The issue template was not saved: %s") % errorMessage); return
+        message = _("Commit these changes to %s on its %s branch? The existing file will be updated only if it has not changed on GitHub since it was loaded.") % (repository.full_name, repository.default_branch)
+        self._showConfirmation(_("Save issue template to GitHub"), message, lambda: self._startIssueTemplateSave(repository, template, content, dialog))
     def _startIssueTemplateSave(self, repository, template, content, dialog):
         if self._templateEditorDialog is not dialog: return
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
@@ -649,8 +809,28 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _finishIssueTemplateSave(self, dialog, succeeded, message):
         if self._templateEditorDialog is dialog:
             if succeeded: self._templateEditorDialog = None; dialog.Destroy()
-            else: dialog.Enable(); dialog.Raise(); dialog.editor.SetFocus()
+            else: dialog.Enable(); dialog.Raise(); dialog.initialFocus().SetFocus()
         ui.message(message); self._showInformation(_("Issue template saved") if succeeded else _("Issue-template save failed"), message)
+    def _startIssueTemplateDelete(self, repository, template, dialog):
+        if self._templateEditorDialog is not dialog: return
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        dialog.Disable(); ui.message(_("Deleting %s from GitHub") % template.name); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._deleteIssueTemplate, args=(repository, template, dialog), name="addonDeveloperIssueTemplateDelete", daemon=True).start()
+        except Exception:
+            dialog.Enable(); self._stopProgress(); self._scanLock.release(); log.exception("Could not start issue-template deletion"); ui.message(_("The issue template could not be deleted"))
+    def _deleteIssueTemplate(self, repository, template, dialog):
+        succeeded = False; message = ""
+        try:
+            publisher.delete_github_issue_template(repository, template); succeeded = True; message = _("Deleted %s from %s on branch %s.") % (template.name, repository.full_name, repository.default_branch)
+        except Exception as error:
+            log.exception("Issue-template deletion failed"); message = _("The issue template was not deleted: %s") % error
+        finally:
+            self._scanLock.release(); self._finishProgressThen(self._finishIssueTemplateDelete, dialog, succeeded, message)
+    def _finishIssueTemplateDelete(self, dialog, succeeded, message):
+        if self._templateEditorDialog is dialog:
+            if succeeded: self._templateEditorDialog = None; dialog.Destroy()
+            else: dialog.Enable(); dialog.Raise(); dialog.initialFocus().SetFocus()
+        ui.message(message); self._showInformation(_("Issue template deleted") if succeeded else _("Issue-template deletion failed"), message)
     def _offerGitHubProjectLogin(self, action):
         self._showConfirmation(_("Sign in to GitHub"), _("GitHub CLI is not signed in for NVDA. Sign in now to access add-on repository Issues and templates? A one-time code will be copied to the clipboard and GitHub will open in your browser."), lambda: self._startGitHubProjectLogin(action), defaultYes=True, onNo=lambda: self._showInformation(_("GitHub repository action canceled"), _("No GitHub page was opened and no issue template was changed.")))
     def _startGitHubProjectLogin(self, action):

@@ -370,11 +370,63 @@ class EngineTests(unittest.TestCase):
         self.assertEqual("main", request["branch"])
         self.assertEqual("name: Updated\n", publisher.base64.b64decode(request["content"]).decode())
 
+    def test_issue_template_delete_uses_revision_and_default_branch(self):
+        repository = publisher.GitHubAddonRepository("addon", "owner/addon", "https://github.com/owner/addon", default_branch="main")
+        template = publisher.GitHubIssueTemplate(".github/ISSUE_TEMPLATE/bug.yml", "bug.yml", "abc123", "name: Bug\n")
+        with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "_run", return_value="") as run:
+            publisher.delete_github_issue_template(repository, template)
+        arguments = run.call_args.args[0]; request = json.loads(run.call_args.kwargs["input_text"])
+        self.assertIn("DELETE", arguments)
+        self.assertEqual("abc123", request["sha"])
+        self.assertEqual("main", request["branch"])
+        self.assertNotIn("content", request)
+
+    def test_yaml_issue_form_round_trip_preserves_unknown_fields(self):
+        content = "name: Bug report\ndescription: Report a problem\ntitle: '[Bug] '\nlabels:\n- bug\nbody:\n- type: textarea\n  id: details\n  attributes:\n    label: What happened?\n    custom: keep me\n  validations:\n    required: true\nx-extra: preserved\n"
+        template = publisher.GitHubIssueTemplate(".github/ISSUE_TEMPLATE/bug.yml", "bug.yml", "abc", content)
+        document = publisher.parse_issue_template_document(template)
+        document.data["description"] = "Updated description"
+        rendered = publisher.render_issue_template_document(document)
+        reparsed = publisher.parse_issue_template_document(template, rendered)
+        self.assertEqual("Updated description", reparsed.data["description"])
+        self.assertEqual("keep me", reparsed.data["body"][0]["attributes"]["custom"])
+        self.assertEqual("preserved", reparsed.data["x-extra"])
+
+    def test_yaml_issue_form_validation_rejects_duplicate_ids_and_empty_options(self):
+        template = publisher.GitHubIssueTemplate(".github/ISSUE_TEMPLATE/bug.yml", "bug.yml")
+        document = publisher.IssueTemplateDocument("yaml", {"name": "Bug", "description": "Report", "body": [
+            {"type": "input", "id": "details", "attributes": {"label": "Details"}},
+            {"type": "dropdown", "id": "details", "attributes": {"label": "Version", "options": []}},
+        ]})
+        with self.assertRaisesRegex(ValueError, "used more than once"): publisher.validate_issue_template_document(template, document)
+        document.data["body"][1]["id"] = "version"
+        with self.assertRaisesRegex(ValueError, "at least one option"): publisher.validate_issue_template_document(template, document)
+
+    def test_yaml_issue_form_treats_yes_option_as_visible_text(self):
+        content = "name: Compatibility\ndescription: Check compatibility\nbody:\n- type: dropdown\n  id: workedBefore\n  attributes:\n    label: Did this work before?\n    options:\n    - Yes\n    - No\n"
+        template = publisher.GitHubIssueTemplate(".github/ISSUE_TEMPLATE/compatibility.yml", "compatibility.yml", content=content)
+        document = publisher.parse_issue_template_document(template)
+        self.assertEqual(["Yes", "No"], document.data["body"][0]["attributes"]["options"])
+        publisher.validate_issue_template_document(template, document)
+        rendered = publisher.render_issue_template_document(document)
+        self.assertIn("- 'Yes'", rendered)
+
+    def test_markdown_issue_template_form_preserves_body(self):
+        content = "---\nname: Bug\nabout: Report a bug\ntitle: ''\nlabels: bug\nassignees: ''\n---\n## Steps\nTell us what happened.\n"
+        template = publisher.GitHubIssueTemplate(".github/ISSUE_TEMPLATE/bug.md", "bug.md", "abc", content)
+        document = publisher.parse_issue_template_document(template)
+        document.data["about"] = "Updated"
+        rendered = publisher.render_issue_template_document(document)
+        self.assertIn("about: Updated", rendered)
+        self.assertTrue(rendered.endswith("## Steps\nTell us what happened.\n"))
+
     def test_issue_and_template_gestures_are_registered(self):
         plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
         self.assertIn('gesture="kb:NVDA+alt+shift+i"', plugin)
         self.assertIn('gesture="kb:NVDA+alt+shift+t"', plugin)
         self.assertIn("Save issue template to GitHub", plugin)
+        self.assertIn("Delete GitHub issue template", plugin)
+        self.assertIn("dialog.getContent()", plugin)
         self.assertIn("template.sha", (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "publisher.py").read_text(encoding="utf-8"))
 
 if __name__ == "__main__": unittest.main()
