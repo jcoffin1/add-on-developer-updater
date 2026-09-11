@@ -430,6 +430,9 @@ class EngineTests(unittest.TestCase):
         self.assertIn("Issue template display &name, shown in GitHub's New Issue menu", plugin)
         self.assertIn("Short answer, one line", plugin)
         self.assertIn("Require an answer before the issue can be submitted", plugin)
+        self.assertIn("control.SetName(label.replace", plugin)
+        self.assertIn("self.editor.SetName", plugin)
+        self.assertIn("self.questionList.SetName", plugin)
         self.assertIn("template.sha", (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "publisher.py").read_text(encoding="utf-8"))
 
 if __name__ == "__main__": unittest.main()
