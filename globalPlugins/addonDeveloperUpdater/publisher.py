@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import base64, io, json, os, re, shutil, subprocess, time, urllib.parse, urllib.request, webbrowser, zipfile
+import base64, io, json, os, re, shutil, subprocess, tempfile, time, urllib.parse, urllib.request, webbrowser, zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -253,10 +253,7 @@ def _github_disclosure_issues(gh: str, remote: str, release_tag: str) -> list[st
             return findings[:20]
     return findings
 
-def _api_versions() -> dict:
-    request = urllib.request.Request(NVDA_API_VERSIONS_URL, headers={"User-Agent": "NVDA-Addon-Developer-Updater"})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        data = json.load(response)
+def _parse_nvda_api_versions(data) -> dict:
     versions = {}
     for item in data if isinstance(data, list) else []:
         api = item.get("apiVer", {}) if isinstance(item, dict) else {}
@@ -268,6 +265,36 @@ def _api_versions() -> dict:
         versions[f"{major}.{minor}.{patch}"] = details
         if patch == 0: versions[f"{major}.{minor}"] = details
     return versions
+
+def nvda_api_versions(cache_path: Path | None = None) -> dict:
+    """Load official Store API versions, optionally falling back to a saved response."""
+    request = urllib.request.Request(NVDA_API_VERSIONS_URL, headers={"User-Agent": "NVDA-Addon-Developer-Updater"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.load(response)
+        versions = _parse_nvda_api_versions(data)
+        if not versions: raise ValueError("the official response contained no NVDA API versions")
+        if cache_path is not None:
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True); fd, temporary = tempfile.mkstemp(prefix=cache_path.name + ".", dir=cache_path.parent)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream: json.dump(data, stream); stream.write("\n")
+                    os.replace(temporary, cache_path)
+                finally:
+                    if os.path.exists(temporary): os.unlink(temporary)
+            except OSError:
+                # A read-only or full configuration folder must not discard a
+                # valid response that has already been received from NV Access.
+                pass
+        return versions
+    except Exception:
+        if cache_path is None: raise
+        try:
+            with cache_path.open(encoding="utf-8-sig") as stream: versions = _parse_nvda_api_versions(json.load(stream))
+            if versions: return versions
+        except (OSError, TypeError, ValueError):
+            pass
+        raise
 
 def normalized_version(value: str) -> str:
     return (value or "").strip().removeprefix("v").removeprefix("V")
@@ -551,7 +578,7 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
         if "not logged" in str(error).lower(): raise AuthenticationRequired("GitHub CLI is not signed in for NVDA") from error
         raise
     authenticated_owner = _run([gh, "api", "user", "--jq", ".login"]).strip()
-    try: api_versions = _api_versions()
+    try: api_versions = nvda_api_versions()
     except Exception as error: raise RuntimeError(f"current NVDA Add-on Store API versions could not be loaded: {error}") from error
     reports = []
     for index, project in enumerate(projects, 1):

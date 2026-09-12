@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026.2.34
+
+- Rename the downgrade interface to Set an older NVDA compatibility target and explain that it changes metadata rather than code or NVDA.
+- Replace free-text versions with official NVDA Add-on Store versions valid for every selected manifest.
+- Offer experimental NVDA targets only to manifests using the beta or development update channel.
+- Cache the last successful official version list so the chooser can still open while offline.
+- Display paths, Git branches, compatibility bounds, and uncommitted-manifest warnings before changes.
+- Add a detailed final confirmation while keeping every selection off by default.
+- Revalidate changed manifests and restore the original automatically when validation fails.
+- Add an assignable undo command that refuses to overwrite any manifest changed after the compatibility operation.
+- Preserve the previous undo operation when a later compatibility attempt makes no changes.
+- Keep `minimumNVDAVersion`, source code, add-on versions, and NVDA itself unchanged.
+
 ## 2026.2.33
 
 - Set the minimum supported NVDA version to the final 2025 stable release, NVDA 2025.3.3, and the last tested version to the current stable release, NVDA 2026.2.

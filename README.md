@@ -23,14 +23,16 @@ Add-on Developer Updater helps NVDA add-on developers discover development proje
 ## Commands
 
 - `NVDA+Alt+Shift+U`: check for NVDA compatibility updates.
-- `NVDA+Alt+Shift+D`: downgrade selected compatibility declarations.
+- `NVDA+Alt+Shift+D`: set an older last-tested NVDA target for selected manifests.
 - `NVDA+Alt+G` or `NVDA+Alt+Shift+G`: select projects to publish to GitHub.
 - `NVDA+Alt+Shift+F`: select the newest released `.nvda-addon` file from the signed-in GitHub account and copy its direct download URL.
 - `NVDA+Alt+Shift+I`: select an add-on repository and open its GitHub Issues page.
 - `NVDA+Alt+Shift+T`: select an add-on repository, edit one of its GitHub issue templates as an accessible form or raw text, or delete it after confirmation.
 - `NVDA+Alt+Shift+S`: select projects for Add-on Store readiness review.
 
-Additional commands can be assigned in NVDA's Input Gestures dialog under **Add-on Developer Updater**.
+Additional commands, including **Undo the most recent compatibility target changes**, can be assigned in NVDA's Input Gestures dialog under **Add-on Developer Updater**.
+
+The compatibility-target command loads the version list recognized by the official NVDA Add-on Store away from NVDA's main thread and saves the last successful response for offline fallback. Select add-ons first; the version list then contains only older targets shared by every selection and never permits a target below an add-on's `minimumNVDAVersion`. Experimental targets are available only when every selected manifest uses the `beta` or `dev` update channel. Each row identifies the path, Git branch, current and minimum versions, and whether the manifest has uncommitted changes. A final confirmation explains every proposed change and warns about dirty manifests. The operation changes only `lastTestedNVDAVersion`; it does not lower the minimum version or alter NVDA, source code, or the add-on version. Every changed manifest is backed up and revalidated, and a failed validation restores the original automatically. The undo command restores the most recent set only when the manifest is byte-for-byte unchanged since the compatibility operation, so later edits are never overwritten. If source already uses newer NVDA APIs, check out the appropriate older source branch instead.
 
 ## Requirements
 

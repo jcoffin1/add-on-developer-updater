@@ -14,7 +14,9 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 - Run `NVDA+Alt+Shift+U`; verify progress feedback, completion details, and continued NVDA responsiveness.
 - Run the assigned review command; verify focus, Space selection, Control+A, Enter, and Escape.
 - Update one disposable manifest and confirm the announcement, formatting preservation, and backup.
-- Run the downgrade command against disposable manifests at, above, and below their minimum versions.
+- Run the compatibility-target command against multiple disposable manifests and verify that only shared official versions above every minimum are offered, and that experimental versions require beta or development channels for every selection.
+- Confirm branch, path, minimum, current target, and uncommitted-manifest status are announced accurately.
+- Test confirmation, automatic rollback after simulated validation failure, successful undo, missing backup, and refusal to overwrite a later manifest edit.
 - Start a scan and invoke the assigned cancel command. During a non-scan GitHub operation, confirm the command says no scan is running.
 
 ## GitHub workflow

@@ -85,6 +85,94 @@ class EngineTests(unittest.TestCase):
         for invalid in ("2026", "2026.2.3.4", "2026.-1", "junk2026.2"):
             with self.assertRaises(ValueError): engine.version_tuple(invalid)
 
+    def test_compatibility_targets_are_official_unique_and_shared(self):
+        choices = engine.compatibility_version_choices({
+            "2026.2.0": {"experimental": False},
+            "2026.2": {"experimental": False},
+            "2026.1.1": {"experimental": False},
+            "2026.1": {"experimental": False},
+            "2025.3.3": {"experimental": False},
+            "2027.1": {"experimental": True},
+            "invalid": {},
+        })
+        self.assertEqual(1, sum(version == "2026.2" for version, _experimental in choices))
+        self.assertEqual(("2027.1", True), choices[0])
+        projects = [
+            engine.CompatibilityTargetProject("one", "One", "one.ini", "2026.2", "2025.3.3", "", "main", False),
+            engine.CompatibilityTargetProject("two", "Two", "two.ini", "2026.1.1", "2025.3.3", "", "release", False),
+        ]
+        self.assertEqual(
+            ["2026.1", "2025.3.3"],
+            [version for version, _experimental in engine.allowed_compatibility_targets(projects, choices)],
+        )
+        invalid = [engine.CompatibilityTargetProject("bad", "Bad", "bad.ini", "unknown", "2025.3.3", "", "main", False)]
+        self.assertEqual([], engine.allowed_compatibility_targets(invalid, choices))
+
+        stable = [engine.CompatibilityTargetProject("stable", "Stable", "stable.ini", "2028.1", "2025.3.3", "", "main", False)]
+        beta = [engine.CompatibilityTargetProject("beta", "Beta", "beta.ini", "2028.1", "2025.3.3", "beta", "main", False)]
+        self.assertNotIn("2027.1", [version for version, _experimental in engine.allowed_compatibility_targets(stable, choices)])
+        self.assertIn("2027.1", [version for version, _experimental in engine.allowed_compatibility_targets(beta, choices)])
+
+    def test_compatibility_target_requires_an_official_version_and_can_be_undone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = self.make_project(folder)
+            original = manifest.read_bytes()
+            rejected = engine.downgrade(manifest, "2025.3", Path(folder) / "backups", {"2025.2": False})
+            self.assertIn("not a recognized NVDA API version", rejected.status)
+            self.assertEqual(original, manifest.read_bytes())
+            experimental = engine.downgrade(manifest, "2025.3", Path(folder) / "backups", {"2025.3": True})
+            self.assertIn("requires updateChannel beta or dev", experimental.status)
+            self.assertEqual(original, manifest.read_bytes())
+            changed = engine.downgrade(manifest, "2025.3", Path(folder) / "backups", {"2025.3": False})
+            self.assertTrue(changed.status.startswith("set last tested NVDA from "))
+            self.assertTrue(Path(changed.backup_path).is_file())
+            self.assertEqual("2025.4", changed.previous_last_tested)
+            self.assertEqual("2025.3", changed.target_last_tested)
+            self.assertEqual("2025.1", engine.values(manifest)["minimumnvdaversion"])
+            restored = engine.undo_compatibility_target(
+                manifest, Path(changed.backup_path), changed.target_last_tested,
+                changed.target_manifest_hash, Path(folder) / "backups",
+            )
+            self.assertTrue(restored.status.startswith("restored last tested NVDA from "))
+            self.assertEqual(original, manifest.read_bytes())
+
+    def test_compatibility_undo_never_overwrites_later_manifest_edits(self):
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = self.make_project(folder)
+            changed = engine.downgrade(manifest, "2025.3", Path(folder) / "backups", {"2025.3": False})
+            manifest.write_text(manifest.read_text().replace("summary = Demo", "summary = Later edit"), encoding="utf-8")
+            later = manifest.read_bytes()
+            result = engine.undo_compatibility_target(
+                manifest, Path(changed.backup_path), changed.target_last_tested,
+                changed.target_manifest_hash, Path(folder) / "backups",
+            )
+            self.assertIn("changed after the compatibility operation", result.status)
+            self.assertEqual(later, manifest.read_bytes())
+
+    def test_failed_post_change_validation_restores_original_manifest(self):
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = self.make_project(folder); original = manifest.read_bytes()
+            with mock.patch.object(engine, "validate", side_effect=[[], ["simulated failure"]]):
+                result = engine.downgrade(manifest, "2025.3", Path(folder) / "backups", {"2025.3": False})
+            self.assertIn("original manifest was restored", result.status)
+            self.assertEqual(original, manifest.read_bytes())
+
+    def test_git_manifest_state_reports_branch_and_local_change(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); manifest = root / "manifest.ini"; manifest.write_text(MANIFEST, encoding="utf-8")
+            commands = (
+                ["git", "init", "-b", "main"],
+                ["git", "config", "user.name", "Test User"],
+                ["git", "config", "user.email", "test@example.invalid"],
+                ["git", "add", "manifest.ini"],
+                ["git", "commit", "-m", "Initial"],
+            )
+            for command in commands:
+                subprocess.run(command, cwd=root, check=True, capture_output=True)
+            self.assertEqual(("main", False), engine.git_manifest_state(manifest))
+            manifest.write_text(MANIFEST.replace("summary = Demo", "summary = Changed"), encoding="utf-8")
+            self.assertEqual(("main", True), engine.git_manifest_state(manifest))
+
     def test_store_manifest_guidelines_validate_names_urls_api_versions_and_channels(self):
         versions = {"2026.2": {"experimental": False}, "2026.3": {"experimental": True}}
         valid = {"name": "demo_addon", "version": "2026.2.1", "url": "https://example.com", "minimumnvdaversion": "2026.2", "lasttestednvdaversion": "2026.2"}
@@ -95,6 +183,26 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(any("manifest version" in issue for issue in issues))
         self.assertTrue(any("HTTPS" in issue for issue in issues))
         self.assertTrue(any("experimental" in issue for issue in issues))
+
+    def test_official_nvda_api_versions_can_fall_back_to_saved_response(self):
+        data = [{
+            "description": "NVDA 2026.2",
+            "apiVer": {"major": 2026, "minor": 2, "patch": 0},
+            "backCompatTo": {"major": 2026, "minor": 1, "patch": 0},
+        }]
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "apiVersions.json"; cache.write_text(json.dumps(data), encoding="utf-8")
+            with mock.patch.object(publisher.urllib.request, "urlopen", side_effect=OSError("offline")):
+                versions = publisher.nvda_api_versions(cache)
+        self.assertIn("2026.2", versions)
+        self.assertFalse(versions["2026.2"]["experimental"])
+
+    def test_valid_official_versions_survive_a_cache_write_failure(self):
+        data = [{"apiVer": {"major": 2026, "minor": 2, "patch": 0}, "experimental": False}]
+        with tempfile.TemporaryDirectory() as folder:
+            with mock.patch.object(publisher.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(data).encode())), mock.patch.object(publisher.tempfile, "mkstemp", side_effect=OSError("disk full")):
+                versions = publisher.nvda_api_versions(Path(folder) / "apiVersions.json")
+        self.assertIn("2026.2", versions)
 
     def test_release_package_ai_disclosure_audit_checks_shipped_text_only(self):
         payload = io.BytesIO()
@@ -297,6 +405,15 @@ class EngineTests(unittest.TestCase):
         command = plugin[start:end]
         self.assertIn("self._scanActive.is_set()", command)
         self.assertNotIn("self._scanLock.locked()", command)
+
+    def test_compatibility_ui_uses_official_versions_confirmation_and_persistent_undo(self):
+        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn("publisher.nvda_api_versions(self._apiVersionCachePath)", plugin)
+        self.assertIn("Official older NVDA target shared by every selected add-on", plugin)
+        self.assertIn("Confirm older compatibility target", plugin)
+        self.assertIn("Undo the most recent compatibility target changes", plugin)
+        self.assertIn('"compatibilityUndo": state.get("compatibilityUndo", [])', plugin)
+        self.assertIn("if changed:\n                state[\"compatibilityUndo\"]", plugin)
 
     def test_store_submission_remains_a_manual_browser_action(self):
         plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")

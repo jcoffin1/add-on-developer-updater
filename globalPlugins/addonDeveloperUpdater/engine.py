@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import ast, codecs, ctypes, hashlib, json, os, re, shutil, stat, tempfile, time
+import ast, codecs, ctypes, hashlib, json, os, re, shutil, stat, subprocess, tempfile, time
 import urllib.error, urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
@@ -33,6 +33,21 @@ class ProjectResult:
     name: str
     path: str
     status: str
+    backup_path: str = ""
+    previous_last_tested: str = ""
+    target_last_tested: str = ""
+    target_manifest_hash: str = ""
+
+@dataclass(frozen=True)
+class CompatibilityTargetProject:
+    project_id: str
+    name: str
+    path: str
+    current_version: str
+    minimum_version: str
+    update_channel: str
+    branch: str
+    manifest_changed: bool
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -73,6 +88,33 @@ def version_tuple(value: str) -> tuple[int, int, int]:
         raise ValueError(f"Invalid NVDA version: {value}")
     parts = [int(p) for p in value.strip().split(".")]
     return tuple((parts + [0])[:3])
+
+def compatibility_version_choices(api_versions: dict) -> list[tuple[str, bool]]:
+    """Return unique NVDA API versions in newest-first display form."""
+    choices = {}
+    for version, details in api_versions.items() if isinstance(api_versions, dict) else ():
+        try:
+            numeric = version_tuple(version)
+        except ValueError:
+            continue
+        display = f"{numeric[0]}.{numeric[1]}" + (f".{numeric[2]}" if numeric[2] else "")
+        experimental = bool(details.get("experimental")) if isinstance(details, dict) else False
+        choices[display] = choices.get(display, False) or experimental
+    return sorted(choices.items(), key=lambda item: version_tuple(item[0]), reverse=True)
+
+def allowed_compatibility_targets(projects: list[CompatibilityTargetProject], choices: list[tuple[str, bool]]) -> list[tuple[str, bool]]:
+    """Return official versions valid for every selected project."""
+    if not projects:
+        return []
+    allowed = []
+    for choice in choices:
+        try:
+            channel_allows_target = not choice[1] or all(project.update_channel.casefold() in {"beta", "dev"} for project in projects)
+            if channel_allows_target and all(version_tuple(project.minimum_version) <= version_tuple(choice[0]) < version_tuple(project.current_version) for project in projects):
+                allowed.append(choice)
+        except ValueError:
+            continue
+    return allowed
 
 def parse_release(item: dict) -> Release | None:
     if not isinstance(item, dict): return None
@@ -349,15 +391,67 @@ def validate(path: Path, cancelled=lambda: False, check_python: bool = True) -> 
             if len(errors) >= MAX_VALIDATION_ERRORS: return errors + [f"validation stopped after {MAX_VALIDATION_ERRORS} errors"]
     return errors
 
+def git_manifest_state(path: Path) -> tuple[str, bool]:
+    """Return the current branch label and whether this manifest is locally changed."""
+    root = project_root(path)
+    if root is None or not (root / ".git").exists():
+        return "not a Git repository", False
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        branch_result = subprocess.run(
+            ["git", "-C", str(root), "branch", "--show-current"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            creationflags=flags,
+        )
+        if branch_result.returncode:
+            raise RuntimeError(branch_result.stderr.strip() or "Git branch lookup failed")
+        branch = branch_result.stdout.strip()
+        if not branch:
+            commit_result = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                creationflags=flags,
+            )
+            branch = f"detached at {commit_result.stdout.strip()}" if commit_result.returncode == 0 else "detached HEAD"
+        relative = path.resolve().relative_to(root).as_posix()
+        status_result = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all", "--", relative],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            creationflags=flags,
+        )
+        if status_result.returncode:
+            raise RuntimeError(status_result.stderr.strip() or "Git status lookup failed")
+        return branch, bool(status_result.stdout.strip())
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+        return "Git status unavailable", False
+
+def _atomic_replace_bytes(path: Path, data: bytes) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+
 def _write_manifest_preserving_format(path: Path, changed_text: str) -> None:
     original = path.read_bytes(); has_bom = original.startswith(codecs.BOM_UTF8); output = changed_text.encode("utf-8")
     if has_bom: output = codecs.BOM_UTF8 + output
-    mode = stat.S_IMODE(path.stat().st_mode); fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as stream: stream.write(output)
-        os.chmod(temporary, mode); os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary): os.unlink(temporary)
+    _atomic_replace_bytes(path, output)
 
 def _next_backup_path(folder: Path) -> Path:
     candidate = folder / "manifest.ini"; number = 2
@@ -391,9 +485,12 @@ def update(path: Path, release: Release, backup_root: Path, apply_changes: bool 
     _write_manifest_preserving_format(path, changed)
     return ProjectResult(identifier, name, str(path), f"updated to {release.manifest_version}")
 
-def downgrade(path: Path, target_version: str, backup_root: Path) -> ProjectResult:
+def downgrade(path: Path, target_version: str, backup_root: Path, official_versions: dict[str, bool]) -> ProjectResult:
     target_version = target_version.strip(); version_tuple(target_version)
     metadata = values(path); name = metadata.get("name", path.parent.name); identifier = project_id(path)
+    if target_version not in official_versions: return ProjectResult(identifier, name, str(path), f"validation failed: {target_version} is not a recognized NVDA API version")
+    if official_versions[target_version] and metadata.get("updatechannel", "").casefold() not in {"beta", "dev"}:
+        return ProjectResult(identifier, name, str(path), f"validation failed: experimental NVDA target {target_version} requires updateChannel beta or dev")
     errors = validate(path, check_python=False)
     if errors: return ProjectResult(identifier, name, str(path), "validation failed: " + "; ".join(errors))
     current = metadata["lasttestednvdaversion"]
@@ -405,8 +502,41 @@ def downgrade(path: Path, target_version: str, backup_root: Path) -> ProjectResu
     match = LAST_TESTED.search(original)
     if not match: return ProjectResult(identifier, name, str(path), "validation failed: compatibility key not found")
     safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" .")[:80] or "add-on"; safe_target = re.sub(r"[^A-Za-z0-9._-]+", "_", target_version).strip(".")[:80] or "target"
-    backup_folder = backup_root / f"downgrade-{safe_target}" / f"{safe_name}-{identifier}"; backup_folder.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(path, _next_backup_path(backup_folder))
+    backup_folder = backup_root / f"compatibility-{safe_target}" / f"{safe_name}-{identifier}"; backup_folder.mkdir(parents=True, exist_ok=True)
+    backup = _next_backup_path(backup_folder); shutil.copy2(path, backup)
     changed = original[:match.start()] + f"{match.group(1)}{match.group('quote')}{target_version}{match.group('quote')}{match.group('suffix')}{match.group('cr')}" + original[match.end():]
     _write_manifest_preserving_format(path, changed)
-    return ProjectResult(identifier, name, str(path), f"downgraded from {current} to {target_version}")
+    errors = validate(path, check_python=False)
+    if errors:
+        _atomic_replace_bytes(path, raw)
+        return ProjectResult(identifier, name, str(path), "validation failed after the change; the original manifest was restored: " + "; ".join(errors))
+    target_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    return ProjectResult(identifier, name, str(path), f"set last tested NVDA from {current} to {target_version}", str(backup), current, target_version, target_hash)
+
+def undo_compatibility_target(path: Path, backup_path: Path, expected_target: str, expected_hash: str, backup_root: Path) -> ProjectResult:
+    """Restore a recorded compatibility backup without overwriting later edits."""
+    metadata = values(path); name = metadata.get("name", path.parent.name); identifier = project_id(path)
+    try:
+        backup = backup_path.resolve(strict=True)
+        backup.relative_to(backup_root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return ProjectResult(identifier, name, str(path), "undo failed: the recorded backup is missing or outside the updater backup folder")
+    current = metadata.get("lasttestednvdaversion", "")
+    if current != expected_target:
+        return ProjectResult(identifier, name, str(path), f"undo failed: lastTestedNVDAVersion is now {current or 'missing'}, expected {expected_target}; no later edits were overwritten")
+    if not expected_hash or hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
+        return ProjectResult(identifier, name, str(path), "undo failed: the manifest changed after the compatibility operation; no later edits were overwritten")
+    try:
+        backup_metadata = values(backup)
+        previous = backup_metadata["lasttestednvdaversion"]
+        if backup_metadata.get("name", "").casefold() != metadata.get("name", "").casefold():
+            raise ValueError("backup add-on name does not match")
+        current_bytes = path.read_bytes()
+        _atomic_replace_bytes(path, backup.read_bytes())
+        errors = validate(path, check_python=False)
+        if errors:
+            _atomic_replace_bytes(path, current_bytes)
+            return ProjectResult(identifier, name, str(path), "undo failed validation; the newer manifest was restored: " + "; ".join(errors))
+        return ProjectResult(identifier, name, str(path), f"restored last tested NVDA from {current} to {previous}", "", current, previous)
+    except (KeyError, OSError, UnicodeError, ValueError) as error:
+        return ProjectResult(identifier, name, str(path), f"undo failed: {error}")

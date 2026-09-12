@@ -311,16 +311,52 @@ class IssueTemplateEditorDialog(wx.Dialog):
             return
         event.Skip()
 
-class DowngradeDialog(GitHubPublishDialog):
-    def __init__(self, parent, results):
-        wx.Dialog.__init__(self, parent, title=_("Downgrade add-on compatibility versions"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.results = results; self.onUpdate = None; self.allSelectedMessage = _("All downgrade projects selected"); mainSizer = wx.BoxSizer(wx.VERTICAL)
-        mainSizer.Add(wx.StaticText(self, label=_("Enter an older NVDA compatibility version, then check the add-ons to downgrade. Nothing is selected by default.")), 0, wx.ALL, 10)
-        targetSizer = wx.BoxSizer(wx.HORIZONTAL); targetSizer.Add(wx.StaticText(self, label=_("Target NVDA version:")), 0, wx.RIGHT, 8); self.target = wx.TextCtrl(self); targetSizer.Add(self.target, 1, wx.EXPAND); mainSizer.Add(targetSizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
-        self.checkList = CustomCheckListBox(self, choices=[_("%s; %s; %s") % (result.name, result.status, result.path) for result in results]); mainSizer.Add(self.checkList, 1, wx.EXPAND | wx.ALL, 10)
+class CompatibilityTargetDialog(GitHubPublishDialog):
+    def __init__(self, parent, projects, officialChoices):
+        wx.Dialog.__init__(self, parent, title=_("Set an older NVDA compatibility target"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.results = projects; self.officialChoices = officialChoices; self.onUpdate = None; self.allSelectedMessage = _("All compatibility-target projects selected"); self._targetValues = []; mainSizer = wx.BoxSizer(wx.VERTICAL)
+        explanation = wx.StaticText(self, label=_("Select add-ons first, then choose an official older NVDA version. This changes only lastTestedNVDAVersion. It does not downgrade NVDA, the add-on version, or source code, and it does not prove the code works with that NVDA release. If the source already uses newer NVDA APIs, check out the correct older source branch instead. Nothing is selected by default.")); explanation.Wrap(900); mainSizer.Add(explanation, 0, wx.ALL, 10)
+        targetSizer = wx.BoxSizer(wx.HORIZONTAL); targetSizer.Add(wx.StaticText(self, label=_("Official older NVDA &target:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8); self.target = wx.Choice(self); self.target.SetName(_("Official older NVDA target shared by every selected add-on")); targetSizer.Add(self.target, 1, wx.EXPAND); mainSizer.Add(targetSizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        choices = []
+        for project in projects:
+            if project.branch == "Git status unavailable": gitState = _("Git state unavailable")
+            elif project.manifest_changed: gitState = _("manifest has uncommitted changes")
+            elif project.branch == "not a Git repository": gitState = _("manifest is not tracked by Git")
+            else: gitState = _("manifest is clean")
+            choices.append(_("%s; current last tested NVDA %s; minimum NVDA %s; branch %s; %s; %s") % (project.name, project.current_version, project.minimum_version, project.branch, gitState, project.path))
+        self.checkList = CustomCheckListBox(self, choices=choices); self.checkList.SetName(_("Add-ons whose last tested NVDA version will be changed")); mainSizer.Add(self.checkList, 1, wx.EXPAND | wx.ALL, 10)
         selectionSizer = wx.BoxSizer(wx.HORIZONTAL); selectAll = wx.Button(self, label=_("Select &all")); selectNone = wx.Button(self, label=_("Select &none")); selectAll.Bind(wx.EVT_BUTTON, lambda _event: self._setAll(True)); selectNone.Bind(wx.EVT_BUTTON, lambda _event: self._setAll(False)); selectionSizer.Add(selectAll, 0, wx.RIGHT, 8); selectionSizer.Add(selectNone, 0); mainSizer.Add(selectionSizer, 0, wx.LEFT | wx.RIGHT, 10)
-        buttons = wx.BoxSizer(wx.HORIZONTAL); self.downgradeButton = wx.Button(self, label=_("&Downgrade selected")); self.closeButton = wx.Button(self, label=_("&Close")); self.downgradeButton.SetDefault(); buttons.Add(self.downgradeButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
-        self.SetSizer(mainSizer); self.SetMinSize((650, 360)); self.SetSize((850, 500)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
+        buttons = wx.BoxSizer(wx.HORIZONTAL); self.applyButton = wx.Button(self, label=_("&Review compatibility changes")); self.closeButton = wx.Button(self, label=_("&Close")); self.applyButton.SetDefault(); buttons.Add(self.applyButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
+        self.checkList.Bind(wx.EVT_CHECKLISTBOX, self._onChecked); self.SetSizer(mainSizer); self.SetMinSize((720, 400)); self.SetSize((980, 580)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey); self._refreshTargets()
+    def _setAll(self, checked):
+        super()._setAll(checked); self._refreshTargets()
+    def _refreshTargets(self):
+        previous = self.selectedTarget(); allowed = engine.allowed_compatibility_targets(self.selectedResults(), self.officialChoices); self._targetValues = [version for version, _experimental in allowed]
+        labels = [_("%s, experimental") % version if experimental else version for version, experimental in allowed]
+        self.target.Set(labels)
+        if labels:
+            selection = self._targetValues.index(previous) if previous in self._targetValues else 0; self.target.SetSelection(selection); self.target.Enable(); self.applyButton.Enable()
+        else:
+            self.target.Disable(); self.applyButton.Disable()
+    def selectedTarget(self):
+        selection = self.target.GetSelection()
+        return self._targetValues[selection] if selection != wx.NOT_FOUND and selection < len(self._targetValues) else ""
+    def _onChecked(self, event):
+        self._refreshTargets(); event.Skip()
+    def _onKey(self, event):
+        key = event.GetKeyCode(); listFocused = event.GetEventObject() is self.checkList or self.checkList.HasFocus()
+        if event.ControlDown() and key in (ord("A"), ord("a")):
+            self._setAll(True); ui.message(self.allSelectedMessage); return
+        if key == wx.WXK_ESCAPE: self.Close(); return
+        if listFocused and key == wx.WXK_SPACE:
+            index = self.checkList.GetSelection()
+            if index != wx.NOT_FOUND:
+                checked = not self.checkList.IsChecked(index); self.checkList.Check(index, checked); self._refreshTargets(); ui.message(_("Selected") if checked else _("Not selected"))
+            return
+        if listFocused and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if self.onUpdate is not None: self.onUpdate(None)
+            return
+        event.Skip()
 
 class ConfirmationDialog(wx.Dialog):
     def __init__(self, parent, title, message, defaultYes=False):
@@ -350,7 +386,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     activeInstance = None
     def __init__(self):
         super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._reviewDialog = None; self._publishDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
-        config_path = Path(globalVars.appArgs.configPath); self._statePath = config_path / "addonDeveloperUpdaterState.json"; self._releaseCachePath = config_path / "addonDeveloperUpdaterReleaseCache.json"; self._backupRoot = config_path / "addonDeveloperUpdaterBackups"
+        config_path = Path(globalVars.appArgs.configPath); self._statePath = config_path / "addonDeveloperUpdaterState.json"; self._releaseCachePath = config_path / "addonDeveloperUpdaterReleaseCache.json"; self._apiVersionCachePath = config_path / "addonDeveloperUpdaterApiVersions.json"; self._backupRoot = config_path / "addonDeveloperUpdaterBackups"
         if config.conf["addonDeveloperUpdater"]["intervalMinutes"] < 15: config.conf["addonDeveloperUpdater"]["intervalMinutes"] = 15
         if UpdaterSettingsPanel not in gui.settingsDialogs.NVDASettingsDialog.categoryClasses: gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(UpdaterSettingsPanel)
         GlobalPlugin.activeInstance = self
@@ -432,53 +468,101 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def script_checkAddonProjects(self, gesture): self._startCheck(manual=True, full_system=bool(config.conf["addonDeveloperUpdater"]["scanFixedDrives"]))
     @scriptHandler.script(description=_("Discover NVDA add-on projects across all accessible drives"), category=SCRIPT_CATEGORY)
     def script_discoverAddonProjects(self, gesture): self._startCheck(manual=True, full_system=True)
-    @scriptHandler.script(description=_("Downgrade selected add-on compatibility versions"), gesture="kb:NVDA+alt+shift+d", category=SCRIPT_CATEGORY)
+    @scriptHandler.script(description=_("Set an older last tested NVDA version for selected add-ons"), gesture="kb:NVDA+alt+shift+d", category=SCRIPT_CATEGORY)
     def script_downgradeAddonCompatibility(self, gesture):
-        state = engine.read_json(self._statePath, {}); approved = engine.approved_project_ids(state); records, _ignored = engine.visible_project_records(state); projects = []
-        records, older = engine.newest_local_project_records(records)
-        for item in records:
-            if not isinstance(item, dict) or item.get("project_id") not in approved or not item.get("path"): continue
-            try:
-                path = Path(item["path"]); metadata = engine.values(path)
-                status = _("last tested with NVDA %s; minimum NVDA %s") % (metadata["lasttestednvdaversion"], metadata["minimumnvdaversion"])
-                projects.append(engine.ProjectResult(item["project_id"], metadata.get("name", item.get("name", path.parent.name)), str(path), status))
-            except (KeyError, OSError, ValueError): pass
-        if not projects: ui.message(_("No approved add-on development projects are available to downgrade")); return
-        self._showDowngradeDialog(projects)
-    def _showDowngradeDialog(self, projects):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Loading approved projects and official NVDA compatibility versions")); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._loadCompatibilityTargets, name="addonDeveloperCompatibilityTargets", daemon=True).start()
+        except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start compatibility-target lookup"); ui.message(_("Compatibility targets could not be loaded"))
+    def _loadCompatibilityTargets(self):
+        callback = None; arguments = ()
+        try:
+            officialChoices = engine.compatibility_version_choices(publisher.nvda_api_versions(self._apiVersionCachePath))
+            if not officialChoices: raise RuntimeError("the official NVDA Add-on Store returned no compatibility versions")
+            state = engine.read_json(self._statePath, {}); approved = engine.approved_project_ids(state); records = engine.newest_local_project_records(engine.visible_project_records(state)[0])[0]; projects = []
+            for item in records:
+                if not isinstance(item, dict) or item.get("project_id") not in approved or not item.get("path"): continue
+                try:
+                    path = Path(item["path"]); metadata = engine.values(path); branch, changed = engine.git_manifest_state(path)
+                    projects.append(engine.CompatibilityTargetProject(item["project_id"], metadata.get("name", item.get("name", path.parent.name)), str(path), metadata["lasttestednvdaversion"], metadata["minimumnvdaversion"], metadata.get("updatechannel", ""), branch, changed))
+                except (KeyError, OSError, ValueError):
+                    log.exception("Could not load compatibility details for %s", item.get("path"))
+            if projects: callback, arguments = self._showDowngradeDialog, (projects, officialChoices)
+            else: callback, arguments = self._showInformation, (_("No compatibility targets available"), _("No approved add-on development projects are available to change."))
+        except Exception as error:
+            log.exception("Compatibility-target lookup failed"); callback, arguments = self._showInformation, (_("Compatibility targets could not be loaded"), _("Official NVDA compatibility versions could not be loaded: %s") % error)
+        finally:
+            self._scanLock.release()
+            if callback is not None: self._finishProgressThen(callback, *arguments)
+    def _showDowngradeDialog(self, projects, officialChoices):
         if self._downgradeDialog is not None: self._downgradeDialog.Raise(); return
-        dialog = DowngradeDialog(gui.mainFrame, projects); self._downgradeDialog = dialog
+        dialog = CompatibilityTargetDialog(gui.mainFrame, projects, officialChoices); self._downgradeDialog = dialog
         def close(_event=None):
             if self._downgradeDialog is dialog: self._downgradeDialog = None
             dialog.Destroy()
         def apply(_event=None):
-            target = dialog.target.GetValue().strip(); selected = dialog.selectedResults()
-            try: engine.version_tuple(target)
-            except ValueError: ui.message(_("Enter a valid NVDA version such as 2026.2")); return
-            if not selected: ui.message(_("No add-on projects were selected for downgrade")); return
-            close(); self._startDowngrade(selected, target)
-        dialog.onUpdate = apply; dialog.downgradeButton.Bind(wx.EVT_BUTTON, apply); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close); dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.target.SetFocus)
-    def _startDowngrade(self, selected, target):
+            selected = dialog.selectedResults(); target = dialog.selectedTarget()
+            if not selected: ui.message(_("No add-on projects were selected")); return
+            if not target: ui.message(_("The selected add-ons do not share an official older NVDA target")); return
+            changes = "; ".join(_("%s: NVDA %s to %s, branch %s") % (item.name, item.current_version, target, item.branch) for item in selected)
+            dirty = [item.name for item in selected if item.manifest_changed]
+            message = _("Change only lastTestedNVDAVersion for %d manifests? This does not test compatibility or change minimumNVDAVersion, the add-on version, source code, or NVDA. Planned changes: %s.") % (len(selected), changes)
+            if dirty: message += _(" Warning: these manifests already have uncommitted changes: %s. Their current contents will be backed up before editing.") % "; ".join(dirty)
+            self._showConfirmation(_("Confirm older compatibility target"), message, lambda: (close(), self._startDowngrade(selected, target, dict(officialChoices))))
+        dialog.onUpdate = apply; dialog.applyButton.Bind(wx.EVT_BUTTON, apply); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close); dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.checkList.SetFocus)
+    def _startDowngrade(self, selected, target, officialVersions):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        ui.message(_("Downgrading %d selected add-on manifests to NVDA %s") % (len(selected), target)); self._startProgress()
-        try: threading.Thread(target=self._downgradeSelected, args=(selected, target), name="addonDeveloperDowngrade", daemon=True).start()
-        except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start downgrade"); ui.message(_("The compatibility downgrade could not be started"))
-    def _downgradeSelected(self, selected, target):
+        ui.message(_("Setting %d selected manifests to last tested NVDA %s") % (len(selected), target)); self._startProgress()
+        try: threading.Thread(target=self._downgradeSelected, args=(selected, target, officialVersions), name="addonDeveloperCompatibilityChange", daemon=True).start()
+        except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start compatibility change"); ui.message(_("The compatibility change could not be started"))
+    def _downgradeSelected(self, selected, target, officialVersions):
         results = []
         try:
             for item in selected:
-                try: results.append(engine.downgrade(Path(item.path), target, self._backupRoot))
+                try: results.append(engine.downgrade(Path(item.path), target, self._backupRoot, officialVersions))
                 except Exception as error: results.append(engine.ProjectResult(item.project_id, item.name, item.path, f"validation failed: {error}"))
-            for result in results: log.info("Add-on Developer Updater downgrade: %s: %s", result.path, result.status)
-            state = engine.read_json(self._statePath, {}); state["projects"] = engine.merge_project_records(state.get("projects", []), results); engine.atomic_json_write(self._statePath, state)
+            for result in results: log.info("Add-on Developer Updater compatibility target: %s: %s", result.path, result.status)
+            changed = [result for result in results if result.status.startswith("set last tested NVDA from ")]
+            state = engine.read_json(self._statePath, {}); state["projects"] = engine.merge_project_records(state.get("projects", []), results)
+            if changed:
+                state["compatibilityUndo"] = [{"project_id": result.project_id, "name": result.name, "path": result.path, "backup_path": result.backup_path, "previous_last_tested": result.previous_last_tested, "target_last_tested": result.target_last_tested, "target_manifest_hash": result.target_manifest_hash} for result in changed]
+            engine.atomic_json_write(self._statePath, state)
         finally:
             self._scanLock.release()
             self._finishProgressThen(self._finishDowngrade, results)
     def _finishDowngrade(self, results):
-        changed = [item for item in results if item.status.startswith("downgraded from ")]; failed = [item for item in results if item not in changed]
-        message = _("Downgrade complete. %d manifests changed: %s.") % (len(changed), self._limitedDetails(changed, lambda item: _("%s %s") % (item.name, item.status))) if changed else _("Downgrade complete. No manifests were changed.")
+        changed = [item for item in results if item.status.startswith("set last tested NVDA from ")]; failed = [item for item in results if item not in changed]
+        message = _("Compatibility target change complete. %d manifests changed: %s. Use the Undo most recent compatibility target changes command if these changes need to be restored.") % (len(changed), self._limitedDetails(changed, lambda item: _("%s %s") % (item.name, item.status))) if changed else _("Compatibility target change complete. No manifests were changed.")
         if failed: message += _(" %d projects were not changed: %s.") % (len(failed), "; ".join(_("%s: %s") % (item.name, item.status.removeprefix("validation failed: ")) for item in failed))
-        ui.message(message); self._showInformation(_("Compatibility downgrade results"), message)
+        ui.message(message); self._showInformation(_("Compatibility target results"), message)
+    @scriptHandler.script(description=_("Undo the most recent compatibility target changes"), category=SCRIPT_CATEGORY)
+    def script_undoCompatibilityTargetChanges(self, gesture):
+        state = engine.read_json(self._statePath, {}); entries = state.get("compatibilityUndo", []) if isinstance(state.get("compatibilityUndo"), list) else []
+        entries = [entry for entry in entries if isinstance(entry, dict) and entry.get("path") and entry.get("backup_path")]
+        if not entries: ui.message(_("No compatibility target changes are available to undo")); return
+        details = "; ".join(_("%s: NVDA %s back to %s; %s") % (entry.get("name", Path(entry["path"]).parent.name), entry.get("target_last_tested", "unknown"), entry.get("previous_last_tested", "unknown"), entry["path"]) for entry in entries)
+        self._showConfirmation(_("Undo compatibility target changes"), _("Restore the manifests from the most recent compatibility target operation? Later edits will never be overwritten. Planned restores: %s.") % details, lambda: self._startUndoCompatibilityTargets(entries))
+    def _startUndoCompatibilityTargets(self, entries):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Restoring manifests from the most recent compatibility target operation")); self._startProgress()
+        try: threading.Thread(target=self._undoCompatibilityTargets, args=(entries,), name="addonDeveloperCompatibilityUndo", daemon=True).start()
+        except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start compatibility undo"); ui.message(_("The compatibility changes could not be restored"))
+    def _undoCompatibilityTargets(self, entries):
+        results = []
+        try:
+            for entry in entries:
+                try: results.append(engine.undo_compatibility_target(Path(entry["path"]), Path(entry["backup_path"]), str(entry.get("target_last_tested", "")), str(entry.get("target_manifest_hash", "")), self._backupRoot))
+                except Exception as error: results.append(engine.ProjectResult(str(entry.get("project_id", "")), str(entry.get("name", "add-on")), str(entry.get("path", "")), f"undo failed: {error}"))
+            restored = {os.path.normcase(result.path) for result in results if result.status.startswith("restored last tested NVDA from ")}
+            state = engine.read_json(self._statePath, {}); state["projects"] = engine.merge_project_records(state.get("projects", []), results); state["compatibilityUndo"] = [entry for entry in entries if os.path.normcase(str(entry.get("path", ""))) not in restored]; engine.atomic_json_write(self._statePath, state)
+            for result in results: log.info("Add-on Developer Updater compatibility undo: %s: %s", result.path, result.status)
+        finally:
+            self._scanLock.release(); self._finishProgressThen(self._finishUndoCompatibilityTargets, results)
+    def _finishUndoCompatibilityTargets(self, results):
+        restored = [result for result in results if result.status.startswith("restored last tested NVDA from ")]; failed = [result for result in results if result not in restored]
+        message = _("Compatibility undo complete. %d manifests restored: %s.") % (len(restored), self._limitedDetails(restored, lambda item: _("%s %s") % (item.name, item.status))) if restored else _("Compatibility undo complete. No manifests were restored.")
+        if failed: message += _(" %d manifests were not restored: %s.") % (len(failed), "; ".join(_("%s: %s") % (item.name, item.status) for item in failed))
+        ui.message(message); self._showInformation(_("Compatibility undo results"), message)
     @scriptHandler.script(description=_("Review previously discovered NVDA add-on compatibility updates"), category=SCRIPT_CATEGORY)
     def script_reviewAddonProjectUpdates(self, gesture):
         state = engine.read_json(self._statePath, {}); available = []
@@ -1170,7 +1254,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 "awaiting": sum("awaiting" in r.status for r in visibleResults),
                 "failed": sum("failed" in r.status for r in visibleResults),
             }
-            engine.atomic_json_write(self._statePath, {"releaseTag": release.tag, "manifestVersion": release.manifest_version, "lastScanAt": engine.utc_now(), "approvedProjects": sorted(approved), "ignoredProjects": sorted(ignored), "projects": projects, "submissionProjects": state.get("submissionProjects", []), "submissionChannels": state.get("submissionChannels", {}), "submissionMetadata": state.get("submissionMetadata", {})})
+            engine.atomic_json_write(self._statePath, {"releaseTag": release.tag, "manifestVersion": release.manifest_version, "lastScanAt": engine.utc_now(), "approvedProjects": sorted(approved), "ignoredProjects": sorted(ignored), "projects": projects, "submissionProjects": state.get("submissionProjects", []), "submissionChannels": state.get("submissionChannels", {}), "submissionMetadata": state.get("submissionMetadata", {}), "compatibilityUndo": state.get("compatibilityUndo", [])})
             for result in results:
                 if result.status != "current": log.info("Add-on Developer Updater: %s: %s", result.path, result.status)
             if manual or any(counts.values()): wx.CallAfter(ui.message, self._completionMessage(visibleResults))
