@@ -15,6 +15,7 @@ USER_AGENT = "NVDA-Addon-Developer-Updater"
 TAG_PATTERN = re.compile(r"^(?:release-)?(20\d{2})\.(\d+)(?:\.(\d+))?(?:(alpha|beta|rc)(\d+))?$", re.I)
 LAST_TESTED = re.compile(r"^([ \t]*lastTestedNVDAVersion[ \t]*=[ \t]*)(?P<quote>[\"']?)(20\d{2}\.\d+(?:\.\d+)?)(?P=quote)(?P<suffix>[ \t]*(?:[#;].*)?)(?P<cr>\r?)$", re.I | re.M)
 VALUE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.*)$", re.M)
+TRIPLE_VALUE = re.compile(r"^[ \t]*([A-Za-z][A-Za-z0-9]*)[ \t]*=[ \t]*(?P<quote>\"\"\"|''')(?P<value>.*?)(?P=quote)[ \t]*(?:[#;].*)?$", re.M | re.S)
 PRUNE_NAMES = {"$recycle.bin", "system volume information", "windows", "program files", "program files (x86)", "programdata", "appdata", "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache", ".pytest_cache", "build", "dist", "outputs", "backups", ".nvdaaddonupdaterbackups", "runtime tests"}
 MAX_PYTHON_FILE_BYTES = 5 * 1024 * 1024
 MAX_VALIDATION_ERRORS = 100
@@ -98,7 +99,12 @@ def _manifest_value(value: str) -> str:
 
 def values(path: Path) -> dict[str, str]:
     text = path.read_text(encoding="utf-8-sig")
-    return {m.group(1).lower(): _manifest_value(m.group(2)) for m in VALUE.finditer(text)}
+    fields = {m.group(1).lower(): _manifest_value(m.group(2)) for m in VALUE.finditer(text)}
+    # NVDA manifests permit ConfigObj-style triple-quoted descriptions and
+    # changelogs.  The ordinary line parser sees only the opening quotes, so
+    # replace those values with the complete field after the initial pass.
+    fields.update({match.group(1).lower(): match.group("value").strip() for match in TRIPLE_VALUE.finditer(text)})
+    return fields
 
 def version_tuple(value: str) -> tuple[int, int, int]:
     if not isinstance(value, str) or not re.fullmatch(r"20\d{2}\.\d+(?:\.\d+)?", value.strip()):
@@ -444,6 +450,30 @@ def merge_project_records(previous: list[dict], current: list[ProjectResult]) ->
     merged = {os.path.normcase(str(item.get("path"))): dict(item) for item in previous if isinstance(item, dict) and item.get("project_id") and item.get("path")}
     merged.update({os.path.normcase(item.path): item.__dict__ for item in current})
     return sorted(merged.values(), key=lambda item: (str(item.get("name", "")).lower(), str(item.get("path", "")).lower()))
+
+def unavailable_manifest_results(paths: list[str], previous: list[dict]) -> list[ProjectResult]:
+    """Turn worker-confirmed unavailable paths into current, non-stale project results."""
+    previous_by_path = {os.path.normcase(str(item.get("path", ""))): item for item in previous if isinstance(item, dict) and item.get("path")}
+    results = []
+    for value in paths if isinstance(paths, list) else ():
+        if not isinstance(value, str) or not value: continue
+        path = Path(value); old = previous_by_path.get(os.path.normcase(value), {})
+        results.append(ProjectResult(str(old.get("project_id") or project_id(path)), str(old.get("name") or path.parent.name), value, "validation failed: approved manifest path is missing or offline"))
+    return results
+
+def wait_for_worker(process, timeout: int = 90, terminate_timeout: int = 5) -> int:
+    """Wait for the isolated worker without allowing a filesystem call to hang forever."""
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        process.terminate()
+        try:
+            process.wait(timeout=terminate_timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try: process.wait(timeout=terminate_timeout)
+            except subprocess.TimeoutExpired: pass
+        raise RuntimeError(f"The isolated project-discovery worker exceeded its {timeout}-second safety limit") from error
 
 def validate(path: Path, cancelled=lambda: False, check_python: bool = True) -> list[str]:
     errors = []; metadata = values(path); text = path.read_text(encoding="utf-8-sig")

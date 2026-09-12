@@ -65,6 +65,7 @@ try {
 	$request = Get-Content -LiteralPath $RequestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 	if ($request.mode -eq 'background') {
 		$manifests = @($request.manifestPaths | Where-Object { $_ -and [System.IO.File]::Exists([string]$_) -and -not (Test-Offline ([string]$_)) })
+		$unavailableManifestPaths = @($request.manifestPaths | Where-Object { $_ -and (-not [System.IO.File]::Exists([string]$_) -or (Test-Offline ([string]$_))) })
 		$directoriesVisited = 0; $truncated = $false; $elapsedSeconds = 0
 	} else {
 		$roots = @($request.roots)
@@ -75,7 +76,7 @@ try {
 		$maxSeconds = if ($null -ne $request.maxSeconds) { [Math]::Max(1, [Math]::Min(60, [int]$request.maxSeconds)) } else { 60 }
 		$scan = Find-Manifests $roots $maxDirectories $maxSeconds; $manifests = @($scan.manifests); $directoriesVisited = $scan.directoriesVisited; $truncated = $scan.truncated; $elapsedSeconds = $scan.elapsedSeconds
 	}
-	Write-WorkerResult @{ ok = $true; manifests = @($manifests); directoriesVisited = $directoriesVisited; truncated = $truncated; elapsedSeconds = $elapsedSeconds; completedAt = [DateTime]::UtcNow.ToString('o') }
+	Write-WorkerResult @{ ok = $true; manifests = @($manifests); unavailableManifestPaths = @($unavailableManifestPaths); directoriesVisited = $directoriesVisited; truncated = $truncated; elapsedSeconds = $elapsedSeconds; completedAt = [DateTime]::UtcNow.ToString('o') }
 } catch {
 	Write-WorkerResult @{ ok = $false; error = $_.Exception.Message; manifests = @(); completedAt = [DateTime]::UtcNow.ToString('o') }
 	exit 1

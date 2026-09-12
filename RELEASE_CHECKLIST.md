@@ -8,6 +8,7 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 - Confirm NVDA starts without an Add-on Developer Updater traceback.
 - Confirm speech, braille, the NVDA menu, and the Input Gestures dialog remain responsive.
 - Restart NVDA while no updater operation is running and while a cancellable scan is running.
+- Close the progress window during a scan; confirm the scan continues in the background and later progress or completion handling does not raise an error.
 
 ## Scan and manifest workflow
 
@@ -24,6 +25,7 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 - Confirm branch, path, minimum, current target, and uncommitted-manifest status are announced accurately.
 - Test confirmation, automatic rollback after simulated validation failure, successful undo, missing backup, and refusal to overwrite a later manifest edit.
 - Start a scan and invoke the assigned cancel command. During a non-scan GitHub operation, confirm the command says no scan is running.
+- Simulate a blocked external scan and confirm it is stopped at the 90-second safety limit; remove an approved disposable manifest and confirm the next background project check reports the unavailable path.
 
 ## GitHub workflow
 

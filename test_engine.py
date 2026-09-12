@@ -17,6 +17,15 @@ class EngineTests(unittest.TestCase):
     def test_beta_version(self):
         release = engine.parse_release({"tag_name": "release-2026.2beta11", "prerelease": True}); self.assertEqual("2026.2", release.manifest_version)
         self.assertTrue(engine.parse_release({"tag_name": "RELEASE-2026.2RC1", "prerelease": False}).prerelease)
+
+    def test_manifest_reader_supports_single_and_multiline_triple_quoted_values(self):
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = Path(folder) / "manifest.ini"
+            manifest.write_text('name = demo\ndescription = """First line\nsecond line"""\nchangelog = """One line"""\nversion = "1.2"\n', encoding="utf-8")
+            metadata = engine.values(manifest)
+        self.assertEqual("First line\nsecond line", metadata["description"])
+        self.assertEqual("One line", metadata["changelog"])
+        self.assertEqual("1.2", metadata["version"])
     def test_addon_version_follows_current_stable_nvda_family(self):
         metadata = engine.values(Path(__file__).parent / "manifest.ini")
         version = metadata["version"]
@@ -100,6 +109,23 @@ class EngineTests(unittest.TestCase):
         current = engine.ProjectResult("new", "New", "C:/new/manifest.ini", "current")
         merged = engine.merge_project_records([{"project_id": "old", "name": "Old", "path": "D:/old/manifest.ini", "status": "current"}], [current])
         self.assertEqual({"old", "new"}, {item["project_id"] for item in merged})
+
+    def test_worker_confirmed_unavailable_manifest_replaces_stale_status(self):
+        path = "C:/removed/manifest.ini"
+        results = engine.unavailable_manifest_results([path], [{"project_id": "old-id", "name": "Removed", "path": path, "status": "update available: 2026.1 to 2026.2"}])
+        self.assertEqual(1, len(results))
+        self.assertEqual("old-id", results[0].project_id)
+        self.assertEqual("Removed", results[0].name)
+        self.assertIn("missing or offline", results[0].status)
+
+    def test_worker_timeout_terminates_then_kills_a_stuck_process(self):
+        process = mock.Mock()
+        process.wait.side_effect = [subprocess.TimeoutExpired("worker", 90), subprocess.TimeoutExpired("worker", 5), 1]
+        with self.assertRaisesRegex(RuntimeError, "90-second safety limit"):
+            engine.wait_for_worker(process)
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(3, process.wait.call_count)
 
     def test_notification_state_announces_only_changes_and_recovery(self):
         records = [
@@ -416,6 +442,25 @@ class EngineTests(unittest.TestCase):
         self.assertEqual([], bounded_result["manifests"])
         self.assertTrue(bounded_result["truncated"])
         self.assertNotIn("Invoke-RestMethod", worker.read_text(encoding="utf-8-sig"))
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "NVDA's scan worker requires Windows PowerShell")
+    def test_external_scan_worker_reports_missing_background_manifests(self):
+        worker = Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "worker.ps1"
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); existing = self.make_project(root, "existing"); missing = root / "gone" / "manifest.ini"
+            request = root / "request.json"; output = root / "result.json"
+            request.write_text(json.dumps({"mode": "background", "manifestPaths": [str(existing), str(missing)]}), encoding="utf-8")
+            completed = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(worker), "-RequestPath", str(request), "-OutputPath", str(output)], capture_output=True, text=True, timeout=30)
+            result = engine.read_json(output)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual([str(existing)], result["manifests"])
+        self.assertEqual([str(missing)], result["unavailableManifestPaths"])
+
+    def test_runtime_bounds_external_worker_and_safely_handles_progress_close(self):
+        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn("engine.wait_for_worker(self._workerProcess)", plugin)
+        self.assertIn("self._progressDialog = None\n            dialog.Destroy()", plugin)
+        self.assertIn("Progress window closed. The operation is still running in the background.", plugin)
 
     def test_documentation_does_not_advertise_nonexistent_automatic_changes(self):
         documentation = (Path(__file__).parent / "doc" / "en" / "readme.html").read_text(encoding="utf-8")

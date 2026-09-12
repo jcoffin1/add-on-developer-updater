@@ -421,9 +421,18 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if stopEvent.is_set() or self._shutdown.is_set(): return
         if self._progressDialog is not None: self._progressDialog.Destroy()
         self._progressDialog = OperationProgressDialog(gui.mainFrame)
+        dialog = self._progressDialog
+        dialog.Bind(wx.EVT_CLOSE, lambda event, dialog=dialog: self._onProgressClose(event, dialog))
         if keepFocus:
             self._progressDialog.Show(); self._progressDialog.Raise(); self._progressDialog.status.SetFocus()
         else: self._progressDialog.ShowWithoutActivating()
+    def _onProgressClose(self, event, dialog):
+        if self._progressDialog is dialog:
+            self._progressDialog = None
+            dialog.Destroy()
+            ui.message(_("Progress window closed. The operation is still running in the background."))
+            return
+        event.Skip()
     def _updateProgressMessage(self, message):
         self._setProgressMessage(message)
         ui.message(_(message))
@@ -454,7 +463,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self._closeProgress()
         if not self._shutdown.is_set(): wx.CallAfter(callback, *args)
     def _closeProgress(self):
-        if self._progressDialog is not None: self._progressDialog.Destroy(); self._progressDialog = None
+        if self._progressDialog is not None:
+            dialog = self._progressDialog; self._progressDialog = None; dialog.Destroy()
         if self._confirmDialog is not None:
             self._confirmDialog.Raise(); self._confirmDialog.defaultButton.SetFocus()
         elif self._informationDialog is not None:
@@ -1383,7 +1393,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(workerPath), "-RequestPath", str(requestPath), "-OutputPath", str(outputPath)]
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
             self._workerProcess = subprocess.Popen(command, creationflags=flags)
-            returnCode = self._workerProcess.wait(); self._workerProcess = None
+            try:
+                returnCode = engine.wait_for_worker(self._workerProcess)
+            finally: self._workerProcess = None
             workerResult = engine.read_json(outputPath, {})
             if cancelled(): wx.CallAfter(ui.message, _("Add-on developer scan cancelled. No completion state was saved.")); return
             if returnCode or not workerResult.get("ok"):
@@ -1399,7 +1411,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                     if not isinstance(item, dict) or not item.get("path"): continue
                     try: approved.add(engine.project_id(Path(item["path"])))
                     except (OSError, TypeError, ValueError): pass
-            results = []
+            results = engine.unavailable_manifest_results(workerResult.get("unavailableManifestPaths", []), state.get("projects", []))
             for index, path in enumerate(manifests, 1):
                 if cancelled(): wx.CallAfter(ui.message, _("Add-on developer scan cancelled. No completion state was saved.")); return
                 if progressStarted: wx.CallAfter(self._setProgressStep, progressEvent, _("Checking add-on manifest %d of %d: %s") % (index, len(manifests), path.parent.name), index, len(manifests))

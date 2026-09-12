@@ -26,6 +26,9 @@ def build(expected_version: str = "") -> Path:
     errors = engine.validate(manifest)
     if errors:
         raise RuntimeError("Manifest validation failed: " + "; ".join(errors))
+    documentation = (ROOT / "doc" / "en" / "readme.html").read_text(encoding="utf-8-sig")
+    if f"Version {version}." not in documentation:
+        raise RuntimeError(f"English documentation does not identify package version {version}")
 
     output = publisher.build_package(
         {"name": metadata["name"], "version": version, "manifest": str(manifest)},

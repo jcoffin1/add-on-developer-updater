@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026.2.36
+
+- Stop an isolated discovery worker after 90 seconds even if Windows blocks inside a cloud or removable-drive filesystem call.
+- Allow the progress window to be closed without retaining a destroyed control that later progress updates could access.
+- Report approved manifest paths that are missing or offline during background checks instead of leaving stale update results in saved status.
+- Read valid single-line and multiline triple-quoted NVDA manifest fields completely instead of treating them as empty.
+
 ## 2026.2.35
 
 - Centralize stable, beta, release-candidate, and alpha detection in one tested implementation while keeping recursive discovery in the isolated worker.
