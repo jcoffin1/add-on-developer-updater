@@ -5,15 +5,16 @@ Add-on Developer Updater helps NVDA add-on developers discover development proje
 ## Quick start
 
 1. Press `NVDA+Alt+Shift+U` to scan your normal development folders.
-2. Assign **Review previously discovered NVDA add-on compatibility updates** in NVDA's Input Gestures dialog.
-3. Run that review command, select the manifests you intend to change with Space, and press Enter.
+2. Approve only the development projects you maintain when the discovery window opens.
+3. Assign **Review previously discovered NVDA add-on compatibility updates** in NVDA's Input Gestures dialog, run it, and select the manifests you intend to change.
 4. Use the GitHub publishing command only after reviewing the changed source and documentation.
 5. Use `NVDA+Alt+Shift+S` for the final Store-readiness check. The official submission form still requires your review and manual submission.
 
 ## Safety defaults
 
 - Automatic checks are disabled by default.
-- Background checks stay within previously approved development projects.
+- Newly discovered projects require explicit approval before monitoring or publishing workflows can use them.
+- Routine unchanged background checks are silent and do not launch recursive discovery.
 - Recursive discovery runs in a separate, below-normal-priority process.
 - Manifest changes require explicit selection and receive backups.
 - GitHub publishing and release creation require confirmation.
@@ -30,7 +31,11 @@ Add-on Developer Updater helps NVDA add-on developers discover development proje
 - `NVDA+Alt+Shift+T`: select an add-on repository, edit one of its GitHub issue templates as an accessible form or raw text, or delete it after confirmation.
 - `NVDA+Alt+Shift+S`: select projects for Add-on Store readiness review.
 
-Additional commands, including **Undo the most recent compatibility target changes**, can be assigned in NVDA's Input Gestures dialog under **Add-on Developer Updater**.
+Additional commands, including **Review newly discovered add-on projects awaiting approval**, **Report add-on update-check status**, **Undo the most recent discovered compatibility updates**, and **Undo the most recent compatibility target changes**, can be assigned in NVDA's Input Gestures dialog under **Add-on Developer Updater**.
+
+Release lookup uses one shared implementation for stable releases, release candidates, betas, and direct NVDA alpha snapshots. It uses GitHub ETags, falls back to the official releases feed, and finally uses saved last-known-good information when live services are unavailable. The status command reports which source was used, the detected release and compatibility family, check and scan times, project counts, pending updates, validation failures, and the expected next automatic check. Automatic checks wait after NVDA starts, back off after repeated failures, and announce only a new or changed action, first fallback to cached data, or recovery. A different alpha build in the same compatibility family is identified without claiming that another manifest change is required.
+
+Discovery and approval are separate. Manual and periodic scans can find projects, but each new project remains unavailable to update, GitHub, and Store workflows until the user selects it in the approval window and confirms that it is a maintained development copy. Compatibility-update review shows each path, minimum and proposed NVDA versions, Git branch, and manifest change state. Nothing is selected by default, and a final confirmation appears before writing. The official release is checked again immediately before the update; a newer compatibility family defers the operation for a fresh scan. Each change is revalidated and automatically rolled back on failure. The update undo command restores the most recent group only when no manifest has been edited afterward.
 
 The compatibility-target command loads the version list recognized by the official NVDA Add-on Store away from NVDA's main thread and saves the last successful response for offline fallback. Select add-ons first; the version list then contains only older targets shared by every selection and never permits a target below an add-on's `minimumNVDAVersion`. Experimental targets are available only when every selected manifest uses the `beta` or `dev` update channel. Each row identifies the path, Git branch, current and minimum versions, and whether the manifest has uncommitted changes. A final confirmation explains every proposed change and warns about dirty manifests. The operation changes only `lastTestedNVDAVersion`; it does not lower the minimum version or alter NVDA, source code, or the add-on version. Every changed manifest is backed up and revalidated, and a failed validation restores the original automatically. The undo command restores the most recent set only when the manifest is byte-for-byte unchanged since the compatibility operation, so later edits are never overwritten. If source already uses newer NVDA APIs, check out the appropriate older source branch instead.
 

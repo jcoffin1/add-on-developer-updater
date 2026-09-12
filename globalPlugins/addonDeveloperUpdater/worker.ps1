@@ -39,42 +39,6 @@ function Test-DeveloperManifest([string]$ManifestPath) {
 	} catch { return $false }
 }
 
-function Get-LatestRelease([bool]$IncludePrereleases) {
-	$headers = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'NVDA-Addon-Developer-Updater' }
-	$items = Invoke-RestMethod -Uri 'https://api.github.com/repos/nvaccess/nvda/releases?per_page=30' -Headers $headers -TimeoutSec 15
-	$releases = foreach ($item in $items) {
-		$tag = [string]$item.tag_name
-		if ($tag -notmatch '^(?:release-)?(20\d{2})\.(\d+)(?:\.(\d+))?(?:(alpha|beta|rc)(\d+))?$') { continue }
-		$stage = if ($Matches[4]) { $Matches[4].ToLowerInvariant() } else { 'final' }
-		$isPrerelease = [bool]$item.prerelease -or $stage -ne 'final'
-		if (-not $IncludePrereleases -and $isPrerelease) { continue }
-		$year = [int]$Matches[1]; $minor = [int]$Matches[2]; $patch = if ($Matches[3]) { [int]$Matches[3] } else { 0 }
-		$stageRank = @{ alpha = 0; beta = 1; rc = 2; final = 3 }[$stage]
-		$stageNumber = if ($Matches[5]) { [int]$Matches[5] } else { 0 }
-		$manifestVersion = "$year.$minor" + $(if ($patch -gt 0) { ".$patch" } else { '' })
-		[pscustomobject]@{ tag = ($tag -replace '^(?i:release-)', ''); manifestVersion = $manifestVersion; prerelease = $isPrerelease; url = [string]$item.html_url; key = '{0:D4}.{1:D6}.{2:D6}.{3:D1}.{4:D6}' -f $year, $minor, $patch, $stageRank, $stageNumber }
-	}
-	if ($IncludePrereleases) {
-		try {
-			$alphaIndex = (Invoke-WebRequest -Uri 'https://download.nvaccess.org/snapshots/alpha/' -Headers $headers -TimeoutSec 15 -UseBasicParsing).Content
-			$buildSource = (Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/nvaccess/nvda/master/source/buildVersion.py' -Headers $headers -TimeoutSec 15 -UseBasicParsing).Content
-			$alphaMatches = [regex]::Matches($alphaIndex, 'nvda_snapshot_alpha-(\d+),([0-9a-f]+)\.exe', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-			if ($alphaMatches.Count -gt 0 -and $buildSource -match '(?m)^version_year\s*=\s*(\d+)\s*$') {
-				$alphaYear = [int]$Matches[1]
-				if ($buildSource -notmatch '(?m)^version_major\s*=\s*(\d+)\s*$') { throw 'NVDA alpha major version was not found' }; $alphaMajor = [int]$Matches[1]
-				if ($buildSource -notmatch '(?m)^version_minor\s*=\s*(\d+)\s*$') { throw 'NVDA alpha minor version was not found' }; $alphaMinor = [int]$Matches[1]
-				$latestAlpha = $alphaMatches | Sort-Object { [int]$_.Groups[1].Value } -Descending | Select-Object -First 1
-				$alphaBuild = [int]$latestAlpha.Groups[1].Value; $alphaCommit = $latestAlpha.Groups[2].Value
-				$alphaManifest = "$alphaYear.$alphaMajor" + $(if ($alphaMinor -gt 0) { ".$alphaMinor" } else { '' })
-				$releases += [pscustomobject]@{ tag = "alpha-$alphaBuild,$alphaCommit"; manifestVersion = $alphaManifest; prerelease = $true; url = "https://download.nvaccess.org/snapshots/alpha/nvda_snapshot_alpha-$alphaBuild,$alphaCommit.exe"; key = '{0:D4}.{1:D6}.{2:D6}.{3:D1}.{4:D6}' -f $alphaYear, $alphaMajor, $alphaMinor, 0, $alphaBuild }
-			}
-		} catch { Write-Warning "NVDA alpha snapshot lookup failed: $_" }
-	}
-	$selected = $releases | Sort-Object key -Descending | Select-Object -First 1
-	if ($null -eq $selected) { throw 'No matching NVDA release was returned.' }
-	return $selected
-}
-
 function Find-Manifests($Roots, [int]$MaxDirectories, [int]$MaxSeconds) {
 	$found = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 	$stack = [System.Collections.Generic.Stack[string]]::new()
@@ -94,22 +58,24 @@ function Find-Manifests($Roots, [int]$MaxDirectories, [int]$MaxSeconds) {
 			}
 		} catch { continue }
 	}
-	return @($found)
+	return [pscustomobject]@{ manifests = @($found); directoriesVisited = $visited; truncated = ($stack.Count -gt 0); elapsedSeconds = [Math]::Round($started.Elapsed.TotalSeconds, 2) }
 }
 
 try {
 	$request = Get-Content -LiteralPath $RequestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-	$release = Get-LatestRelease ([bool]$request.includePrereleases)
 	if ($request.mode -eq 'background') {
 		$manifests = @($request.manifestPaths | Where-Object { $_ -and [System.IO.File]::Exists([string]$_) -and -not (Test-Offline ([string]$_)) })
+		$directoriesVisited = 0; $truncated = $false; $elapsedSeconds = 0
 	} else {
 		$roots = @($request.roots)
 		if ([bool]$request.fullSystem) {
 			$roots += [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and ($_.DriveType -eq 'Fixed' -or $_.DriveType -eq 'Removable') } | ForEach-Object { $_.RootDirectory.FullName }
 		}
-		$manifests = Find-Manifests $roots 20000 60
+		$maxDirectories = if ($null -ne $request.maxDirectories) { [Math]::Max(1, [Math]::Min(20000, [int]$request.maxDirectories)) } else { 20000 }
+		$maxSeconds = if ($null -ne $request.maxSeconds) { [Math]::Max(1, [Math]::Min(60, [int]$request.maxSeconds)) } else { 60 }
+		$scan = Find-Manifests $roots $maxDirectories $maxSeconds; $manifests = @($scan.manifests); $directoriesVisited = $scan.directoriesVisited; $truncated = $scan.truncated; $elapsedSeconds = $scan.elapsedSeconds
 	}
-	Write-WorkerResult @{ ok = $true; releaseTag = $release.tag; manifestVersion = $release.manifestVersion; prerelease = $release.prerelease; releaseUrl = $release.url; manifests = @($manifests); completedAt = [DateTime]::UtcNow.ToString('o') }
+	Write-WorkerResult @{ ok = $true; manifests = @($manifests); directoriesVisited = $directoriesVisited; truncated = $truncated; elapsedSeconds = $elapsedSeconds; completedAt = [DateTime]::UtcNow.ToString('o') }
 } catch {
 	Write-WorkerResult @{ ok = $false; error = $_.Exception.Message; manifests = @(); completedAt = [DateTime]::UtcNow.ToString('o') }
 	exit 1

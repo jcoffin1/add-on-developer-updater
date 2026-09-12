@@ -44,8 +44,14 @@ class UpdateReviewDialog(wx.Dialog):
         super().__init__(parent, title=_("Review NVDA add-on compatibility updates"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.results = results; mainSizer = wx.BoxSizer(wx.VERTICAL)
         self.onUpdate = None; self.allSelectedMessage = _("All add-on updates selected")
-        mainSizer.Add(wx.StaticText(self, label=_("Check the add-ons whose manifests should be updated. Nothing is selected by default. Press Space to check an item, Control+A to select all, Enter to update the checked items, or Escape to close.")), 0, wx.ALL, 10)
-        choices = [_("%s: NVDA %s; %s") % (result.name, result.status.removeprefix("update available: "), result.path) for result in results]
+        self.instructions = wx.StaticText(self, label=_("Check the add-ons whose manifests should be updated. Nothing is selected by default. Press Space to check an item, Control+A to select all, Enter to update the checked items, or Escape to close.")); mainSizer.Add(self.instructions, 0, wx.ALL, 10)
+        choices = []
+        for result in results:
+            if result.branch == "not a Git repository": gitState = _("manifest is not tracked by Git")
+            elif not result.branch or result.branch == "Git status unavailable": gitState = _("manifest change state is unavailable")
+            elif result.manifest_changed: gitState = _("manifest has uncommitted changes")
+            else: gitState = _("manifest is clean")
+            choices.append(_("%s: NVDA %s; minimum NVDA %s; branch %s; %s; %s") % (result.name, result.status.removeprefix("update available: "), result.minimum_version or _("unknown"), result.branch or _("unknown"), gitState, result.path))
         self.checkList = CustomCheckListBox(self, choices=choices)
         mainSizer.Add(self.checkList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
         selectionSizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -82,6 +88,14 @@ class UpdateReviewDialog(wx.Dialog):
             if self.onUpdate is not None: self.onUpdate(None)
             return
         event.Skip()
+
+class ProjectApprovalDialog(UpdateReviewDialog):
+    def __init__(self, parent, results):
+        super().__init__(parent, results)
+        self.SetTitle(_("Approve discovered NVDA add-on projects")); self.allSelectedMessage = _("All discovered add-on projects selected")
+        self.instructions.SetLabel(_("Select only development projects this add-on may monitor and offer to publishing or store workflows. Test copies, installed add-ons, forks you do not maintain, and archived copies should remain unselected. Nothing is selected by default.")); self.instructions.Wrap(850)
+        labels = {"primary": _("primary development copy"), "codex": _("Codex work copy"), "other": _("other development copy")}
+        self.checkList.Set([_("%s; %s; %s") % (result.name, labels[engine.path_kind(result.path)], result.path) for result in results]); self.checkList.SetName(_("Discovered add-on development projects awaiting approval")); self.updateButton.SetLabel(_("&Approve and check selected"))
 
 class GitHubPublishDialog(UpdateReviewDialog):
     def __init__(self, parent, results):
@@ -385,7 +399,7 @@ class OperationProgressDialog(wx.Dialog):
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     activeInstance = None
     def __init__(self):
-        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._reviewDialog = None; self._publishDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
+        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._progressDeterminate = False; self._reviewDialog = None; self._approvalDialog = None; self._publishDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
         config_path = Path(globalVars.appArgs.configPath); self._statePath = config_path / "addonDeveloperUpdaterState.json"; self._releaseCachePath = config_path / "addonDeveloperUpdaterReleaseCache.json"; self._apiVersionCachePath = config_path / "addonDeveloperUpdaterApiVersions.json"; self._backupRoot = config_path / "addonDeveloperUpdaterBackups"
         if config.conf["addonDeveloperUpdater"]["intervalMinutes"] < 15: config.conf["addonDeveloperUpdater"]["intervalMinutes"] = 15
         if UpdaterSettingsPanel not in gui.settingsDialogs.NVDASettingsDialog.categoryClasses: gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(UpdaterSettingsPanel)
@@ -399,7 +413,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if config.conf["addonDeveloperUpdater"]["automaticChecks"]: self._startMonitor()
         self._wakeMonitor.set()
     def _startProgress(self, keepFocus=False):
-        self._stopProgress(); stopEvent = threading.Event(); self._progressStop = stopEvent; self._progressValue = 0; wx.CallAfter(self._showProgress, stopEvent, keepFocus)
+        self._stopProgress(); stopEvent = threading.Event(); self._progressStop = stopEvent; self._progressValue = 0; self._progressDeterminate = False; wx.CallAfter(self._showProgress, stopEvent, keepFocus)
         def pulse():
             while not stopEvent.wait(2) and not self._shutdown.is_set(): wx.CallAfter(self._pulseProgress, stopEvent)
         self._progressThread = threading.Thread(target=pulse, name="addonDeveloperProgress", daemon=True); self._progressThread.start()
@@ -411,11 +425,18 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._progressDialog.Show(); self._progressDialog.Raise(); self._progressDialog.status.SetFocus()
         else: self._progressDialog.ShowWithoutActivating()
     def _updateProgressMessage(self, message):
+        self._setProgressMessage(message)
+        ui.message(_(message))
+    def _setProgressMessage(self, message):
         if self._progressDialog is not None:
             self._progressDialog.status.SetValue(_(message)); self._progressDialog.Layout()
-        ui.message(_(message))
+    def _setProgressStep(self, stopEvent, message, current, total):
+        if stopEvent is not self._progressStop or stopEvent.is_set(): return
+        self._progressDeterminate = True
+        if self._progressDialog is not None:
+            self._progressValue = min(100, max(0, round(current * 100 / max(1, total)))); self._progressDialog.status.SetValue(_(message)); self._progressDialog.gauge.SetValue(self._progressValue); self._progressDialog.Layout()
     def _pulseProgress(self, stopEvent):
-        if stopEvent is self._progressStop and not stopEvent.is_set() and self._progressDialog is not None:
+        if stopEvent is self._progressStop and not stopEvent.is_set() and not self._progressDeterminate and self._progressDialog is not None:
             self._progressValue = self._progressValue + 10 if self._progressValue < 90 else 10
             self._progressDialog.gauge.SetValue(self._progressValue)
     def _stopProgress(self):
@@ -445,6 +466,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             except OSError: pass
         if self._reviewDialog is not None:
             self._reviewDialog.Destroy(); self._reviewDialog = None
+        if self._approvalDialog is not None:
+            self._approvalDialog.Destroy(); self._approvalDialog = None
         if self._publishDialog is not None:
             self._publishDialog.Destroy(); self._publishDialog = None
         if self._repositoryDialog is not None:
@@ -468,6 +491,31 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def script_checkAddonProjects(self, gesture): self._startCheck(manual=True, full_system=bool(config.conf["addonDeveloperUpdater"]["scanFixedDrives"]))
     @scriptHandler.script(description=_("Discover NVDA add-on projects across all accessible drives"), category=SCRIPT_CATEGORY)
     def script_discoverAddonProjects(self, gesture): self._startCheck(manual=True, full_system=True)
+    @scriptHandler.script(description=_("Report add-on update-check status"), category=SCRIPT_CATEGORY)
+    def script_reportAddonUpdateCheckStatus(self, gesture):
+        state = engine.read_json(self._statePath, {}); records = engine.visible_project_records(state)[0]; approved = engine.approved_project_ids(state)
+        available = sum(str(item.get("status", "")).startswith("update available: ") for item in records if isinstance(item, dict)); awaiting = sum("awaiting" in str(item.get("status", "")) for item in records if isinstance(item, dict)); failed = sum("failed" in str(item.get("status", "")) for item in records if isinstance(item, dict)); approvedCount = sum(item.get("project_id") in approved for item in records if isinstance(item, dict))
+        source = str(state.get("releaseSource", "unknown")); release = str(state.get("releaseTag", "unknown")); compatibility = str(state.get("manifestVersion", "unknown"))
+        message = _("Latest detected NVDA release %s, compatibility target %s, information source %s. Last successful check %s. Last complete project check %s. Last development-folder discovery %s. %d approved projects, %d updates available, %d awaiting approval, and %d validation failures.") % (release, compatibility, source, self._formatCheckTime(state.get("lastSuccessfulCheckAt")), self._formatCheckTime(state.get("lastScanAt")), self._formatCheckTime(state.get("lastDiscoveryAt")), approvedCount, available, awaiting, failed)
+        if state.get("lastDiscoveryDirectories") is not None: message += _(" The last discovery visited %d directories in %s seconds%s.") % (int(state.get("lastDiscoveryDirectories", 0)), state.get("lastDiscoverySeconds", 0), _(", and stopped at its safety limit") if state.get("lastDiscoveryTruncated") else "")
+        if config.conf["addonDeveloperUpdater"]["automaticChecks"]: message += _(" The next automatic check is expected in about %d minutes.") % max(1, round(self._nextAutomaticCheckDelay(state, config.conf["addonDeveloperUpdater"]) / 60))
+        else: message += _(" Automatic checks are disabled.")
+        if state.get("lastCheckError"): message += _(" Most recent check error: %s.") % state["lastCheckError"]
+        ui.message(message); self._showInformation(_("Add-on update-check status"), message)
+    @staticmethod
+    def _formatCheckTime(value):
+        try: return datetime.fromisoformat(str(value)).astimezone().strftime("%B %d, %Y at %I:%M %p")
+        except (TypeError, ValueError): return _("never")
+    @scriptHandler.script(description=_("Review newly discovered add-on projects awaiting approval"), category=SCRIPT_CATEGORY)
+    def script_reviewDiscoveredAddonProjects(self, gesture):
+        state = engine.read_json(self._statePath, {}); awaiting = []
+        for item in engine.visible_project_records(state)[0]:
+            if isinstance(item, dict) and "awaiting" in str(item.get("status", "")):
+                try: awaiting.append(engine.ProjectResult(**item))
+                except TypeError: pass
+        if not awaiting: ui.message(_("No discovered add-on projects are awaiting approval")); return
+        release = engine.Release(str(state.get("releaseTag", "")), str(state.get("manifestVersion", "")), bool(state.get("prerelease")), str(state.get("releaseUrl", "")), str(state.get("releaseSource", "saved")), str(state.get("releaseCheckedAt", "")))
+        self._showProjectApprovalDialog(awaiting, release)
     @scriptHandler.script(description=_("Set an older last tested NVDA version for selected add-ons"), gesture="kb:NVDA+alt+shift+d", category=SCRIPT_CATEGORY)
     def script_downgradeAddonCompatibility(self, gesture):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
@@ -542,27 +590,36 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if not entries: ui.message(_("No compatibility target changes are available to undo")); return
         details = "; ".join(_("%s: NVDA %s back to %s; %s") % (entry.get("name", Path(entry["path"]).parent.name), entry.get("target_last_tested", "unknown"), entry.get("previous_last_tested", "unknown"), entry["path"]) for entry in entries)
         self._showConfirmation(_("Undo compatibility target changes"), _("Restore the manifests from the most recent compatibility target operation? Later edits will never be overwritten. Planned restores: %s.") % details, lambda: self._startUndoCompatibilityTargets(entries))
-    def _startUndoCompatibilityTargets(self, entries):
+    @scriptHandler.script(description=_("Undo the most recent discovered compatibility updates"), category=SCRIPT_CATEGORY)
+    def script_undoLatestCompatibilityUpdates(self, gesture):
+        state = engine.read_json(self._statePath, {}); entries = state.get("updateUndo", []) if isinstance(state.get("updateUndo"), list) else []; entries = [entry for entry in entries if isinstance(entry, dict) and entry.get("path") and entry.get("backup_path")]
+        if not entries: ui.message(_("No compatibility updates are available to undo")); return
+        details = "; ".join(_("%s: NVDA %s back to %s; %s") % (entry.get("name", Path(entry["path"]).parent.name), entry.get("target_last_tested", "unknown"), entry.get("previous_last_tested", "unknown"), entry["path"]) for entry in entries)
+        self._showConfirmation(_("Undo compatibility updates"), _("Restore manifests from the most recent update operation? Later edits will never be overwritten. Planned restores: %s.") % details, lambda: self._startUndoCompatibilityTargets(entries, "updateUndo", True))
+    def _startUndoCompatibilityTargets(self, entries, stateKey="compatibilityUndo", updateOperation=False):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        ui.message(_("Restoring manifests from the most recent compatibility target operation")); self._startProgress()
-        try: threading.Thread(target=self._undoCompatibilityTargets, args=(entries,), name="addonDeveloperCompatibilityUndo", daemon=True).start()
+        ui.message(_("Restoring manifests from the most recent compatibility update") if updateOperation else _("Restoring manifests from the most recent compatibility target operation")); self._startProgress()
+        try: threading.Thread(target=self._undoCompatibilityTargets, args=(entries, stateKey, updateOperation), name="addonDeveloperCompatibilityUndo", daemon=True).start()
         except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start compatibility undo"); ui.message(_("The compatibility changes could not be restored"))
-    def _undoCompatibilityTargets(self, entries):
+    def _undoCompatibilityTargets(self, entries, stateKey="compatibilityUndo", updateOperation=False):
         results = []
         try:
             for entry in entries:
                 try: results.append(engine.undo_compatibility_target(Path(entry["path"]), Path(entry["backup_path"]), str(entry.get("target_last_tested", "")), str(entry.get("target_manifest_hash", "")), self._backupRoot))
                 except Exception as error: results.append(engine.ProjectResult(str(entry.get("project_id", "")), str(entry.get("name", "add-on")), str(entry.get("path", "")), f"undo failed: {error}"))
             restored = {os.path.normcase(result.path) for result in results if result.status.startswith("restored last tested NVDA from ")}
-            state = engine.read_json(self._statePath, {}); state["projects"] = engine.merge_project_records(state.get("projects", []), results); state["compatibilityUndo"] = [entry for entry in entries if os.path.normcase(str(entry.get("path", ""))) not in restored]; engine.atomic_json_write(self._statePath, state)
+            state = engine.read_json(self._statePath, {}); state["projects"] = engine.merge_project_records(state.get("projects", []), results); state[stateKey] = [entry for entry in entries if os.path.normcase(str(entry.get("path", ""))) not in restored]; engine.atomic_json_write(self._statePath, state)
             for result in results: log.info("Add-on Developer Updater compatibility undo: %s: %s", result.path, result.status)
         finally:
-            self._scanLock.release(); self._finishProgressThen(self._finishUndoCompatibilityTargets, results)
-    def _finishUndoCompatibilityTargets(self, results):
+            self._scanLock.release(); self._finishProgressThen(self._finishUndoCompatibilityTargets, results, updateOperation)
+    def _finishUndoCompatibilityTargets(self, results, updateOperation=False):
         restored = [result for result in results if result.status.startswith("restored last tested NVDA from ")]; failed = [result for result in results if result not in restored]
-        message = _("Compatibility undo complete. %d manifests restored: %s.") % (len(restored), self._limitedDetails(restored, lambda item: _("%s %s") % (item.name, item.status))) if restored else _("Compatibility undo complete. No manifests were restored.")
+        if restored:
+            template = _("Compatibility update undo complete. %d manifests restored: %s.") if updateOperation else _("Compatibility undo complete. %d manifests restored: %s.")
+            message = template % (len(restored), self._limitedDetails(restored, lambda item: _("%s %s") % (item.name, item.status)))
+        else: message = _("Compatibility update undo complete. No manifests were restored.") if updateOperation else _("Compatibility undo complete. No manifests were restored.")
         if failed: message += _(" %d manifests were not restored: %s.") % (len(failed), "; ".join(_("%s: %s") % (item.name, item.status) for item in failed))
-        ui.message(message); self._showInformation(_("Compatibility undo results"), message)
+        ui.message(message); self._showInformation(_("Compatibility update undo results") if updateOperation else _("Compatibility undo results"), message)
     @scriptHandler.script(description=_("Review previously discovered NVDA add-on compatibility updates"), category=SCRIPT_CATEGORY)
     def script_reviewAddonProjectUpdates(self, gesture):
         state = engine.read_json(self._statePath, {}); available = []
@@ -571,7 +628,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 try: available.append(engine.ProjectResult(**item))
                 except TypeError: pass
         if not available: ui.message(_("No saved add-on compatibility updates are available")); return
-        self._showReviewDialog(available, engine.Release(str(state.get("releaseTag", "")), str(state.get("manifestVersion", "")), True, ""))
+        self._showReviewDialog(available, engine.Release(str(state.get("releaseTag", "")), str(state.get("manifestVersion", "")), bool(state.get("prerelease")), str(state.get("releaseUrl", "")), str(state.get("releaseSource", "saved")), str(state.get("releaseCheckedAt", ""))))
     @scriptHandler.script(description=_("Cancel the running add-on developer update scan"), category=SCRIPT_CATEGORY)
     def script_cancelAddonProjectScan(self, gesture):
         if not self._scanActive.is_set(): ui.message(_("No add-on developer scan is running")); return
@@ -961,13 +1018,21 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         while not self._shutdown.is_set():
             try:
                 settings = config.conf["addonDeveloperUpdater"]
-                if settings["automaticChecks"]:
-                    self._scanCancel.clear(); self._runCheck(manual=False, full_system=False)
-                wait_seconds = max(900, int(settings["intervalMinutes"]) * 60)
+                state = engine.read_json(self._statePath, {})
+                wait_seconds = self._nextAutomaticCheckDelay(state, settings) if settings["automaticChecks"] else 900
             except Exception:
                 log.exception("Add-on Developer Updater monitor failed")
                 wait_seconds = 900
-            self._wakeMonitor.wait(wait_seconds); self._wakeMonitor.clear()
+            if self._wakeMonitor.wait(wait_seconds): self._wakeMonitor.clear(); continue
+            if self._shutdown.is_set(): break
+            try:
+                if config.conf["addonDeveloperUpdater"]["automaticChecks"]:
+                    self._scanCancel.clear(); self._runCheck(manual=False, full_system=False)
+            except Exception:
+                log.exception("Add-on Developer Updater monitor failed")
+    @staticmethod
+    def _nextAutomaticCheckDelay(state, settings):
+        return engine.automatic_check_delay(state, int(settings["intervalMinutes"]))
     def _startCheck(self, manual=False, full_system=False):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer scan is already running")); return
         self._scanCancel.clear(); self._scanActive.set(); ui.message(_("Checking for NVDA releases and add-on projects"))
@@ -985,7 +1050,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     @staticmethod
     def _rescanDue(state, hours):
         try:
-            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(state["lastScanAt"])).total_seconds()
+            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(state.get("lastDiscoveryAt") or state["lastScanAt"])).total_seconds()
             return elapsed < -300 or elapsed >= hours * 3600
         except (KeyError, TypeError, ValueError): return True
     @classmethod
@@ -1005,6 +1070,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         available = [result for result in results if result.status.startswith("update available: ")]
         awaiting = [result for result in results if "awaiting" in result.status]
         failed = [result for result in results if "failed" in result.status]
+        deferred = [result for result in results if "deferred" in result.status]
         parts = [_("Scan complete.")]
         if current: parts.append(_("1 project is current.") if len(current) == 1 else _("%d projects are current.") % len(current))
         if updated:
@@ -1018,8 +1084,63 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             parts.append(_("1 project is awaiting approval: %s.") % details if len(awaiting) == 1 else _("%d projects are awaiting approval: %s.") % (len(awaiting), details))
         if failed:
             details = cls._limitedDetails(failed, lambda result: result.name)
-            parts.append(_("1 project failed validation: %s. See the NVDA log for details.") % details if len(failed) == 1 else _("%d projects failed validation: %s. See the NVDA log for details.") % (len(failed), details))
+            parts.append(_("1 project could not be processed: %s. See the NVDA log for details.") % details if len(failed) == 1 else _("%d projects could not be processed: %s. See the NVDA log for details.") % (len(failed), details))
+        if deferred:
+            details = cls._limitedDetails(deferred, lambda result: _("%s: %s") % (result.name, result.status))
+            parts.append(_("The update was deferred: %s.") % details)
         return " ".join(parts)
+    @staticmethod
+    def _addProjectContext(result, path):
+        try:
+            metadata = engine.values(path); result.minimum_version = metadata.get("minimumnvdaversion", ""); result.branch, result.manifest_changed = engine.git_manifest_state(path)
+        except (OSError, UnicodeError, ValueError):
+            pass
+        return result
+    def _showProjectApprovalDialog(self, awaiting, release):
+        if self._approvalDialog is not None: self._approvalDialog.Raise(); self._approvalDialog.checkList.SetFocus(); return
+        dialog = ProjectApprovalDialog(gui.mainFrame, awaiting); self._approvalDialog = dialog
+        def close(_event=None):
+            if self._approvalDialog is dialog: self._approvalDialog = None
+            dialog.Destroy()
+        def approve(_event=None):
+            selected = dialog.selectedResults()
+            if not selected: ui.message(_("No discovered add-on projects were selected")); return
+            details = "; ".join(_("%s; %s") % (item.name, item.path) for item in selected)
+            self._showConfirmation(_("Confirm approved add-on projects"), _("Approve %d development projects for future monitoring, GitHub publishing, and store-readiness workflows? Confirm that these are copies you maintain. Projects: %s.") % (len(selected), details), lambda: (close(), self._startApproveProjects(selected, release)))
+        dialog.onUpdate = approve; dialog.updateButton.Bind(wx.EVT_BUTTON, approve); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close); dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.checkList.SetFocus)
+    def _startApproveProjects(self, selected, release):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Validating %d selected projects before approval") % len(selected)); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._approveProjects, args=(selected, release, self._progressStop), name="addonDeveloperProjectApproval", daemon=True).start()
+        except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start project approval"); ui.message(_("Project approval could not be started"))
+    def _approveProjects(self, selected, release, progressEvent):
+        results = []; operationError = ""
+        try:
+            state = engine.read_json(self._statePath, {}); approved = engine.approved_project_ids(state)
+            latest = engine.latest_release(bool(config.conf["addonDeveloperUpdater"]["includePrereleases"]), self._releaseCachePath)
+            if engine.version_tuple(latest.manifest_version) >= engine.version_tuple(release.manifest_version): release = latest
+            for index, item in enumerate(selected, 1):
+                path = Path(item.path)
+                wx.CallAfter(self._setProgressStep, progressEvent, _("Validating project %d of %d: %s") % (index, len(selected), item.name), index, len(selected))
+                try: result = self._addProjectContext(engine.update(path, release, self._backupRoot, False), path)
+                except Exception as error: result = engine.ProjectResult(item.project_id, item.name, item.path, f"validation failed: {error}")
+                if "failed" in result.status: result.status = "awaiting manual approval; " + result.status
+                else: approved.add(result.project_id)
+                results.append(result)
+            state["approvedProjects"] = sorted(approved); state["projects"] = engine.merge_project_records(state.get("projects", []), results); engine.atomic_json_write(self._statePath, state)
+        except Exception as error:
+            operationError = str(error); log.exception("Project approval failed")
+        finally:
+            self._scanLock.release(); self._finishProgressThen(self._finishProjectApproval, results, release, operationError)
+    def _finishProjectApproval(self, results, release, operationError=""):
+        if operationError:
+            message = _("Project approval failed before its results could be saved: %s. No project should be treated as newly approved.") % operationError; ui.message(message); self._showInformation(_("Project approval failed"), message); return
+        approved = [item for item in results if "awaiting" not in item.status]; failed = [item for item in results if item not in approved]; available = [item for item in approved if item.status.startswith("update available: ")]
+        message = _("Project approval complete. %d projects approved: %s.") % (len(approved), self._limitedDetails(approved, lambda item: item.name)) if approved else _("Project approval complete. No projects were approved.")
+        if failed: message += _(" %d projects remain unapproved because validation failed: %s.") % (len(failed), self._limitedDetails(failed, lambda item: item.name))
+        ui.message(message)
+        if available: self._showReviewDialog(available, release)
+        else: self._showInformation(_("Project approval results"), message)
     def _showReviewDialog(self, available, release):
         if self._reviewDialog is not None:
             self._reviewDialog.Raise(); self._reviewDialog.checkList.SetFocus(); return
@@ -1030,7 +1151,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         def updateSelected(_event):
             selected = dialog.selectedResults()
             if not selected: ui.message(_("No add-on manifests were selected")); return
-            closeDialog(); self._startApply(selected, release)
+            details = "; ".join(_("%s: %s; branch %s; %s") % (item.name, item.status.removeprefix("update available: "), item.branch or _("unknown"), item.path) for item in selected)
+            dirty = [item.name for item in selected if item.manifest_changed]
+            message = _("Update only lastTestedNVDAVersion for %d selected manifests? The latest official NVDA target will be rechecked before writing. Planned changes: %s.") % (len(selected), details)
+            if dirty: message += _(" Warning: these manifests have uncommitted changes: %s. Current contents will be backed up before editing.") % "; ".join(dirty)
+            self._showConfirmation(_("Confirm add-on compatibility updates"), message, lambda: (closeDialog(), self._startApply(selected, release)))
         dialog.onUpdate = updateSelected
         dialog.updateButton.Bind(wx.EVT_BUTTON, updateSelected); dialog.closeButton.Bind(wx.EVT_BUTTON, closeDialog); dialog.Bind(wx.EVT_CLOSE, closeDialog)
         dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.checkList.SetFocus)
@@ -1043,10 +1168,16 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _applySelected(self, selected, release):
         cancelled = lambda: self._scanCancel.is_set() or self._shutdown.is_set(); results = []
         try:
+            latest = engine.latest_release(bool(config.conf["addonDeveloperUpdater"]["includePrereleases"]), self._releaseCachePath)
+            if engine.version_tuple(latest.manifest_version) > engine.version_tuple(release.manifest_version):
+                results = [engine.ProjectResult(item.project_id, item.name, item.path, _("update deferred because newer NVDA %s is now available; run the update check again") % latest.tag) for item in selected]
+                if not self._shutdown.is_set(): wx.CallAfter(self._finishApply, results)
+                return
+            if engine.version_tuple(latest.manifest_version) == engine.version_tuple(release.manifest_version): release = latest
             for selectedResult in selected:
                 if cancelled(): return
                 path = Path(selectedResult.path)
-                try: results.append(engine.update(path, release, self._backupRoot, True, cancelled))
+                try: results.append(self._addProjectContext(engine.update(path, release, self._backupRoot, True, cancelled), path))
                 except Exception as error:
                     log.exception("Could not update selected add-on manifest %s", path)
                     results.append(engine.ProjectResult(selectedResult.project_id, selectedResult.name, str(path), f"validation failed: {error}"))
@@ -1055,8 +1186,14 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             submissionProjects = engine.merge_project_records(state.get("submissionProjects", []), updated)
             channels = state.get("submissionChannels", {}) if isinstance(state.get("submissionChannels"), dict) else {}
             for result in updated: channels[result.project_id] = "beta" if release.prerelease else "stable"
-            state["projects"] = projects; state["submissionProjects"] = submissionProjects; state["submissionChannels"] = channels; state["lastScanAt"] = engine.utc_now(); engine.atomic_json_write(self._statePath, state)
+            state["projects"] = projects; state["submissionProjects"] = submissionProjects; state["submissionChannels"] = channels; state["lastScanAt"] = engine.utc_now()
+            if updated: state["updateUndo"] = [{"project_id": result.project_id, "name": result.name, "path": result.path, "backup_path": result.backup_path, "previous_last_tested": result.previous_last_tested, "target_last_tested": result.target_last_tested, "target_manifest_hash": result.target_manifest_hash} for result in updated]
+            engine.atomic_json_write(self._statePath, state)
             for result in results: log.info("Add-on Developer Updater selected update: %s: %s", result.path, result.status)
+            if not self._shutdown.is_set(): wx.CallAfter(self._finishApply, results)
+        except Exception as error:
+            log.exception("Selected manifest update operation failed")
+            results = [engine.ProjectResult(item.project_id, item.name, item.path, _("update operation failed while saving complete results; inspect the manifest and its backup: %s") % error) for item in selected]
             if not self._shutdown.is_set(): wx.CallAfter(self._finishApply, results)
         finally: self._stopProgress(); self._scanLock.release()
     def _finishApply(self, results):
@@ -1199,17 +1336,47 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         except OSError:
             log.exception("Could not open add-on submission resources")
             if not self._shutdown.is_set(): wx.CallAfter(ui.message, _("One or more add-on folders or the submission form could not be opened"))
+    def _finishManualCheck(self, results, awaiting, release, sameCompatibilityFamily, discoveryTruncated=False):
+        message = self._completionMessage(results)
+        if sameCompatibilityFamily:
+            message = _("NVDA %s was found, but it uses the same add-on compatibility target %s, so no manifest change is required solely for this build. ") % (release.tag, release.manifest_version) + message
+        if release.source == "cached":
+            message = _("The live NVDA release services were unavailable, so this scan used the last known release information. ") + message
+        if discoveryTruncated: message += _(" Discovery stopped at its directory or time safety limit. Add narrower development folders in settings if a project was missed.")
+        ui.message(message)
+        if awaiting: self._showProjectApprovalDialog(awaiting, release)
+    @staticmethod
+    def _checkErrorText(error):
+        detail = " ".join(str(error).split())[:300] or error.__class__.__name__
+        lowered = detail.casefold()
+        if any(word in lowered for word in ("url", "http", "network", "timed out", "name resolution", "connection")):
+            return _("NVDA release services could not be reached: %s") % detail
+        if "worker" in lowered or "powershell" in lowered:
+            return _("The isolated project-discovery worker failed: %s") % detail
+        return _("The update check failed: %s") % detail
     def _runCheck(self, manual=False, full_system=False, lock_acquired=False):
         if not lock_acquired and not self._scanLock.acquire(blocking=False): return
-        self._scanActive.set()
-        self._startProgress()
+        self._scanActive.set(); progressStarted = False; progressEvent = None; finishCallback = None
         cancelled = lambda: self._scanCancel.is_set() or self._shutdown.is_set()
         requestPath = self._statePath.with_name(f"addonDeveloperUpdaterRequest-{uuid.uuid4().hex}.json")
         outputPath = self._statePath.with_name(f"addonDeveloperUpdaterResult-{uuid.uuid4().hex}.json")
         try:
             settings = config.conf["addonDeveloperUpdater"]; state = engine.read_json(self._statePath, {})
+            mode = self._workerMode(manual, state, settings["periodicRescanHours"])
+            if manual or mode == "periodic":
+                self._startProgress(); progressStarted = True; progressEvent = self._progressStop; wx.CallAfter(self._setProgressMessage, _("Checking official NVDA release information"))
+            release = engine.latest_release(bool(settings["includePrereleases"]), self._releaseCachePath)
+            if progressStarted: wx.CallAfter(self._setProgressMessage, _("Discovering add-on development projects in the isolated worker"))
             storedPaths = [str(path) for path in engine.approved_manifest_paths(state)]
-            request = {"mode": self._workerMode(manual, state, settings["periodicRescanHours"]), "includePrereleases": bool(settings["includePrereleases"]), "fullSystem": bool(full_system), "roots": self._rootStrings(), "manifestPaths": storedPaths}
+            checkedAt = engine.utc_now(); previousAutomaticError = str(state.get("lastAutomaticError", "")); previousReleaseSource = str(state.get("releaseSource", ""))
+            if not manual and state.get("releaseTag") == release.tag and not self._rescanDue(state, settings["periodicRescanHours"]):
+                state.update({"lastCheckAt": checkedAt, "lastSuccessfulCheckAt": checkedAt, "lastCheckError": "", "lastAutomaticError": "", "automaticFailureCount": 0, "releaseSource": release.source, "releaseCheckedAt": release.checked_at, "prerelease": release.prerelease, "releaseUrl": release.url})
+                engine.atomic_json_write(self._statePath, state)
+                if previousAutomaticError: wx.CallAfter(ui.message, _("Automatic NVDA add-on update checks are working again"))
+                if release.source == "cached" and previousReleaseSource != "cached": wx.CallAfter(ui.message, _("Live NVDA release services are unavailable. Automatic checks are using the last known release information."))
+                elif release.source != "cached" and previousReleaseSource == "cached": wx.CallAfter(ui.message, _("Live NVDA release information is available again"))
+                return
+            request = {"mode": mode, "fullSystem": bool(full_system), "roots": self._rootStrings(), "manifestPaths": storedPaths}
             engine.atomic_json_write(requestPath, request)
             workerPath = Path(__file__).with_name("worker.ps1")
             if not workerPath.is_file(): raise RuntimeError("The external scan worker is missing. Reinstall Add-on Developer Updater.")
@@ -1223,46 +1390,67 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 detail = workerResult.get("error")
                 if not detail: detail = f"External worker stopped before returning details (Windows status 0x{returnCode & 0xFFFFFFFF:08X})"
                 raise RuntimeError(detail)
-            release = engine.Release(str(workerResult["releaseTag"]), str(workerResult["manifestVersion"]), bool(workerResult.get("prerelease")), str(workerResult.get("releaseUrl", "")))
-            if not manual and state.get("releaseTag") == release.tag and not self._rescanDue(state, settings["periodicRescanHours"]): return
             manifests = [Path(path) for path in workerResult.get("manifests", []) if isinstance(path, str)]
-            if manual: wx.CallAfter(ui.message, _("NVDA %s was found. External project discovery completed.") % release.tag)
+            discoveryTruncated = bool(workerResult.get("truncated")); previousDiscoveryTruncated = bool(state.get("lastDiscoveryTruncated"))
+            if progressStarted: wx.CallAfter(self._setProgressMessage, _("Checking %d discovered add-on manifests") % len(manifests))
             approved = engine.approved_project_ids(state)
             if "approvedProjects" not in state:
                 for item in state.get("projects", []) if isinstance(state.get("projects"), list) else []:
                     if not isinstance(item, dict) or not item.get("path"): continue
                     try: approved.add(engine.project_id(Path(item["path"])))
                     except (OSError, TypeError, ValueError): pass
-            if manual: approved.update(engine.project_id(path) for path in manifests)
             results = []
-            for path in manifests:
+            for index, path in enumerate(manifests, 1):
                 if cancelled(): wx.CallAfter(ui.message, _("Add-on developer scan cancelled. No completion state was saved.")); return
+                if progressStarted: wx.CallAfter(self._setProgressStep, progressEvent, _("Checking add-on manifest %d of %d: %s") % (index, len(manifests), path.parent.name), index, len(manifests))
                 identifier = engine.project_id(path)
                 try:
                     if identifier not in approved:
                         metadata = engine.values(path); results.append(engine.ProjectResult(identifier, metadata.get("name", path.parent.name), str(path), "awaiting manual approval")); continue
-                    results.append(engine.update(path, release, self._backupRoot, False, cancelled))
+                    results.append(self._addProjectContext(engine.update(path, release, self._backupRoot, False, cancelled), path))
                 except Exception as error:
                     log.exception("Could not process add-on manifest %s", path)
                     results.append(engine.ProjectResult(identifier, path.parent.name, str(path), f"validation failed: {error}"))
                 if cancelled(): wx.CallAfter(ui.message, _("Add-on developer scan cancelled. No completion state was saved.")); return
             projects = engine.merge_project_records(state.get("projects", []), results); ignored = engine.ignored_project_ids({"projects": projects, "ignoredProjects": state.get("ignoredProjects", [])})
             visibleResults = [result for result in results if result.project_id not in ignored]
-            counts = {
-                "updated": sum(r.status.startswith("updated") for r in visibleResults),
-                "available": sum(r.status.startswith("update available") for r in visibleResults),
-                "awaiting": sum("awaiting" in r.status for r in visibleResults),
-                "failed": sum("failed" in r.status for r in visibleResults),
-            }
-            engine.atomic_json_write(self._statePath, {"releaseTag": release.tag, "manifestVersion": release.manifest_version, "lastScanAt": engine.utc_now(), "approvedProjects": sorted(approved), "ignoredProjects": sorted(ignored), "projects": projects, "submissionProjects": state.get("submissionProjects", []), "submissionChannels": state.get("submissionChannels", {}), "submissionMetadata": state.get("submissionMetadata", {}), "compatibilityUndo": state.get("compatibilityUndo", [])})
+            previousRecords = {item.get("project_id"): item for item in state.get("projects", []) if isinstance(item, dict) and item.get("project_id")}
+            previousUpdates = state.get("notifiedUpdates", {}) if isinstance(state.get("notifiedUpdates"), dict) else {}; previousAwaiting = state.get("notifiedAwaiting", {}) if isinstance(state.get("notifiedAwaiting"), dict) else {}; previousFailures = state.get("notifiedFailures", {}) if isinstance(state.get("notifiedFailures"), dict) else {}
+            allVisibleRecords = engine.visible_project_records({"projects": projects, "ignoredProjects": sorted(ignored)})[0]
+            currentUpdates, currentAwaiting, currentFailures, changedNotifications, resolvedFailureIds = engine.notification_state(allVisibleRecords, previousUpdates, previousAwaiting, previousFailures)
+            newlyActionable = [result for result in visibleResults if result.project_id in changedNotifications]
+            resolvedFailures = [previousRecords[identifier].get("name", identifier) for identifier in resolvedFailureIds if identifier in previousRecords]
+            sameCompatibilityFamily = bool(state.get("releaseTag") and state.get("releaseTag") != release.tag and state.get("manifestVersion") == release.manifest_version)
+            state.update({"releaseTag": release.tag, "manifestVersion": release.manifest_version, "prerelease": release.prerelease, "releaseUrl": release.url, "releaseSource": release.source, "releaseCheckedAt": release.checked_at, "lastCheckAt": checkedAt, "lastSuccessfulCheckAt": checkedAt, "lastScanAt": checkedAt, "lastCheckError": "", "lastAutomaticError": "", "automaticFailureCount": 0, "approvedProjects": sorted(approved), "ignoredProjects": sorted(ignored), "projects": projects, "notifiedUpdates": currentUpdates, "notifiedAwaiting": currentAwaiting, "notifiedFailures": currentFailures})
+            if mode != "background": state.update({"lastDiscoveryAt": checkedAt, "lastDiscoveryDirectories": int(workerResult.get("directoriesVisited", 0)), "lastDiscoverySeconds": workerResult.get("elapsedSeconds", 0), "lastDiscoveryTruncated": discoveryTruncated})
+            engine.atomic_json_write(self._statePath, state)
             for result in results:
                 if result.status != "current": log.info("Add-on Developer Updater: %s: %s", result.path, result.status)
-            if manual or any(counts.values()): wx.CallAfter(ui.message, self._completionMessage(visibleResults))
-        except Exception:
-            log.exception("Add-on Developer Updater check failed"); wx.CallAfter(ui.message, _("The add-on developer update check failed. See the NVDA log for details."))
+            awaiting = [result for result in visibleResults if "awaiting" in result.status]
+            if manual: finishCallback = (self._finishManualCheck, visibleResults, awaiting, release, sameCompatibilityFamily, discoveryTruncated)
+            else:
+                if newlyActionable: wx.CallAfter(ui.message, self._completionMessage(newlyActionable))
+                if resolvedFailures: wx.CallAfter(ui.message, _("Add-on validation is working again for: %s") % "; ".join(resolvedFailures))
+                if previousAutomaticError: wx.CallAfter(ui.message, _("Automatic NVDA add-on update checks are working again"))
+                if release.source == "cached" and previousReleaseSource != "cached": wx.CallAfter(ui.message, _("Live NVDA release services are unavailable. Automatic checks are using the last known release information."))
+                elif release.source != "cached" and previousReleaseSource == "cached": wx.CallAfter(ui.message, _("Live NVDA release information is available again"))
+                if discoveryTruncated and not previousDiscoveryTruncated: wx.CallAfter(ui.message, _("Periodic add-on discovery stopped at its safety limit. Add narrower development folders in settings if a project was missed."))
+        except Exception as error:
+            message = self._checkErrorText(error); state = engine.read_json(self._statePath, {}); previousError = str(state.get("lastAutomaticError", "")); state["lastCheckAt"] = engine.utc_now(); state["lastCheckError"] = message
+            if not manual:
+                state["lastAutomaticError"] = message; state["automaticFailureCount"] = min(10, int(state.get("automaticFailureCount", 0) or 0) + 1)
+            try: engine.atomic_json_write(self._statePath, state)
+            except OSError: pass
+            if manual or previousError != message:
+                log.exception("Add-on Developer Updater check failed"); wx.CallAfter(ui.message, message)
+            else: log.debug("Repeated automatic update-check failure suppressed: %s", message)
         finally:
             self._workerProcess = None
             for path in (requestPath, outputPath):
                 try: path.unlink(missing_ok=True)
                 except OSError: pass
-            self._scanActive.clear(); self._stopProgress(); self._scanLock.release()
+            self._scanActive.clear(); self._scanLock.release()
+            if finishCallback is not None:
+                if progressStarted: self._finishProgressThen(*finishCallback)
+                else: wx.CallAfter(finishCallback[0], *finishCallback[1:])
+            elif progressStarted: self._stopProgress()

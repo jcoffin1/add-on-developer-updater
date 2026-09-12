@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026.2.35
+
+- Centralize stable, beta, release-candidate, and alpha detection in one tested implementation while keeping recursive discovery in the isolated worker.
+- Add ETag caching, official release-feed fallback, last-known-good offline fallback, and clear live, validated-cache, feed, or cached status.
+- Delay the first automatic check, exponentially back off repeated failures, suppress duplicate failures and unchanged update notices, and announce recovery.
+- Keep routine unchanged background release polls silent and avoid launching the discovery worker until an actual project scan is required.
+- Require explicit confirmation before newly discovered projects enter monitoring, GitHub publishing, or Store-readiness workflows.
+- Add an assignable project-approval command and automatically offer the approval window after a manual discovery scan.
+- Show minimum NVDA version, Git branch, manifest change state, and exact paths before compatibility updates, followed by a second confirmation.
+- Recheck the official release target immediately before writing selected manifests and defer changes when a newer compatibility family has appeared.
+- Revalidate every changed update manifest, roll back failed writes automatically, and add a hash-protected undo command for the most recent update operation.
+- Add meaningful scan stages, determinate per-manifest progress, clearer same-family alpha feedback, and an assignable update-check status command.
+- Add direct external-worker tests plus release-cache, feed fallback, alpha selection, notification deduplication, and recovery tests.
+
 ## 2026.2.34
 
 - Rename the downgrade interface to Set an older NVDA compatibility target and explain that it changes metadata rather than code or NVDA.

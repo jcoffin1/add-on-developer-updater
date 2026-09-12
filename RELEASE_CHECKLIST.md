@@ -12,8 +12,14 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 ## Scan and manifest workflow
 
 - Run `NVDA+Alt+Shift+U`; verify progress feedback, completion details, and continued NVDA responsiveness.
+- Confirm newly found projects remain unapproved, nothing is selected initially, and only confirmed maintained copies become available to later workflows.
+- Test the assignable approval and update-check status commands, including a project left awaiting approval.
+- Verify repeated unchanged updates and failures are announced once, backoff increases after failures, and recovery is announced.
+- Test live release lookup, HTTP not-modified cache validation, official feed fallback, offline saved fallback, and same-family alpha feedback.
 - Run the assigned review command; verify focus, Space selection, Control+A, Enter, and Escape.
+- Confirm review and final confirmation report path, branch, minimum and target versions, and uncommitted-manifest state, and that a newly detected compatibility family defers an outdated selection.
 - Update one disposable manifest and confirm the announcement, formatting preservation, and backup.
+- Verify post-update validation rollback, successful update undo, missing backup handling, and refusal to overwrite later edits.
 - Run the compatibility-target command against multiple disposable manifests and verify that only shared official versions above every minimum are offered, and that experimental versions require beta or development channels for every selection.
 - Confirm branch, path, minimum, current target, and uncommitted-manifest status are announced accurately.
 - Test confirmation, automatic rollback after simulated validation failure, successful undo, missing backup, and refusal to overwrite a later manifest edit.

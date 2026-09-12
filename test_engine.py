@@ -1,4 +1,5 @@
-import codecs, io, json, os, stat, subprocess, tempfile, unittest, zipfile
+import codecs, io, json, os, shutil, stat, subprocess, tempfile, unittest, urllib.error, zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 from unittest import mock
@@ -28,6 +29,51 @@ class EngineTests(unittest.TestCase):
         items = [{"tag_name": "release-2026.3beta9", "prerelease": True}, {"tag_name": "release-2026.2.0"}, {"tag_name": "release-2026.3beta11", "prerelease": True}]
         self.assertEqual("2026.3beta11", engine._select_release(items, True).tag); self.assertEqual("2026.2.0", engine._select_release(items, False).tag)
         self.assertIsNone(engine.parse_release({"tag_name": "junk-2026.9"}))
+
+    def test_release_lookup_selects_alpha_and_saves_one_shared_cache(self):
+        api = io.BytesIO(json.dumps([{"tag_name": "release-2026.2.0", "prerelease": False, "html_url": "https://example.invalid/stable"}]).encode()); api.headers = {"ETag": "test-etag"}
+        alpha_index = io.BytesIO(b'<a href="nvda_snapshot_alpha-57626,71bae80b.exe">alpha</a>'); alpha_index.headers = {}
+        build_source = io.BytesIO(b"version_year = 2026\nversion_major = 3\nversion_minor = 0\n"); build_source.headers = {}
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "release.json"
+            with mock.patch.object(engine.urllib.request, "urlopen", side_effect=[api, alpha_index, build_source]):
+                release = engine.latest_release(True, cache)
+            saved = engine.read_json(cache)
+        self.assertEqual("alpha-57626,71bae80b", release.tag)
+        self.assertEqual("2026.3", release.manifest_version)
+        self.assertEqual("live", release.source)
+        self.assertEqual("test-etag", saved["etag"])
+        self.assertEqual("alpha-57626,71bae80b", saved["releases"]["prerelease"]["tag"])
+
+    def test_release_lookup_uses_feed_then_last_known_cache(self):
+        feed = b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><title>release-2026.2.1</title><link href="https://example.invalid/release"/></entry></feed>'
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "release.json"; feed_response = io.BytesIO(feed); feed_response.headers = {}
+            with mock.patch.object(engine.urllib.request, "urlopen", side_effect=[OSError("api offline"), OSError("api offline"), feed_response]), mock.patch.object(engine.time, "sleep"):
+                release = engine.latest_release(False, cache)
+            self.assertEqual("release feed", release.source)
+            with mock.patch.object(engine.urllib.request, "urlopen", side_effect=OSError("offline")), mock.patch.object(engine.time, "sleep"):
+                cached = engine.latest_release(False, cache)
+        self.assertEqual("2026.2.1", cached.tag)
+        self.assertEqual("cached", cached.source)
+
+    def test_not_modified_release_response_is_a_validated_cache_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "release.json"; engine.atomic_json_write(cache, {"etag": "tag", "checkedAt": "2026-01-01T00:00:00+00:00", "releases": {"stable": {"tag": "2026.2.1", "manifest_version": "2026.2.1", "prerelease": False, "url": "https://example.invalid"}}})
+            not_modified = urllib.error.HTTPError(engine.RELEASES_URL, 304, "Not Modified", None, None)
+            with mock.patch.object(engine.urllib.request, "urlopen", side_effect=not_modified):
+                release = engine.latest_release(False, cache)
+        self.assertEqual("validated cache", release.source)
+        self.assertEqual("2026.2.1", release.tag)
+
+    def test_alpha_lookup_failure_never_regresses_below_cached_alpha(self):
+        api = io.BytesIO(json.dumps([{"tag_name": "release-2026.2.0", "prerelease": False, "html_url": "https://example.invalid/stable"}]).encode()); api.headers = {"ETag": "new"}
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "release.json"; engine.atomic_json_write(cache, {"checkedAt": "2026-09-01T00:00:00+00:00", "releases": {"prerelease": {"tag": "alpha-60000,abcdef", "manifest_version": "2026.3", "prerelease": True, "url": "https://example.invalid/alpha", "source": "live", "checked_at": "2026-09-01T00:00:00+00:00"}}})
+            with mock.patch.object(engine.urllib.request, "urlopen", side_effect=[api, OSError("alpha service offline")]):
+                release = engine.latest_release(True, cache)
+        self.assertEqual("alpha-60000,abcdef", release.tag)
+        self.assertEqual("cached", release.source)
     def test_developer_project_discovery_and_preview_default(self):
         with tempfile.TemporaryDirectory() as folder:
             manifest = self.make_project(folder); self.assertEqual([manifest.resolve()], engine.discover_manifests([Path(folder)]))
@@ -54,6 +100,38 @@ class EngineTests(unittest.TestCase):
         current = engine.ProjectResult("new", "New", "C:/new/manifest.ini", "current")
         merged = engine.merge_project_records([{"project_id": "old", "name": "Old", "path": "D:/old/manifest.ini", "status": "current"}], [current])
         self.assertEqual({"old", "new"}, {item["project_id"] for item in merged})
+
+    def test_notification_state_announces_only_changes_and_recovery(self):
+        records = [
+            {"project_id": "update", "status": "update available: 2026.1 to 2026.2"},
+            {"project_id": "waiting", "status": "awaiting manual approval"},
+            {"project_id": "fixed", "status": "current"},
+        ]
+        current_updates, current_awaiting, current_failures, changed, resolved = engine.notification_state(
+            records,
+            {"update": "update available: 2026.1 to 2026.2"},
+            {"waiting": "awaiting manual approval"},
+            {"fixed": "validation failed: old problem"},
+        )
+        self.assertEqual({"update": "update available: 2026.1 to 2026.2"}, current_updates)
+        self.assertEqual({"waiting": "awaiting manual approval"}, current_awaiting)
+        self.assertEqual({}, current_failures)
+        self.assertEqual(set(), changed)
+        self.assertEqual({"fixed"}, resolved)
+
+        records[0]["status"] = "update available: 2026.1 to 2026.3"
+        *_, changed, _resolved = engine.notification_state(records, current_updates, current_awaiting, current_failures)
+        self.assertEqual({"update"}, changed)
+
+    def test_automatic_check_delay_waits_after_startup_and_backs_off(self):
+        now = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(30, engine.automatic_check_delay({}, 30, now))
+        state = {"lastCheckAt": (now - timedelta(minutes=5)).isoformat(), "automaticFailureCount": 0}
+        self.assertEqual(25 * 60, engine.automatic_check_delay(state, 30, now))
+        state["automaticFailureCount"] = 2
+        self.assertEqual(115 * 60, engine.automatic_check_delay(state, 30, now))
+        state["automaticFailureCount"] = 10
+        self.assertEqual((24 * 60 - 5) * 60, engine.automatic_check_delay(state, 1440, now))
     def test_duplicate_names_have_distinct_ids_and_backups(self):
         with tempfile.TemporaryDirectory() as folder:
             first = self.make_project(folder, "one"); second = self.make_project(folder, "two"); release = engine.Release("2026.2", "2026.2", False, ""); backups = Path(folder) / "safe"
@@ -75,6 +153,24 @@ class EngineTests(unittest.TestCase):
             manifest = self.make_project(folder, manifest=text)
             result = engine.update(manifest, engine.Release("2026.2", "2026.2", False, ""), Path(folder) / "safe", True)
             self.assertTrue(result.status.startswith("updated")); self.assertIn('lastTestedNVDAVersion = "2026.2"  # tested', manifest.read_text())
+
+    def test_discovered_update_revalidates_and_can_be_safely_undone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = self.make_project(folder); original = manifest.read_bytes(); backups = Path(folder) / "backups"
+            changed = engine.update(manifest, engine.Release("2026.2", "2026.2", False, ""), backups, True)
+            self.assertTrue(changed.status.startswith("updated to "))
+            self.assertTrue(Path(changed.backup_path).is_file())
+            restored = engine.undo_compatibility_target(manifest, Path(changed.backup_path), changed.target_last_tested, changed.target_manifest_hash, backups)
+            self.assertTrue(restored.status.startswith("restored last tested NVDA from "))
+            self.assertEqual(original, manifest.read_bytes())
+
+    def test_failed_post_update_validation_restores_original_manifest(self):
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = self.make_project(folder); original = manifest.read_bytes()
+            with mock.patch.object(engine, "validate", side_effect=[[], ["simulated failure"]]):
+                result = engine.update(manifest, engine.Release("2026.2", "2026.2", False, ""), Path(folder) / "backups", True)
+            self.assertIn("original manifest was restored", result.status)
+            self.assertEqual(original, manifest.read_bytes())
     def test_atomic_state_round_trip_and_corrupt_fallback(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "state.json"; engine.atomic_json_write(path, {"ok": True}); self.assertEqual({"ok": True}, engine.read_json(path)); path.write_text("{"); self.assertEqual({}, engine.read_json(path))
@@ -300,6 +396,27 @@ class EngineTests(unittest.TestCase):
                 self.assertIn("globalPlugins/addonDeveloperUpdater/_vendor/PyYAML-LICENSE.txt", archive.namelist())
                 self.assertIn("COPYING.txt", archive.namelist())
 
+    @unittest.skipUnless(shutil.which("powershell.exe"), "NVDA's scan worker requires Windows PowerShell")
+    def test_external_scan_worker_directly_discovers_only_developer_manifests(self):
+        worker = Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "worker.ps1"
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); project = root / "project"; project.mkdir(); (project / ".git").mkdir(); manifest = project / "manifest.ini"; manifest.write_text(MANIFEST, encoding="utf-8")
+            ordinary = root / "ordinary"; ordinary.mkdir(); (ordinary / "manifest.ini").write_text(MANIFEST, encoding="utf-8")
+            request = root / "request.json"; output = root / "output.json"; request.write_text(json.dumps({"mode": "manual", "fullSystem": False, "roots": [str(root)], "manifestPaths": []}), encoding="utf-8")
+            completed = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(worker), "-RequestPath", str(request), "-OutputPath", str(output)], capture_output=True, text=True, timeout=20)
+            result = engine.read_json(output)
+            bounded_output = root / "bounded.json"; request.write_text(json.dumps({"mode": "manual", "fullSystem": False, "roots": [str(root)], "manifestPaths": [], "maxDirectories": 1, "maxSeconds": 5}), encoding="utf-8")
+            bounded = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(worker), "-RequestPath", str(request), "-OutputPath", str(bounded_output)], capture_output=True, text=True, timeout=20)
+            bounded_result = engine.read_json(bounded_output)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertTrue(result["ok"])
+        self.assertEqual([str(manifest.resolve())], result["manifests"])
+        self.assertFalse(result["truncated"])
+        self.assertEqual(0, bounded.returncode, bounded.stderr)
+        self.assertEqual([], bounded_result["manifests"])
+        self.assertTrue(bounded_result["truncated"])
+        self.assertNotIn("Invoke-RestMethod", worker.read_text(encoding="utf-8-sig"))
+
     def test_documentation_does_not_advertise_nonexistent_automatic_changes(self):
         documentation = (Path(__file__).parent / "doc" / "en" / "readme.html").read_text(encoding="utf-8")
         self.assertNotIn("opt-in automatic changes", documentation)
@@ -412,8 +529,21 @@ class EngineTests(unittest.TestCase):
         self.assertIn("Official older NVDA target shared by every selected add-on", plugin)
         self.assertIn("Confirm older compatibility target", plugin)
         self.assertIn("Undo the most recent compatibility target changes", plugin)
-        self.assertIn('"compatibilityUndo": state.get("compatibilityUndo", [])', plugin)
+        self.assertIn('state.update({"releaseTag": release.tag', plugin)
         self.assertIn("if changed:\n                state[\"compatibilityUndo\"]", plugin)
+
+    def test_update_check_ui_requires_approval_and_reports_status(self):
+        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn("class ProjectApprovalDialog", plugin)
+        self.assertIn("Confirm approved add-on projects", plugin)
+        self.assertIn("Report add-on update-check status", plugin)
+        self.assertIn("engine.latest_release", plugin)
+        self.assertIn("engine.notification_state", plugin)
+        self.assertIn("Confirm add-on compatibility updates", plugin)
+        self.assertIn("Undo the most recent discovered compatibility updates", plugin)
+        self.assertIn('state["updateUndo"]', plugin)
+        self.assertIn('state.get("lastDiscoveryAt")', plugin)
+        self.assertNotIn("if manual: approved.update", plugin)
 
     def test_store_submission_remains_a_manual_browser_action(self):
         plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")

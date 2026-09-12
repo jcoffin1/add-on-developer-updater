@@ -26,6 +26,8 @@ class Release:
     manifest_version: str
     prerelease: bool
     url: str
+    source: str = "live"
+    checked_at: str = ""
 
 @dataclass
 class ProjectResult:
@@ -37,6 +39,9 @@ class ProjectResult:
     previous_last_tested: str = ""
     target_last_tested: str = ""
     target_manifest_hash: str = ""
+    minimum_version: str = ""
+    branch: str = ""
+    manifest_changed: bool = False
 
 @dataclass(frozen=True)
 class CompatibilityTargetProject:
@@ -51,6 +56,18 @@ class CompatibilityTargetProject:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+def automatic_check_delay(state: dict, interval_minutes: int, now: datetime | None = None) -> float:
+    """Return seconds until the next check, including bounded failure backoff."""
+    base = max(900, int(interval_minutes) * 60)
+    try: failures = max(0, min(4, int(state.get("automaticFailureCount", 0) or 0)))
+    except (AttributeError, TypeError, ValueError): failures = 0
+    interval = min(max(21600, base), base * (2 ** failures))
+    try:
+        current = now or datetime.now(timezone.utc); elapsed = (current - datetime.fromisoformat(state["lastCheckAt"])).total_seconds()
+        return max(30, interval - max(0, elapsed))
+    except (KeyError, TypeError, ValueError):
+        return 30
 
 def atomic_json_write(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -138,15 +155,40 @@ def parse_alpha_snapshot(index_html: str, build_version_source: str) -> Release 
     manifest = f"{fields['year']}.{fields['major']}" + (f".{fields['minor']}" if fields["minor"] else "")
     return Release(f"alpha-{build},{commit}", manifest, True, ALPHA_SNAPSHOTS_URL + f"nvda_snapshot_alpha-{build},{commit}.exe")
 
+def _release_sort_key(release: Release):
+    alpha = re.fullmatch(r"alpha-(\d+),[0-9a-f]+", release.tag, re.I)
+    if alpha:
+        return version_tuple(release.manifest_version), 0, int(alpha.group(1))
+    match = TAG_PATTERN.search(release.tag)
+    stage = (match.group(4) or "final").lower() if match else "final"
+    stage_number = int(match.group(5) or 0) if match else 0
+    return version_tuple(release.manifest_version), {"alpha": 0, "beta": 1, "rc": 2, "final": 3}[stage], stage_number
+
 def _select_release(items: list[dict], include_prereleases: bool) -> Release:
     releases = [r for item in items if (r := parse_release(item)) and (include_prereleases or not r.prerelease)]
     if not releases: raise RuntimeError("No matching NVDA release was returned.")
-    def sort_key(release):
-        match = TAG_PATTERN.search(release.tag)
-        stage = (match.group(4) or "final").lower() if match else "final"
-        stage_number = int(match.group(5) or 0) if match else 0
-        return version_tuple(release.manifest_version), {"alpha": 0, "beta": 1, "rc": 2, "final": 3}[stage], stage_number
-    return max(releases, key=sort_key)
+    return max(releases, key=_release_sort_key)
+
+def _latest_alpha_release() -> Release | None:
+    headers = {"User-Agent": USER_AGENT}
+    with urllib.request.urlopen(urllib.request.Request(ALPHA_SNAPSHOTS_URL, headers=headers), timeout=15) as response:
+        index_html = response.read().decode("utf-8", errors="replace")
+    with urllib.request.urlopen(urllib.request.Request(BUILD_VERSION_URL, headers=headers), timeout=15) as response:
+        build_source = response.read().decode("utf-8", errors="replace")
+    return parse_alpha_snapshot(index_html, build_source)
+
+def _release_with_status(release: Release, source: str, checked_at: str) -> Release:
+    return Release(release.tag, release.manifest_version, release.prerelease, release.url, source, checked_at)
+
+def _save_release_cache(path: Path | None, data: dict) -> None:
+    if path is None:
+        return
+    try:
+        atomic_json_write(path, data)
+    except OSError:
+        # A valid network result remains usable even if the configuration
+        # directory is temporarily read-only or full.
+        pass
 
 def _cached_release(cache: dict, include_prereleases: bool) -> Release | None:
     key = "prerelease" if include_prereleases else "stable"
@@ -157,7 +199,7 @@ def _cached_release(cache: dict, include_prereleases: bool) -> Release | None:
         release = Release(**candidate)
         version_tuple(release.manifest_version)
         if not include_prereleases and release.prerelease: return None
-        return release
+        return _release_with_status(release, "cached", release.checked_at or str(cache.get("checkedAt", "")))
     except (TypeError, ValueError): return None
 
 def latest_release(include_prereleases: bool = True, cache_path: Path | None = None) -> Release:
@@ -168,14 +210,39 @@ def latest_release(include_prereleases: bool = True, cache_path: Path | None = N
         try:
             request = urllib.request.Request(RELEASES_URL, headers=headers)
             with urllib.request.urlopen(request, timeout=15) as response:
-                items = json.load(response); release = _select_release(items, include_prereleases)
-                cached_releases = {"prerelease": asdict(_select_release(items, True))}
-                try: cached_releases["stable"] = asdict(_select_release(items, False))
-                except RuntimeError: pass
-                if cache_path: atomic_json_write(cache_path, {"etag": response.headers.get("ETag"), "releases": cached_releases, "checkedAt": utc_now()})
-                return release
+                items = json.load(response); checked_at = utc_now(); prerelease = _select_release(items, True); prerelease_source = "live"; prerelease_checked_at = checked_at
+                if include_prereleases:
+                    try:
+                        alpha = _latest_alpha_release()
+                        if alpha is not None and _release_sort_key(alpha) > _release_sort_key(prerelease): prerelease = alpha
+                    except Exception:
+                        cached_prerelease = _cached_release(cache, True)
+                        if cached_prerelease is not None and _release_sort_key(cached_prerelease) > _release_sort_key(prerelease):
+                            prerelease = cached_prerelease; prerelease_source = "cached"; prerelease_checked_at = cached_prerelease.checked_at
+                try: stable = _select_release(items, False)
+                except RuntimeError:
+                    if not include_prereleases: raise
+                    stable = None
+                release = prerelease if include_prereleases else stable
+                cached_releases = {"prerelease": asdict(_release_with_status(prerelease, prerelease_source, prerelease_checked_at))}
+                if stable is not None: cached_releases["stable"] = asdict(_release_with_status(stable, "live", checked_at))
+                response_headers = getattr(response, "headers", {})
+                _save_release_cache(cache_path, {"etag": response_headers.get("ETag"), "releases": cached_releases, "checkedAt": checked_at})
+                return _release_with_status(release, prerelease_source, prerelease_checked_at) if include_prereleases else _release_with_status(release, "live", checked_at)
         except urllib.error.HTTPError as error:
-            if error.code == 304 and (cached := _cached_release(cache, include_prereleases)): return cached
+            if error.code == 304 and (cached := _cached_release(cache, include_prereleases)):
+                if include_prereleases:
+                    try:
+                        alpha = _latest_alpha_release()
+                        if alpha is not None and _release_sort_key(alpha) > _release_sort_key(cached):
+                            checked_at = utc_now(); cached_releases = dict(cache.get("releases", {})); cached_releases["prerelease"] = asdict(alpha)
+                            _save_release_cache(cache_path, {**cache, "releases": cached_releases, "checkedAt": checked_at})
+                            return _release_with_status(alpha, "live", checked_at)
+                    except Exception:
+                        return cached
+                checked_at = utc_now(); validated = _release_with_status(cached, "validated cache", checked_at); cached_releases = dict(cache.get("releases", {})); cached_releases["prerelease" if include_prereleases else "stable"] = asdict(validated)
+                _save_release_cache(cache_path, {**cache, "releases": cached_releases, "checkedAt": checked_at})
+                return validated
             last_error = error
         except Exception as error: last_error = error
         if attempt == 0: time.sleep(1)
@@ -186,9 +253,20 @@ def latest_release(include_prereleases: bool = True, cache_path: Path | None = N
         for entry in root.findall("atom:entry", ns):
             title = entry.findtext("atom:title", default="", namespaces=ns).strip(); link = entry.find("atom:link", ns)
             items.append({"tag_name": title, "prerelease": bool(re.search(r"(?:alpha|beta|rc)\d*", title, re.I)), "html_url": link.get("href", "") if link is not None else ""})
-        release = _select_release(items, include_prereleases)
-        if cache_path: atomic_json_write(cache_path, {"releases": {"prerelease" if include_prereleases else "stable": asdict(release)}, "checkedAt": utc_now(), "apiError": str(last_error)})
-        return release
+        release = _select_release(items, include_prereleases); release_source = "release feed"; release_checked_at = utc_now()
+        if include_prereleases:
+            try:
+                alpha = _latest_alpha_release()
+                if alpha is not None and _release_sort_key(alpha) > _release_sort_key(release): release = alpha
+            except Exception:
+                cached_prerelease = _cached_release(cache, True)
+                if cached_prerelease is not None and _release_sort_key(cached_prerelease) > _release_sort_key(release):
+                    release = cached_prerelease; release_source = "cached"; release_checked_at = cached_prerelease.checked_at
+        checked_at = utc_now()
+        cached_releases = dict(cache.get("releases", {})) if isinstance(cache.get("releases"), dict) else {}
+        cached_releases["prerelease" if include_prereleases else "stable"] = asdict(_release_with_status(release, release_source, release_checked_at))
+        _save_release_cache(cache_path, {"releases": cached_releases, "checkedAt": checked_at, "apiError": str(last_error)})
+        return _release_with_status(release, release_source, release_checked_at)
     except Exception as feed_error:
         if cached := _cached_release(cache, include_prereleases): return cached
         raise RuntimeError(f"GitHub API and releases feed failed: {last_error}; {feed_error}") from feed_error
@@ -318,6 +396,15 @@ def visible_project_records(state: dict) -> tuple[list[dict], set[str]]:
     projects = state.get("projects", []) if isinstance(state, dict) and isinstance(state.get("projects"), list) else []
     ignored = ignored_project_ids(state)
     return [item for item in projects if isinstance(item, dict) and item.get("project_id") not in ignored], ignored
+
+def notification_state(records: list[dict], previous_updates: dict, previous_awaiting: dict, previous_failures: dict):
+    """Return current notification maps, changed IDs, and resolved failure IDs."""
+    valid = [item for item in records if isinstance(item, dict) and item.get("project_id")]
+    updates = {item["project_id"]: str(item.get("status", "")) for item in valid if str(item.get("status", "")).startswith("update available: ")}
+    awaiting = {item["project_id"]: str(item.get("status", "")) for item in valid if "awaiting" in str(item.get("status", ""))}
+    failures = {item["project_id"]: str(item.get("status", "")) for item in valid if "failed" in str(item.get("status", ""))}
+    changed = {identifier for mapping, previous in ((updates, previous_updates), (awaiting, previous_awaiting), (failures, previous_failures)) for identifier, status in mapping.items() if previous.get(identifier) != status}
+    return updates, awaiting, failures, changed, set(previous_failures) - set(failures)
 
 def addon_version_key(value: str) -> tuple:
     """Compare common add-on versions numerically, with stable builds after prereleases."""
@@ -483,7 +570,12 @@ def update(path: Path, release: Release, backup_root: Path, apply_changes: bool 
     backup = _next_backup_path(backup_folder); shutil.copy2(path, backup)
     changed = original[:match.start()] + f"{match.group(1)}{match.group('quote')}{release.manifest_version}{match.group('quote')}{match.group('suffix')}{match.group('cr')}" + original[match.end():]
     _write_manifest_preserving_format(path, changed)
-    return ProjectResult(identifier, name, str(path), f"updated to {release.manifest_version}")
+    errors = validate(path, check_python=False)
+    if errors:
+        _atomic_replace_bytes(path, raw)
+        return ProjectResult(identifier, name, str(path), "validation failed after the update; the original manifest was restored: " + "; ".join(errors))
+    target_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    return ProjectResult(identifier, name, str(path), f"updated to {release.manifest_version}", str(backup), current, release.manifest_version, target_hash)
 
 def downgrade(path: Path, target_version: str, backup_root: Path, official_versions: dict[str, bool]) -> ProjectResult:
     target_version = target_version.strip(); version_tuple(target_version)
