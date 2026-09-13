@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.2.37
+
+- Verify that the exact pushed commit is contained in the repository's current default branch before offering to create a GitHub Release.
+- Defer ineligible releases with a focused explanation telling the user to merge the commit into the default branch and rerun publishing.
+- Continue offering eligible releases when a multi-add-on publishing operation contains other projects that are not yet on their default branches.
+
 ## 2026.2.36
 
 - Stop an isolated discovery worker after 90 seconds even if Windows blocks inside a cloud or removable-drive filesystem call.

@@ -1299,12 +1299,19 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if callback is not None: self._finishProgressThen(callback, *arguments)
     def _offerGitHubRelease(self, published):
         names = "; ".join(item["name"] for item in published); ui.message(_("GitHub push completed for: %s") % names)
-        differing = [item for item in published if publisher.release_needed(item.get("version", ""), item.get("github_release_version", ""))]
+        blocked = [item for item in published if item.get("releaseBlocker")]
+        if blocked:
+            ui.message(_("GitHub release deferred for: %s") % "; ".join(_("%s: %s") % (item["name"], item["releaseBlocker"]) for item in blocked))
+        differing = [item for item in published if not item.get("releaseBlocker") and publisher.release_needed(item.get("version", ""), item.get("github_release_version", ""))]
         if not differing:
+            if blocked:
+                message = _("Source changes were pushed, but no release was created. Release blockers: %s. Press OK to exit.") % "; ".join(_("%s: %s") % (item["name"], item["releaseBlocker"]) for item in blocked)
+                ui.message(message); self._showInformation(_("GitHub release deferred"), message); return
             message = _("The newest local releases are already current on GitHub. Press OK to exit.")
             ui.message(message); self._showInformation(_("GitHub releases are current"), message); return
         comparisons = "; ".join(_("%s: GitHub %s, local %s") % (item["name"], item.get("github_release_version") or _("no release"), item.get("version") or _("unknown")) for item in differing)
-        self._showConfirmation(_("Release new add-on versions"), _("The following local versions differ from the newest GitHub Releases: %s. Release the local versions now? Select No to leave only the source repositories pushed.") % comparisons, lambda: self._startGitHubRelease(differing), onNo=lambda: self._showGitHubResult(_("Source changes were pushed, but no new GitHub Release was created. Press OK to exit.")))
+        blockedText = _(" Releases deferred until their commits reach the default branch: %s.") % "; ".join(item["name"] for item in blocked) if blocked else ""
+        self._showConfirmation(_("Release new add-on versions"), _("The following local versions differ from the newest GitHub Releases: %s.%s Release the eligible local versions now? Select No to leave only the source repositories pushed.") % (comparisons, blockedText), lambda: self._startGitHubRelease(differing), onNo=lambda: self._showGitHubResult(_("Source changes were pushed, but no new GitHub Release was created. Press OK to exit.")))
     def _startGitHubRelease(self, published):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
         ui.message(_("Packaging and publishing GitHub Releases")); self._startProgress(keepFocus=True)

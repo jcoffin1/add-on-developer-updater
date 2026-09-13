@@ -59,6 +59,7 @@ class ProjectPublishInfo:
     release_package_error: str = ""
     store_guideline_issues: tuple[str, ...] = ()
     channel: str = ""
+    default_branch: str = ""
 
 @dataclass(frozen=True)
 class GitHubAddonRepository:
@@ -599,8 +600,11 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
             try: remote = _run([gh, "repo", "view", _repository_name(project.name), "--json", "url", "--jq", ".url"])
             except RuntimeError: pass
         release_download = ""; package_verified = True; package_error = ""
+        default_branch = ""
         if remote:
-            visibility = _run([gh, "repo", "view", _remote_web_url(remote), "--json", "visibility", "--jq", ".visibility"])
+            repository_details = json.loads(_run([gh, "repo", "view", _remote_web_url(remote), "--json", "visibility,defaultBranchRef"]) or "{}")
+            visibility = str(repository_details.get("visibility", ""))
+            default_branch = str((repository_details.get("defaultBranchRef") or {}).get("name") or "")
             if visibility.upper() != "PUBLIC": raise RuntimeError(f"{project.name} must use a public GitHub repository for NVDA Store submission")
             if progress: progress(f"Checking the newest GitHub Release for {project.name}")
             github_release = _run([gh, "release", "list", "--repo", _remote_web_url(remote), "--exclude-drafts", "--limit", "1", "--json", "tagName", "--jq", ".[0].tagName"])
@@ -633,7 +637,7 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
         if release_download and owned:
             package_verified, package_error, package_issues = verify_release_package(release_download, metadata.get("name", project.name), metadata.get("version", ""), api_versions, channel)
             guideline_issues += package_issues
-        reports.append(ProjectPublishInfo(project.project_id, project.name, str(manifest), str(root), metadata.get("version", ""), metadata.get("summary", project.name), metadata.get("author", ""), remote, changed, has_git, unpushed, normalized_version(github_release), release_download, owned, package_verified, package_error, guideline_issues, channel))
+        reports.append(ProjectPublishInfo(project.project_id, project.name, str(manifest), str(root), metadata.get("version", ""), metadata.get("summary", project.name), metadata.get("author", ""), remote, changed, has_git, unpushed, normalized_version(github_release), release_download, owned, package_verified, package_error, guideline_issues, channel, default_branch))
     return reports
 
 def login() -> None:
@@ -674,6 +678,31 @@ def repository_name(remote: str) -> str:
     parts = path.split("/", 1)
     if len(parts) != 2 or not parts[1]: raise RuntimeError(f"GitHub repository name is missing from: {remote}")
     return urllib.parse.unquote(parts[1])
+
+def release_target_blocker(root: Path, remote_name: str, default_branch: str, target_commit: str) -> str:
+    """Return why a pushed commit cannot safely be released, or an empty string."""
+    if not remote_name or not default_branch:
+        return "the repository's default branch could not be determined"
+    remote_reference = f"refs/remotes/{remote_name}/{default_branch}"
+    try:
+        _git(root, "fetch", "--no-tags", remote_name, f"+refs/heads/{default_branch}:{remote_reference}")
+        completed = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor", target_commit, remote_reference],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        return f"the default-branch safety check failed: {error}"
+    if completed.returncode == 0:
+        return ""
+    if completed.returncode == 1:
+        return f"the pushed commit is not yet on the repository's default branch, {default_branch}; merge it there before creating a release"
+    detail = (completed.stderr or completed.stdout).strip()
+    return f"Git could not verify the repository's default branch: {detail or f'exit code {completed.returncode}'}"
 
 def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
     gh = gh_path(); published = []
@@ -718,7 +747,19 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
         # Releases must target the commit we actually pushed.  GitHub otherwise
         # defaults to the repository's default branch, which may be unrelated.
         target_commit = _git(root, "rev-parse", "HEAD")
-        published.append({**report.__dict__, "sourceUrl": _remote_web_url(remote), "targetCommitish": target_commit})
+        repository = _remote_web_url(remote)
+        default_branch = report.default_branch
+        release_pending = release_needed(report.version, report.github_release_version)
+        if release_pending:
+            try:
+                details = json.loads(_run([gh, "repo", "view", repository, "--json", "defaultBranchRef"]) or "{}")
+                current_default_branch = str((details.get("defaultBranchRef") or {}).get("name") or "")
+                if current_default_branch:
+                    default_branch = current_default_branch
+            except (RuntimeError, TypeError, ValueError):
+                pass
+        blocker = release_target_blocker(root, push_remote, default_branch, target_commit) if release_pending else ""
+        published.append({**report.__dict__, "sourceUrl": repository, "targetCommitish": target_commit, "defaultBranch": default_branch, "releaseBlocker": blocker})
         if progress: progress(f"GitHub push finished for {report.name}, project {index} of {len(reports)}")
     return published
 
@@ -798,6 +839,8 @@ def release_create_arguments(gh: str, tag: str, package: Path, repository: str, 
 def release(items: list[dict], output_folder: Path, progress=None, on_released=None) -> list[dict]:
     gh = gh_path(); released = []
     for index, item in enumerate(items, 1):
+        if item.get("releaseBlocker"):
+            raise RuntimeError(f"Release creation was stopped for {item['name']}: {item['releaseBlocker']}")
         if progress: progress(f"Packaging {item['name']}, release {index} of {len(items)}")
         package = build_release_package(item, output_folder); tag = f"v{item['version']}"
         repository = item["sourceUrl"].removeprefix("https://github.com/")

@@ -486,6 +486,28 @@ class EngineTests(unittest.TestCase):
             "jcoffin1/chatgpt-desktop-access", target, "ChatGPT Desktop Access", True,
         ))
 
+    def test_release_target_must_be_on_repository_default_branch(self):
+        completed = subprocess.CompletedProcess([], 1, "", "")
+        with mock.patch.object(publisher, "_git", return_value=""), mock.patch.object(publisher.subprocess, "run", return_value=completed) as run:
+            blocker = publisher.release_target_blocker(Path("C:/project"), "origin", "main", "abc123")
+        self.assertIn("not yet on", blocker)
+        self.assertIn("main", blocker)
+        self.assertIn("merge-base", run.call_args.args[0])
+        with mock.patch.object(publisher, "_git", return_value=""), mock.patch.object(publisher.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.assertEqual("", publisher.release_target_blocker(Path("C:/project"), "origin", "main", "abc123"))
+
+    def test_release_refuses_an_item_with_a_recorded_branch_blocker(self):
+        item = {"name": "Demo", "releaseBlocker": "commit is not on main"}
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(publisher, "gh_path") as gh:
+            with self.assertRaisesRegex(RuntimeError, "not on main"):
+                publisher.release([item], Path(folder))
+        gh.assert_called_once()
+
+    def test_runtime_defers_ineligible_github_releases(self):
+        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn('item.get("releaseBlocker")', plugin)
+        self.assertIn("GitHub release deferred", plugin)
+
     def test_public_github_text_is_checked_before_store_submission(self):
         responses = iter((
             '{"description":"Accessible NVDA add-on"}',

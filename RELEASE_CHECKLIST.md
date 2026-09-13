@@ -35,6 +35,7 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 - Open Issues and edit, validate, save, and delete a disposable Markdown and YAML template.
 - Confirm no push or release occurs before its explicit confirmation.
 - Confirm matching local and GitHub versions produce one clear current-release message.
+- Push a disposable development branch whose commit is not on the repository's default branch; confirm source is pushed but no tag or release is created, then merge it and confirm the next publishing run permits the release.
 
 ## Store readiness
 
