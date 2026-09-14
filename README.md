@@ -47,7 +47,9 @@ GitHub release publishing verifies that the exact pushed commit is already conta
 
 - NVDA 2025.3.3 or later. The add-on is currently tested through NVDA 2026.2.
 - Windows PowerShell for isolated compatibility discovery.
-- Git and GitHub CLI for optional GitHub publishing features.
+- Git and [GitHub CLI](https://cli.github.com/) for optional GitHub features.
+
+GitHub features do not require sign-in during installation or NVDA startup. When a GitHub command is first used, the add-on checks for GitHub CLI and an authenticated account. If GitHub CLI is missing, an accessible Yes/No prompt offers to open its official installation page; installation is never started automatically. After installation, restart NVDA and run the command again. If GitHub CLI is signed out, the requested publishing, link-copying, Issues, template, or store-readiness operation offers GitHub's browser device sign-in and retries automatically after authorization.
 
 The link-copy command lists the newest non-draft GitHub Release containing a `.nvda-addon` asset for each owned repository. Repositories without a released add-on package are excluded. GitHub queries run on a worker thread, and public, private, archived, and prerelease packages are clearly identified in the selection list. Copy download link places the direct release-asset URL on the clipboard. Copy repository link, immediately below it, copies the selected repository's GitHub page instead.
 

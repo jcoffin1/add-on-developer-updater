@@ -29,7 +29,8 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 
 ## GitHub workflow
 
-- Test signed-in, signed-out, offline, inaccessible-repository, and disabled-Issues cases.
+- Test signed-in, signed-out, offline, inaccessible-repository, and disabled-Issues cases. Confirm every signed-out GitHub entry point, including store readiness, offers device sign-in and retries the original operation.
+- Test without GitHub CLI installed; confirm every GitHub entry point offers the official installation page, makes no installation changes itself, and explains how to continue afterward.
 - Verify each selection and confirmation dialog retains focus and every editable field has a meaningful spoken name.
 - Verify Copy download link copies the direct `.nvda-addon` asset URL and Copy repository link copies the selected repository's GitHub page.
 - Open Issues and edit, validate, save, and delete a disposable Markdown and YAML template.

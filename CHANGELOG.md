@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.2.39
+
+- Offer GitHub's secure browser device sign-in directly from the store-readiness command, then automatically retry the selected add-ons after authorization.
+- Distinguish a missing GitHub CLI installation from authentication and other GitHub errors in every GitHub entry point.
+- When GitHub CLI is missing, offer to open its official installation page and explain that installation is manual and NVDA should be restarted afterward.
+
 ## 2026.2.38
 
 - Add a separate Copy repository link button directly below Copy download link in the released add-on selection dialog.

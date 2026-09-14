@@ -22,6 +22,7 @@ _GitHubYamlLoader.add_implicit_resolver("tag:yaml.org,2002:bool", re.compile(r"^
 STORE_FORM = "https://github.com/nvaccess/addon-datastore/issues/new?template=registerAddon.yml"
 STORE_PUBLISHER = "Justin Coffin"
 GITHUB_DEVICE_URL = "https://github.com/login/device"
+GITHUB_CLI_URL = "https://cli.github.com/"
 NVDA_API_VERSIONS_URL = "https://raw.githubusercontent.com/nvaccess/addon-datastore/master/transform/nvdaAPIVersions.json"
 RUNTIME_NAMES = {"appmodules", "brailledisplaydrivers", "copying.txt", "doc", "globalplugins", "installtasks.py", "license.txt", "locale", "manifest.ini", "synthdrivers"}
 SENSITIVE_NAMES = {".env", "credentials.json", "id_dsa", "id_ed25519", "id_rsa", "secrets.json"}
@@ -37,6 +38,9 @@ _AI_DISCLOSURE_PATTERNS = (
 )
 
 class AuthenticationRequired(RuntimeError):
+    pass
+
+class GitHubCliRequired(RuntimeError):
     pass
 
 @dataclass
@@ -346,7 +350,7 @@ def gh_path() -> str:
     if found: return found
     candidate = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "GitHub CLI" / "gh.exe"
     if candidate.is_file(): return str(candidate)
-    raise RuntimeError("GitHub CLI is not installed")
+    raise GitHubCliRequired("GitHub CLI is not installed")
 
 def _github_owned_repository_nodes(query: str, progress_message: str, progress=None) -> tuple[str, list[dict]]:
     gh = gh_path()

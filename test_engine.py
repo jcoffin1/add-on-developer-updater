@@ -676,6 +676,19 @@ class EngineTests(unittest.TestCase):
         with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "_run", side_effect=RuntimeError("gh failed: not logged into any GitHub hosts")):
             with self.assertRaises(publisher.AuthenticationRequired): publisher.github_addon_repositories()
 
+    def test_missing_github_cli_has_a_distinct_actionable_error(self):
+        with mock.patch.object(publisher.shutil, "which", return_value=None), mock.patch.object(publisher.Path, "is_file", return_value=False):
+            with self.assertRaisesRegex(publisher.GitHubCliRequired, "not installed"):
+                publisher.gh_path()
+
+    def test_every_github_entry_point_offers_missing_cli_guidance(self):
+        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        self.assertGreaterEqual(plugin.count("except publisher.GitHubCliRequired"), 7)
+        self.assertIn("self._offerStoreGitHubLogin", plugin)
+        self.assertIn("self._retryStorePreflight", plugin)
+        self.assertIn("publisher.GITHUB_CLI_URL", plugin)
+        self.assertIn("Installation is not automatic", plugin)
+
     def test_download_url_gesture_and_clipboard_action_are_present(self):
         plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
         self.assertIn('gesture="kb:NVDA+alt+shift+f"', plugin)

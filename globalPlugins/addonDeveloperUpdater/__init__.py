@@ -685,8 +685,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         try:
             reports = publisher.preflight(ready, engine.values, self._githubProgress)
             callback, arguments = self._offerStoreSubmission, (reports,)
+        except publisher.GitHubCliRequired:
+            callback, arguments = self._offerGitHubCliInstall, ()
         except publisher.AuthenticationRequired:
-            callback, arguments = self._showGitHubResult, (_("GitHub is not signed in. Publish the add-ons to GitHub before attempting store submission. Press OK to exit."),)
+            callback, arguments = self._offerStoreGitHubLogin, (ready,)
         except Exception as error:
             # One malformed or inaccessible project must not hide other add-ons
             # that can be verified. Retry individually and retain exact failures.
@@ -694,8 +696,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             reports = []; failures = []
             for project in ready:
                 try: reports.extend(publisher.preflight([project], engine.values, self._githubProgress))
+                except publisher.GitHubCliRequired:
+                    callback, arguments = self._offerGitHubCliInstall, (); break
                 except publisher.AuthenticationRequired:
-                    callback, arguments = self._showGitHubResult, (_("GitHub is not signed in. Publish the add-ons to GitHub before attempting store submission. Press OK to exit."),); break
+                    callback, arguments = self._offerStoreGitHubLogin, (ready,); break
                 except Exception as projectError:
                     log.exception("Store submission inspection failed for %s", project.name)
                     failures.append(_("%s: inspection failed: %s") % (project.name, projectError))
@@ -703,6 +707,27 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         finally:
             self._scanLock.release()
             if callback is not None: self._finishProgressThen(callback, *arguments)
+    def _offerStoreGitHubLogin(self, ready):
+        self._showConfirmation(_("Sign in to GitHub"), _("GitHub CLI is not signed in for NVDA. Sign in now to check the selected add-ons for store submission? A one-time code will be copied to the clipboard and GitHub will open in your browser."), lambda: self._startStoreGitHubLogin(ready), defaultYes=True, onNo=lambda: self._showInformation(_("Store-readiness check canceled"), _("The selected add-ons were not checked and no store pages were opened.")))
+    def _startStoreGitHubLogin(self, ready):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Starting GitHub sign-in. Complete authorization in the browser.")); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._storeGitHubLogin, args=(ready,), name="addonDeveloperStoreGitHubLogin", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub sign-in"); ui.message(_("GitHub sign-in could not be started"))
+    def _storeGitHubLogin(self, ready):
+        callback = None; arguments = ()
+        try:
+            publisher.login(); callback, arguments = self._retryStorePreflight, (ready,)
+        except publisher.GitHubCliRequired:
+            callback, arguments = self._offerGitHubCliInstall, ()
+        except Exception as error:
+            log.exception("GitHub sign-in failed"); callback, arguments = self._showInformation, (_("GitHub sign-in failed"), _("GitHub sign-in failed: %s") % error)
+        finally:
+            self._scanLock.release()
+            if callback is not None: self._finishProgressThen(callback, *arguments)
+    def _retryStorePreflight(self, ready):
+        ui.message(_("GitHub sign-in completed. Retrying the store-readiness check.")); self._beginStorePreflight(ready)
     def _offerStoreSubmission(self, reports, inspectionFailures=()):
         self._rememberExistingReleases(reports); eligible = []; blocked = list(inspectionFailures)
         for report in reports:
@@ -756,6 +781,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             owner, repositories = publisher.github_addon_repositories(self._githubProgress)
             if repositories: callback, arguments = self._showGitHubRepositoryDialog, (owner, repositories)
             else: callback, arguments = self._showInformation, (_("No released NVDA add-ons found"), _("No non-draft GitHub Releases with downloadable .nvda-addon files were found in the signed-in account."))
+        except publisher.GitHubCliRequired:
+            callback, arguments = self._offerGitHubCliInstall, ()
         except publisher.AuthenticationRequired:
             callback, arguments = self._offerGitHubRepositoryLogin, ()
         except Exception as error:
@@ -799,6 +826,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         callback = None; arguments = ()
         try:
             publisher.login(); callback, arguments = self._beginGitHubRepositoryLookup, ()
+        except publisher.GitHubCliRequired:
+            callback, arguments = self._offerGitHubCliInstall, ()
         except Exception as error:
             log.exception("GitHub sign-in failed"); callback, arguments = self._showInformation, (_("GitHub sign-in failed"), _("GitHub sign-in failed: %s") % error)
         finally:
@@ -826,6 +855,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             owner, repositories = publisher.github_addon_projects(self._githubProgress)
             if repositories: callback, arguments = self._showGitHubProjectActionDialog, (owner, repositories, action)
             else: callback, arguments = self._showInformation, (_("No NVDA add-on repositories found"), _("No repositories containing recognized NVDA add-on project files were found in the signed-in GitHub account."))
+        except publisher.GitHubCliRequired:
+            callback, arguments = self._offerGitHubCliInstall, ()
         except publisher.AuthenticationRequired:
             callback, arguments = self._offerGitHubProjectLogin, (action,)
         except Exception as error:
@@ -1008,6 +1039,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _githubProjectLogin(self, action):
         callback = None; arguments = ()
         try: publisher.login(); callback, arguments = self._beginGitHubProjectAction, (action,)
+        except publisher.GitHubCliRequired: callback, arguments = self._offerGitHubCliInstall, ()
         except Exception as error:
             log.exception("GitHub sign-in failed"); callback, arguments = self._showInformation, (_("GitHub sign-in failed"), _("GitHub sign-in failed: %s") % error)
         finally:
@@ -1243,6 +1275,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         try:
             reports = publisher.preflight(ready, engine.values, self._githubProgress)
             callback, arguments = self._offerGitHubPush, (reports,)
+        except publisher.GitHubCliRequired:
+            callback, arguments = self._offerGitHubCliInstall, ()
         except publisher.AuthenticationRequired:
             callback, arguments = self._offerGitHubLogin, (ready,)
         except Exception as error:
@@ -1262,11 +1296,27 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         succeeded = False
         try:
             publisher.login(); succeeded = True; wx.CallAfter(ui.message, _("GitHub sign-in completed. Retrying the publishing safety check."))
+        except publisher.GitHubCliRequired:
+            wx.CallAfter(self._offerGitHubCliInstall)
         except Exception as error:
             log.exception("GitHub login failed"); wx.CallAfter(ui.message, _("GitHub sign-in failed: %s") % error)
         finally:
             self._stopProgress(); self._scanLock.release()
             if succeeded and not self._shutdown.is_set(): wx.CallAfter(self._beginGitHubPreflight, ready)
+    def _offerGitHubCliInstall(self):
+        self._showConfirmation(_("GitHub CLI required"), _("The optional GitHub features require GitHub CLI, but it is not installed or NVDA cannot find it. Open the official GitHub CLI installation page now? Installation is not automatic. After installing GitHub CLI, restart NVDA and run the command again."), self._openGitHubCliInstallationPage, defaultYes=True, onNo=lambda: self._showInformation(_("GitHub feature canceled"), _("GitHub CLI was not installed. No GitHub action was performed.")))
+    def _openGitHubCliInstallationPage(self):
+        def launch():
+            try:
+                if self._shutdown.wait(0.2): return
+                os.startfile(publisher.GITHUB_CLI_URL)
+            except OSError:
+                log.exception("Could not open the GitHub CLI installation page")
+                if not self._shutdown.is_set(): wx.CallAfter(ui.message, _("The GitHub CLI installation page could not be opened"))
+        ui.message(_("Opening the official GitHub CLI installation page. After installation, restart NVDA and run the GitHub command again."))
+        try: threading.Thread(target=launch, name="addonDeveloperOpenGitHubCli", daemon=True).start()
+        except Exception:
+            log.exception("Could not start the GitHub CLI installation-page launcher"); ui.message(_("The GitHub CLI installation page could not be opened"))
     def _offerGitHubPush(self, reports):
         comparisons = "; ".join(_("%s: current GitHub release %s, newest local version %s") % (report.name, getattr(report, "github_release_version", "") or _("none"), getattr(report, "version", "") or _("unknown")) for report in reports)
         if comparisons: ui.message(_("GitHub release version comparison: %s") % comparisons)
