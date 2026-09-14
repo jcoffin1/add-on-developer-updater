@@ -34,7 +34,7 @@ jobs:
         run: python tools/build_addon.py
       - name: Upload audited package
         if: matrix.python-version == '3.13'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: addonDeveloperUpdater-package
           path: outputs/*.nvda-addon
