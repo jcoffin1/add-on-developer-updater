@@ -680,6 +680,10 @@ class EngineTests(unittest.TestCase):
         plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
         self.assertIn('gesture="kb:NVDA+alt+shift+f"', plugin)
         self.assertIn("api.copyToClip(repository.download_url)", plugin)
+        self.assertIn('label=_("&Copy download link")', plugin)
+        self.assertIn('label=_("Copy &repository link")', plugin)
+        self.assertIn("api.copyToClip(repository.url)", plugin)
+        self.assertLess(plugin.index('label=_("&Copy download link")'), plugin.index('label=_("Copy &repository link")'))
 
     def test_github_addon_project_catalog_includes_unreleased_projects(self):
         page = {"data": {"viewer": {"login": "owner", "repositories": {

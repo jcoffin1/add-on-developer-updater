@@ -121,9 +121,9 @@ class StoreSubmissionDialog(GitHubPublishDialog):
 
 class GitHubRepositoryUrlDialog(wx.Dialog):
     def __init__(self, parent, owner, repositories):
-        super().__init__(parent, title=_("Copy an NVDA add-on download URL"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.repositories = repositories; self.onCopy = None; mainSizer = wx.BoxSizer(wx.VERTICAL)
-        mainSizer.Add(wx.StaticText(self, label=_("Select a released NVDA add-on owned by %s, then choose Copy download URL. Press Enter to copy or Escape to close.") % owner), 0, wx.ALL, 10)
+        super().__init__(parent, title=_("Copy an NVDA add-on link"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.repositories = repositories; self.onCopy = None; self.onCopyRepository = None; mainSizer = wx.BoxSizer(wx.VERTICAL)
+        mainSizer.Add(wx.StaticText(self, label=_("Select a released NVDA add-on owned by %s, then choose Copy download link or Copy repository link. Press Enter to copy the download link, or Escape to close.") % owner), 0, wx.ALL, 10)
         choices = []
         for repository in repositories:
             status = _("private") if repository.private else _("public")
@@ -133,8 +133,8 @@ class GitHubRepositoryUrlDialog(wx.Dialog):
         self.repositoryList = wx.ListBox(self, choices=choices, style=wx.LB_SINGLE)
         if choices: self.repositoryList.SetSelection(0)
         mainSizer.Add(self.repositoryList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
-        buttons = wx.BoxSizer(wx.HORIZONTAL); self.copyButton = wx.Button(self, label=_("&Copy download URL")); self.closeButton = wx.Button(self, label=_("&Close")); self.copyButton.SetDefault()
-        buttons.Add(self.copyButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
+        buttons = wx.BoxSizer(wx.VERTICAL); self.copyButton = wx.Button(self, label=_("&Copy download link")); self.copyRepositoryButton = wx.Button(self, label=_("Copy &repository link")); self.closeButton = wx.Button(self, label=_("C&lose")); self.copyButton.SetDefault()
+        buttons.Add(self.copyButton, 0, wx.BOTTOM, 8); buttons.Add(self.copyRepositoryButton, 0, wx.BOTTOM, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
         self.SetSizer(mainSizer); self.SetMinSize((650, 320)); self.SetSize((850, 480)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
     def selectedRepository(self):
         index = self.repositoryList.GetSelection()
@@ -739,7 +739,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if older:
             ui.message(_("Ignored %d older local add-on copies. Only the newest local version of each add-on is available for GitHub publishing.") % len(older))
         self._showGitHubPublishDialog(ready)
-    @scriptHandler.script(description=_("Copy the direct download URL for a released NVDA add-on"), gesture="kb:NVDA+alt+shift+f", category=SCRIPT_CATEGORY)
+    @scriptHandler.script(description=_("Copy a download or repository link for a released NVDA add-on"), gesture="kb:NVDA+alt+shift+f", category=SCRIPT_CATEGORY)
     def script_copyGitHubAddonRepositoryUrl(self, gesture):
         if self._repositoryDialog is not None:
             self._repositoryDialog.Raise(); self._repositoryDialog.repositoryList.SetFocus(); return
@@ -777,7 +777,15 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 log.exception("Could not copy GitHub add-on download URL"); copied = False
             if copied: ui.message(_("Copied direct download URL for %s, release %s, file %s") % (repository.name, repository.release_tag, repository.asset_name))
             else: ui.message(_("The add-on download URL could not be copied to the clipboard"))
-        dialog.onCopy = copyUrl; dialog.copyButton.Bind(wx.EVT_BUTTON, copyUrl); dialog.repositoryList.Bind(wx.EVT_LISTBOX_DCLICK, copyUrl); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
+        def copyRepositoryUrl(_event=None):
+            repository = dialog.selectedRepository()
+            if repository is None: ui.message(_("No repository is selected")); return
+            try: copied = api.copyToClip(repository.url)
+            except Exception:
+                log.exception("Could not copy GitHub repository URL"); copied = False
+            if copied: ui.message(_("Copied repository link for %s") % repository.full_name)
+            else: ui.message(_("The repository link could not be copied to the clipboard"))
+        dialog.onCopy = copyUrl; dialog.onCopyRepository = copyRepositoryUrl; dialog.copyButton.Bind(wx.EVT_BUTTON, copyUrl); dialog.copyRepositoryButton.Bind(wx.EVT_BUTTON, copyRepositoryUrl); dialog.repositoryList.Bind(wx.EVT_LISTBOX_DCLICK, copyUrl); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
         dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.repositoryList.SetFocus)
     def _offerGitHubRepositoryLogin(self):
         self._showConfirmation(_("Sign in to GitHub"), _("GitHub CLI is not signed in for NVDA. Sign in now to load your released NVDA add-on files? A one-time code will be copied to the clipboard and GitHub will open in your browser."), self._startGitHubRepositoryLogin, defaultYes=True, onNo=lambda: self._showInformation(_("Add-on download lookup canceled"), _("No add-on download URL was copied.")))

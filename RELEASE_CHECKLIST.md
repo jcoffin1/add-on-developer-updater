@@ -31,7 +31,7 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 
 - Test signed-in, signed-out, offline, inaccessible-repository, and disabled-Issues cases.
 - Verify each selection and confirmation dialog retains focus and every editable field has a meaningful spoken name.
-- Verify the download command copies the direct `.nvda-addon` asset URL.
+- Verify Copy download link copies the direct `.nvda-addon` asset URL and Copy repository link copies the selected repository's GitHub page.
 - Open Issues and edit, validate, save, and delete a disposable Markdown and YAML template.
 - Confirm no push or release occurs before its explicit confirmation.
 - Confirm matching local and GitHub versions produce one clear current-release message.

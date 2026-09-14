@@ -26,7 +26,7 @@ Add-on Developer Updater helps NVDA add-on developers discover development proje
 - `NVDA+Alt+Shift+U`: check for NVDA compatibility updates.
 - `NVDA+Alt+Shift+D`: set an older last-tested NVDA target for selected manifests.
 - `NVDA+Alt+G` or `NVDA+Alt+Shift+G`: select projects to publish to GitHub.
-- `NVDA+Alt+Shift+F`: select the newest released `.nvda-addon` file from the signed-in GitHub account and copy its direct download URL.
+- `NVDA+Alt+Shift+F`: select the newest released `.nvda-addon` file from the signed-in GitHub account, then copy either its direct download link or its repository link.
 - `NVDA+Alt+Shift+I`: select an add-on repository and open its GitHub Issues page.
 - `NVDA+Alt+Shift+T`: select an add-on repository, edit one of its GitHub issue templates as an accessible form or raw text, or delete it after confirmation.
 - `NVDA+Alt+Shift+S`: select projects for Add-on Store readiness review.
@@ -49,7 +49,7 @@ GitHub release publishing verifies that the exact pushed commit is already conta
 - Windows PowerShell for isolated compatibility discovery.
 - Git and GitHub CLI for optional GitHub publishing features.
 
-The download URL command lists the newest non-draft GitHub Release containing a `.nvda-addon` asset for each owned repository. Repositories without a released add-on package are excluded. GitHub queries run on a worker thread, and public, private, archived, and prerelease packages are clearly identified in the selection list.
+The link-copy command lists the newest non-draft GitHub Release containing a `.nvda-addon` asset for each owned repository. Repositories without a released add-on package are excluded. GitHub queries run on a worker thread, and public, private, archived, and prerelease packages are clearly identified in the selection list. Copy download link places the direct release-asset URL on the clipboard. Copy repository link, immediately below it, copies the selected repository's GitHub page instead.
 
 The Issues command lists owned repositories with recognized NVDA add-on layouts and identifies repositories where Issues are disabled. The issue-template editor supports Markdown and YAML files directly inside `.github/ISSUE_TEMPLATE` on the repository's default branch. Its Form tab exposes template details and GitHub issue-form questions as labeled controls, including question order, type, ID, label, help text, placeholder, options, and required state. Every editable control also has an explicit accessibility name, so NVDA announces its purpose when it receives focus rather than only saying "edit." Labels explain where each value appears on GitHub, and technical YAML question types are presented as plain-language choices such as Short answer, Long answer, Drop-down choice list, Checkbox list, and Information text. The editor explains that Markdown is ordinary text with optional symbols for headings, bullets, and links; no special formatting is required. The Raw Text tab remains available for advanced or unsupported YAML. Structured saves preserve unrecognized properties but may normalize YAML formatting and comments. The editor validates GitHub's required fields, question IDs, and choices before saving. Saving or deleting requires a separate confirmation and uses the exact revision loaded from GitHub, so a concurrent remote change is rejected rather than overwritten or removed. Archived repositories cannot be edited.
 

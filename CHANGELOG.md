@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.2.38
+
+- Add a separate Copy repository link button directly below Copy download link in the released add-on selection dialog.
+- Preserve Enter and double-click as shortcuts for copying the selected release asset's direct download link.
+- Announce whether a download link or repository link was copied, including the selected add-on or repository name.
+
 ## 2026.2.37
 
 - Verify that the exact pushed commit is contained in the repository's current default branch before offering to create a GitHub Release.
