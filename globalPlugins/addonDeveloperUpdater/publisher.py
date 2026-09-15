@@ -64,6 +64,7 @@ class ProjectPublishInfo:
     store_guideline_issues: tuple[str, ...] = ()
     channel: str = ""
     default_branch: str = ""
+    current_branch: str = ""
 
 @dataclass(frozen=True)
 class GitHubAddonRepository:
@@ -590,6 +591,9 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
         if progress: progress(f"Inspecting {project.name}, project {index} of {len(projects)}")
         manifest = Path(project.path).resolve(); root = project_root(manifest)
         has_git = (root / ".git").exists()
+        current_branch = _git(root, "branch", "--show-current").strip() if has_git else "main"
+        if has_git and not current_branch:
+            raise RuntimeError(f"{project.name} is using a detached Git HEAD; check out the branch to publish before continuing")
         if not has_git:
             names = [path.name for path in root.rglob("*") if path.is_file()]
             unsafe = [name for name in names if name.lower() in SENSITIVE_NAMES or Path(name).suffix.lower() in SENSITIVE_SUFFIXES]
@@ -641,7 +645,7 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
         if release_download and owned:
             package_verified, package_error, package_issues = verify_release_package(release_download, metadata.get("name", project.name), metadata.get("version", ""), api_versions, channel)
             guideline_issues += package_issues
-        reports.append(ProjectPublishInfo(project.project_id, project.name, str(manifest), str(root), metadata.get("version", ""), metadata.get("summary", project.name), metadata.get("author", ""), remote, changed, has_git, unpushed, normalized_version(github_release), release_download, owned, package_verified, package_error, guideline_issues, channel, default_branch))
+        reports.append(ProjectPublishInfo(project.project_id, project.name, str(manifest), str(root), metadata.get("version", ""), metadata.get("summary", project.name), metadata.get("author", ""), remote, changed, has_git, unpushed, normalized_version(github_release), release_download, owned, package_verified, package_error, guideline_issues, channel, default_branch, current_branch))
     return reports
 
 def login() -> None:
@@ -683,30 +687,46 @@ def repository_name(remote: str) -> str:
     if len(parts) != 2 or not parts[1]: raise RuntimeError(f"GitHub repository name is missing from: {remote}")
     return urllib.parse.unquote(parts[1])
 
-def release_target_blocker(root: Path, remote_name: str, default_branch: str, target_commit: str) -> str:
-    """Return why a pushed commit cannot safely be released, or an empty string."""
+def _ancestor_result(root: Path, ancestor: str, descendant: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(root), "merge-base", "--is-ancestor", ancestor, descendant],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+def release_target_status(root: Path, remote_name: str, default_branch: str, target_commit: str) -> tuple[str, bool]:
+    """Return a release blocker and whether the default branch can be fast-forwarded."""
     if not remote_name or not default_branch:
-        return "the repository's default branch could not be determined"
+        return "the repository's default branch could not be determined", False
     remote_reference = f"refs/remotes/{remote_name}/{default_branch}"
     try:
         _git(root, "fetch", "--no-tags", remote_name, f"+refs/heads/{default_branch}:{remote_reference}")
-        completed = subprocess.run(
-            ["git", "-C", str(root), "merge-base", "--is-ancestor", target_commit, remote_reference],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        contained = _ancestor_result(root, target_commit, remote_reference)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-        return f"the default-branch safety check failed: {error}"
-    if completed.returncode == 0:
-        return ""
-    if completed.returncode == 1:
-        return f"the pushed commit is not yet on the repository's default branch, {default_branch}; merge it there before creating a release"
-    detail = (completed.stderr or completed.stdout).strip()
-    return f"Git could not verify the repository's default branch: {detail or f'exit code {completed.returncode}'}"
+        return f"the default-branch safety check failed: {error}", False
+    if contained.returncode == 0:
+        return "", False
+    if contained.returncode != 1:
+        detail = (contained.stderr or contained.stdout).strip()
+        return f"Git could not verify the repository's default branch: {detail or f'exit code {contained.returncode}'}", False
+    try:
+        fast_forward = _ancestor_result(root, remote_reference, target_commit)
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"the default-branch fast-forward check failed: {error}", False
+    if fast_forward.returncode == 0:
+        return f"the pushed commit is not yet on the repository's default branch, {default_branch}; that branch can be safely fast-forwarded", True
+    if fast_forward.returncode == 1:
+        return f"the pushed commit is not yet on the repository's default branch, {default_branch}, and the branches have diverged; merge a pull request before creating a release", False
+    detail = (fast_forward.stderr or fast_forward.stdout).strip()
+    return f"Git could not verify whether {default_branch} can be fast-forwarded: {detail or f'exit code {fast_forward.returncode}'}", False
+
+def release_target_blocker(root: Path, remote_name: str, default_branch: str, target_commit: str) -> str:
+    """Return why a pushed commit cannot safely be released, or an empty string."""
+    return release_target_status(root, remote_name, default_branch, target_commit)[0]
 
 def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
     gh = gh_path(); published = []
@@ -716,6 +736,11 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
         if not report.has_git:
             if progress: progress(f"Creating local Git repository for {report.name}")
             _run(["git", "init", "-b", "main"], root)
+        branch = _git(root, "branch", "--show-current").strip()
+        if not branch:
+            raise RuntimeError(f"{report.name} is using a detached Git HEAD; check out the branch to publish before continuing")
+        if report.has_git and report.current_branch and branch != report.current_branch:
+            raise RuntimeError(f"{report.name} changed branches after the publishing review, from {report.current_branch} to {branch}; run the command again")
         push_remote = ""
         if report.remote:
             remotes = _repository_remotes(root)
@@ -745,7 +770,6 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
                 _run([gh, "repo", "create", repository, "--public", "--source", str(root), "--remote", "origin", "--description", report.summary])
                 push_remote = "origin"
             remote = _git(root, "remote", "get-url", push_remote)
-        branch = _git(root, "branch", "--show-current") or "main"
         if progress: progress(f"Pushing {report.name} to GitHub")
         _git(root, "push", "--set-upstream", push_remote, branch)
         # Releases must target the commit we actually pushed.  GitHub otherwise
@@ -762,10 +786,42 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
                     default_branch = current_default_branch
             except (RuntimeError, TypeError, ValueError):
                 pass
-        blocker = release_target_blocker(root, push_remote, default_branch, target_commit) if release_pending else ""
-        published.append({**report.__dict__, "sourceUrl": repository, "targetCommitish": target_commit, "defaultBranch": default_branch, "releaseBlocker": blocker})
+        blocker, can_fast_forward = release_target_status(root, push_remote, default_branch, target_commit) if release_pending else ("", False)
+        published.append({**report.__dict__, "sourceUrl": repository, "targetCommitish": target_commit, "currentBranch": branch, "defaultBranch": default_branch, "pushRemote": push_remote, "releaseBlocker": blocker, "defaultBranchCanFastForward": can_fast_forward})
         if progress: progress(f"GitHub push finished for {report.name}, project {index} of {len(reports)}")
     return published
+
+def promote_default_branches(items: list[dict], progress=None) -> list[dict]:
+    """Fast-forward confirmed repository default branches without checking out or merging locally."""
+    promoted = []
+    for index, item in enumerate(items, 1):
+        updated = dict(item); name = str(item.get("name", "add-on")); root = Path(item["root"])
+        remote_name = str(item.get("pushRemote", "")); default_branch = str(item.get("defaultBranch", "")); target_commit = str(item.get("targetCommitish", ""))
+        if progress: progress(f"Rechecking the default branch for {name}, project {index} of {len(items)}")
+        blocker, can_fast_forward = release_target_status(root, remote_name, default_branch, target_commit)
+        if not blocker:
+            updated.update(releaseBlocker="", defaultBranchCanFastForward=False); promoted.append(updated); continue
+        if not can_fast_forward:
+            updated.update(releaseBlocker=blocker, defaultBranchCanFastForward=False); promoted.append(updated); continue
+        try:
+            if progress: progress(f"Fast-forwarding {default_branch} for {name}, project {index} of {len(items)}")
+            _git(root, "push", remote_name, f"{target_commit}:refs/heads/{default_branch}")
+            blocker, can_fast_forward = release_target_status(root, remote_name, default_branch, target_commit)
+            if blocker:
+                blocker = f"the default branch was pushed but could not be verified afterward: {blocker}"
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            blocker = f"GitHub did not accept the update to {default_branch}: {error}; create and merge a pull request instead"
+            can_fast_forward = False
+        updated.update(releaseBlocker=blocker, defaultBranchCanFastForward=can_fast_forward)
+        promoted.append(updated)
+    return promoted
+
+def pull_request_url(item: dict) -> str:
+    repository = str(item.get("sourceUrl", "")).rstrip("/")
+    default_branch = str(item.get("defaultBranch", "")).strip(); current_branch = str(item.get("currentBranch", "")).strip()
+    if not repository or not default_branch or not current_branch or default_branch == current_branch:
+        return ""
+    return f"{repository}/compare/{urllib.parse.quote(default_branch, safe='')}...{urllib.parse.quote(current_branch, safe='')}?expand=1"
 
 def _package_source(manifest: Path) -> Path:
     return manifest.parent

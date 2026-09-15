@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026.2.40
+
+- Announce every selected project's working branch and GitHub default branch before source publishing begins.
+- When a release commit is only on a development branch, detect whether the remote default branch can be advanced without discarding or conflicting with any commits.
+- Offer a separate confirmation to push an eligible exact commit to the named default branch, reverify it, and then continue to release confirmation without changing the developer's checked-out branch.
+- Never merge diverged histories or bypass branch protection. When a safe direct update is unavailable or rejected, offer to open GitHub's comparison page so the developer can review and merge a pull request.
+- In multi-add-on publishing, preserve the pull-request offer for blocked projects after eligible projects are released or declined.
+- Stop publishing if the repository is in detached-HEAD state or its working branch changes after the publishing review.
+
 ## 2026.2.39
 
 - Offer GitHub's secure browser device sign-in directly from the store-readiness command, then automatically retry the selected add-ons after authorization.

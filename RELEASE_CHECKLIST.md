@@ -36,7 +36,9 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 - Open Issues and edit, validate, save, and delete a disposable Markdown and YAML template.
 - Confirm no push or release occurs before its explicit confirmation.
 - Confirm matching local and GitHub versions produce one clear current-release message.
-- Push a disposable development branch whose commit is not on the repository's default branch; confirm source is pushed but no tag or release is created, then merge it and confirm the next publishing run permits the release.
+- Publish a disposable development branch whose remote default branch is its direct ancestor; confirm the updater names both branches, offers a separate default-branch update, advances only the remote default branch after Yes, leaves the checked-out local branch unchanged, reverifies it, and then offers the release.
+- Create a disposable diverged or protected default branch; confirm the updater does not merge or force-push it and instead offers the correct GitHub comparison page. Select No and confirm only the source branch remains pushed.
+- Change branches after opening the publishing review and test a detached HEAD; confirm both operations stop before committing or pushing.
 
 ## Store readiness
 

@@ -487,14 +487,51 @@ class EngineTests(unittest.TestCase):
         ))
 
     def test_release_target_must_be_on_repository_default_branch(self):
-        completed = subprocess.CompletedProcess([], 1, "", "")
-        with mock.patch.object(publisher, "_git", return_value=""), mock.patch.object(publisher.subprocess, "run", return_value=completed) as run:
-            blocker = publisher.release_target_blocker(Path("C:/project"), "origin", "main", "abc123")
+        missing = subprocess.CompletedProcess([], 1, "", "")
+        fast_forward = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(publisher, "_git", return_value=""), mock.patch.object(publisher.subprocess, "run", side_effect=[missing, fast_forward]) as run:
+            blocker, can_fast_forward = publisher.release_target_status(Path("C:/project"), "origin", "main", "abc123")
         self.assertIn("not yet on", blocker)
         self.assertIn("main", blocker)
+        self.assertTrue(can_fast_forward)
         self.assertIn("merge-base", run.call_args.args[0])
         with mock.patch.object(publisher, "_git", return_value=""), mock.patch.object(publisher.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             self.assertEqual("", publisher.release_target_blocker(Path("C:/project"), "origin", "main", "abc123"))
+
+    def test_diverged_default_branch_requires_a_pull_request(self):
+        missing = subprocess.CompletedProcess([], 1, "", "")
+        with mock.patch.object(publisher, "_git", return_value=""), mock.patch.object(publisher.subprocess, "run", side_effect=[missing, missing]):
+            blocker, can_fast_forward = publisher.release_target_status(Path("C:/project"), "origin", "main", "abc123")
+        self.assertIn("diverged", blocker)
+        self.assertIn("pull request", blocker)
+        self.assertFalse(can_fast_forward)
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required for the default-branch integration test")
+    def test_confirmed_default_branch_promotion_is_a_remote_fast_forward(self):
+        def git(*arguments, cwd=None):
+            completed = subprocess.run(["git", *arguments], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            return completed.stdout.strip()
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder); remote = base / "remote.git"; root = base / "project"; root.mkdir()
+            git("init", "--bare", str(remote)); git("init", "-b", "main", cwd=root)
+            git("config", "user.name", "Test Publisher", cwd=root); git("config", "user.email", "publisher@example.invalid", cwd=root)
+            (root / "file.txt").write_text("base\n", encoding="utf-8"); git("add", "file.txt", cwd=root); git("commit", "-m", "base", cwd=root)
+            git("remote", "add", "origin", str(remote), cwd=root); git("push", "-u", "origin", "main", cwd=root)
+            git("switch", "-c", "development/current", cwd=root); (root / "file.txt").write_text("release\n", encoding="utf-8"); git("commit", "-am", "release", cwd=root)
+            git("push", "-u", "origin", "development/current", cwd=root); target = git("rev-parse", "HEAD", cwd=root)
+            item = {"project_id": "demo", "name": "Demo", "root": str(root), "pushRemote": "origin", "defaultBranch": "main", "currentBranch": "development/current", "targetCommitish": target, "sourceUrl": "https://github.com/example/demo", "releaseBlocker": "pending", "defaultBranchCanFastForward": True}
+            promoted = publisher.promote_default_branches([item])[0]
+            remote_main = git("--git-dir", str(remote), "rev-parse", "refs/heads/main")
+            current_branch = git("branch", "--show-current", cwd=root)
+        self.assertEqual(target, remote_main)
+        self.assertEqual("development/current", current_branch)
+        self.assertEqual("", promoted["releaseBlocker"])
+        self.assertFalse(promoted["defaultBranchCanFastForward"])
+
+    def test_pull_request_url_names_the_default_and_working_branches(self):
+        item = {"sourceUrl": "https://github.com/example/demo", "defaultBranch": "main", "currentBranch": "development/current"}
+        self.assertEqual("https://github.com/example/demo/compare/main...development%2Fcurrent?expand=1", publisher.pull_request_url(item))
 
     def test_release_refuses_an_item_with_a_recorded_branch_blocker(self):
         item = {"name": "Demo", "releaseBlocker": "commit is not on main"}
@@ -507,6 +544,9 @@ class EngineTests(unittest.TestCase):
         plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
         self.assertIn('item.get("releaseBlocker")', plugin)
         self.assertIn("GitHub release deferred", plugin)
+        self.assertIn("Update repository default branches", plugin)
+        self.assertIn("publisher.promote_default_branches", plugin)
+        self.assertIn("publisher.pull_request_url", plugin)
 
     def test_public_github_text_is_checked_before_store_submission(self):
         responses = iter((

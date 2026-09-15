@@ -1330,7 +1330,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             ui.message(message); self._showInformation(_("GitHub releases are current"), message); return
         create = [report.name for report in reports if not report.remote]; changed = sum(report.changed_files for report in reports)
         unpushed = sum(report.unpushed_commits for report in reports)
-        message = _("Publish %d add-on projects to GitHub? %d changed files will be committed and %d existing local commits will be pushed. Missing public repositories will be created for: %s. Select No to make no changes.") % (len(reports), changed, unpushed, "; ".join(create) if create else _("none"))
+        branchPlan = self._limitedDetails(reports, lambda report: _("%s: working branch %s, repository default branch %s") % (report.name, getattr(report, "current_branch", "") or _("unknown"), getattr(report, "default_branch", "") or _("will be determined after the first push")))
+        ui.message(_("GitHub branch plan: %s") % branchPlan)
+        message = _("Publish %d add-on projects to GitHub? %d changed files will be committed and %d existing local commits will be pushed. Missing public repositories will be created for: %s. Branches: %s. A release will be created only after its exact commit is present on the repository's default branch. Select No to make no changes.") % (len(reports), changed, unpushed, "; ".join(create) if create else _("none"), branchPlan)
         self._showConfirmation(_("Publish add-ons to GitHub"), message, lambda: self._startGitHubPush(reports), onNo=lambda: self._showGitHubResult(_("GitHub publishing was canceled. Press OK to exit.")))
     def _rememberExistingReleases(self, reports):
         current = [report for report in reports if getattr(report, "repository_owned_by_user", True) and not publisher.release_needed(getattr(report, "version", ""), getattr(report, "github_release_version", "")) and getattr(report, "github_release_download_url", "") and getattr(report, "remote", "")]
@@ -1355,28 +1357,75 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         finally:
             self._scanLock.release()
             if callback is not None: self._finishProgressThen(callback, *arguments)
-    def _offerGitHubRelease(self, published):
-        names = "; ".join(item["name"] for item in published); ui.message(_("GitHub push completed for: %s") % names)
+    def _offerGitHubRelease(self, published, allowDefaultPromotion=True, announcePush=True):
+        names = "; ".join(item["name"] for item in published)
+        if announcePush: ui.message(_("GitHub push completed for: %s") % names)
         blocked = [item for item in published if item.get("releaseBlocker")]
         if blocked:
             ui.message(_("GitHub release deferred for: %s") % "; ".join(_("%s: %s") % (item["name"], item["releaseBlocker"]) for item in blocked))
+        promotable = [item for item in blocked if item.get("defaultBranchCanFastForward") and publisher.release_needed(item.get("version", ""), item.get("github_release_version", ""))]
+        if allowDefaultPromotion and promotable:
+            details = self._limitedDetails(promotable, lambda item: _("%s: %s to %s") % (item["name"], item.get("currentBranch") or _("unknown branch"), item.get("defaultBranch") or _("unknown default branch")))
+            message = _("The following release commits are on development branches, but their repository default branches have no competing commits and can be updated safely: %s. Select Yes to push each exact commit to its named default branch, verify it again, and continue to release confirmation. Select No to leave only the development branches pushed.") % details
+            self._showConfirmation(_("Update repository default branches"), message, lambda: self._startGitHubDefaultPromotion(published, promotable), onNo=lambda: self._offerGitHubRelease(published, False, False)); return
         differing = [item for item in published if not item.get("releaseBlocker") and publisher.release_needed(item.get("version", ""), item.get("github_release_version", ""))]
         if not differing:
             if blocked:
-                message = _("Source changes were pushed, but no release was created. Release blockers: %s. Press OK to exit.") % "; ".join(_("%s: %s") % (item["name"], item["releaseBlocker"]) for item in blocked)
-                ui.message(message); self._showInformation(_("GitHub release deferred"), message); return
+                self._offerGitHubPullRequests(blocked); return
             message = _("The newest local releases are already current on GitHub. Press OK to exit.")
             ui.message(message); self._showInformation(_("GitHub releases are current"), message); return
         comparisons = "; ".join(_("%s: GitHub %s, local %s") % (item["name"], item.get("github_release_version") or _("no release"), item.get("version") or _("unknown")) for item in differing)
         blockedText = _(" Releases deferred until their commits reach the default branch: %s.") % "; ".join(item["name"] for item in blocked) if blocked else ""
-        self._showConfirmation(_("Release new add-on versions"), _("The following local versions differ from the newest GitHub Releases: %s.%s Release the eligible local versions now? Select No to leave only the source repositories pushed.") % (comparisons, blockedText), lambda: self._startGitHubRelease(differing), onNo=lambda: self._showGitHubResult(_("Source changes were pushed, but no new GitHub Release was created. Press OK to exit.")))
-    def _startGitHubRelease(self, published):
+        onNo = (lambda: self._offerGitHubPullRequests(blocked, _("No eligible GitHub Releases were created. "))) if blocked else (lambda: self._showGitHubResult(_("Source changes were pushed, but no new GitHub Release was created. Press OK to exit.")))
+        self._showConfirmation(_("Release new add-on versions"), _("The following local versions differ from the newest GitHub Releases: %s.%s Release the eligible local versions now? Select No to leave only the source repositories pushed.") % (comparisons, blockedText), lambda: self._startGitHubRelease(differing, blocked), onNo=onNo)
+    def _startGitHubDefaultPromotion(self, published, promotable):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Updating confirmed repository default branches")); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._githubDefaultPromotion, args=(published, promotable), name="addonDeveloperGitHubDefaultPromotion", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub default-branch update"); ui.message(_("The repository default-branch update could not be started"))
+    def _githubDefaultPromotion(self, published, promotable):
+        callback = None; arguments = ()
+        try:
+            updated = publisher.promote_default_branches(promotable, self._githubProgress)
+            byProject = {item["project_id"]: item for item in updated}
+            published = [byProject.get(item["project_id"], item) for item in published]
+            callback, arguments = self._offerGitHubRelease, (published, False, False)
+        except Exception as error:
+            log.exception("GitHub default-branch update failed"); callback, arguments = self._showGitHubResult, (_("GitHub default-branch update failed: %s. No release was created. Press OK to exit.") % error,)
+        finally:
+            self._scanLock.release()
+            if callback is not None: self._finishProgressThen(callback, *arguments)
+    def _offerGitHubPullRequests(self, blocked, prefix=""):
+        details = self._limitedDetails(blocked, lambda item: _("%s: %s") % (item["name"], item["releaseBlocker"]))
+        available = [(item, publisher.pull_request_url(item)) for item in blocked]
+        available = [(item, url) for item, url in available if url]
+        if not available:
+            message = prefix + _("Source changes were pushed, but no release was created for the blocked add-ons. Release blockers: %s. Press OK to exit.") % details
+            ui.message(message); self._showInformation(_("GitHub release deferred"), message); return
+        repositories = "; ".join(item["name"] for item, _url in available)
+        message = prefix + _("Source changes were pushed, but no release was created for the blocked add-ons. Release blockers: %s. Open GitHub comparison pages for %s so you can create and merge pull requests into the named default branches?") % (details, repositories)
+        self._showConfirmation(_("Open pull requests for deferred releases"), message, lambda: self._openGitHubPullRequestPages(available), onNo=lambda: self._showGitHubResult(_("The development branches remain pushed. No release or pull request was created. Press OK to exit.")))
+    def _openGitHubPullRequestPages(self, repositories):
+        names = "; ".join(item["name"] for item, _url in repositories)
+        def launch():
+            try:
+                if self._shutdown.wait(0.2): return
+                for _item, url in repositories: os.startfile(url)
+            except OSError:
+                log.exception("Could not open a GitHub pull-request comparison page")
+                if not self._shutdown.is_set(): wx.CallAfter(ui.message, _("One or more GitHub pull-request pages could not be opened"))
+        ui.message(_("Opening GitHub comparison pages for: %s. Review and merge each pull request, then run the publishing command again.") % names)
+        try: threading.Thread(target=launch, name="addonDeveloperOpenPullRequests", daemon=True).start()
+        except Exception:
+            log.exception("Could not start GitHub pull-request page launcher"); ui.message(_("The GitHub pull-request pages could not be opened"))
+    def _startGitHubRelease(self, published, blocked=None):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
         ui.message(_("Packaging and publishing GitHub Releases")); self._startProgress(keepFocus=True)
-        try: threading.Thread(target=self._githubRelease, args=(published,), name="addonDeveloperGitHubRelease", daemon=True).start()
+        try: threading.Thread(target=self._githubRelease, args=(published, blocked or []), name="addonDeveloperGitHubRelease", daemon=True).start()
         except Exception:
             self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub release publishing"); ui.message(_("GitHub release publishing could not be started"))
-    def _githubRelease(self, published):
+    def _githubRelease(self, published, blocked):
         callback = None; arguments = ()
         try:
             output = Path.home() / "Documents" / "NVDA Add-on Development" / "Packages"
@@ -1388,7 +1437,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 state["submissionMetadata"] = metadata
                 engine.atomic_json_write(self._statePath, state)
             released = publisher.release(published, output, self._githubProgress, checkpoint)
-            callback, arguments = self._showGitHubResult, (_("GitHub Releases published and store submission details saved for: %s. Press OK to exit.") % "; ".join(item["name"] for item in released),)
+            names = "; ".join(item["name"] for item in released)
+            if blocked:
+                callback, arguments = self._offerGitHubPullRequests, (blocked, _("GitHub Releases were published and store submission details saved for: %s. ") % names)
+            else:
+                callback, arguments = self._showGitHubResult, (_("GitHub Releases published and store submission details saved for: %s. Press OK to exit.") % names,)
         except Exception as error:
             log.exception("GitHub release publishing failed"); callback, arguments = self._showGitHubResult, (_("GitHub release publishing failed: %s. Press OK to exit.") % error,)
         finally:
