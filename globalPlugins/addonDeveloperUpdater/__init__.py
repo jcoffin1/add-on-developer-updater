@@ -40,11 +40,15 @@ class UpdaterSettingsPanel(SettingsPanel):
         if GlobalPlugin.activeInstance is not None: GlobalPlugin.activeInstance._settingsChanged()
 
 class UpdateReviewDialog(wx.Dialog):
-    def __init__(self, parent, results):
+    def __init__(self, parent, results, release=None):
         super().__init__(parent, title=_("Review NVDA add-on compatibility updates"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.results = results; mainSizer = wx.BoxSizer(wx.VERTICAL)
         self.onUpdate = None; self.allSelectedMessage = _("All add-on updates selected")
-        self.instructions = wx.StaticText(self, label=_("Check the add-ons whose manifests should be updated. Nothing is selected by default. Press Space to check an item, Control+A to select all, Enter to update the checked items, or Escape to close.")); mainSizer.Add(self.instructions, 0, wx.ALL, 10)
+        instruction = _("Check the add-ons whose manifests should be updated. Nothing is selected by default. Press Space to check an item, Control+A to select all, Enter to update the checked items, or Escape to close.")
+        if release is not None:
+            build = release.tag + (f" ({release.build_version})" if release.build_version and release.build_version != release.tag else "")
+            instruction = _("Selected NVDA build: %s. Manifest compatibility target: %s. ") % (build, release.manifest_version) + instruction
+        self.instructions = wx.StaticText(self, label=instruction); self.instructions.Wrap(900); mainSizer.Add(self.instructions, 0, wx.ALL, 10)
         choices = []
         for result in results:
             if result.branch == "not a Git repository": gitState = _("manifest is not tracked by Git")
@@ -372,6 +376,34 @@ class CompatibilityTargetDialog(GitHubPublishDialog):
             return
         event.Skip()
 
+class ScanTargetDialog(wx.Dialog):
+    def __init__(self, parent, releases, preferredTag=""):
+        super().__init__(parent, title=_("Choose the NVDA compatibility scan target"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.releases = releases; self.onStart = None; mainSizer = wx.BoxSizer(wx.VERTICAL)
+        explanation = wx.StaticText(self, label=_("Choose the exact NVDA build to check. Stable, beta, release candidate, and alpha are separate choices. The full build identifies what will be tested; the manifest compatibility target is the value proposed for lastTestedNVDAVersion. Scans propose only newer targets and make no manifest changes. Use the compatibility downgrade command when an existing manifest must be set to an older target.")); explanation.Wrap(850); mainSizer.Add(explanation, 0, wx.ALL, 10)
+        channelNames = {"stable": _("stable"), "beta": _("beta"), "rc": _("release candidate"), "alpha": _("alpha"), "prerelease": _("prerelease")}
+        labels = []
+        for release in releases:
+            build = release.tag + (f" ({release.build_version})" if release.build_version and release.build_version != release.tag else "")
+            labels.append(_("%s; NVDA build %s; manifest compatibility target %s; information source %s") % (channelNames.get(engine.release_channel(release), engine.release_channel(release)), build, release.manifest_version, release.source))
+        self.targetList = wx.ListBox(self, choices=labels, style=wx.LB_SINGLE); self.targetList.SetName(_("Available NVDA builds and manifest compatibility targets"))
+        selection = next((index for index, release in enumerate(releases) if release.tag.casefold() == preferredTag.casefold()), wx.NOT_FOUND)
+        if selection == wx.NOT_FOUND: selection = next((index for index, release in enumerate(releases) if engine.release_channel(release) == "stable"), 0)
+        if labels: self.targetList.SetSelection(selection)
+        mainSizer.Add(self.targetList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        buttons = wx.BoxSizer(wx.HORIZONTAL); self.startButton = wx.Button(self, label=_("&Start scan with selected build")); self.closeButton = wx.Button(self, label=_("&Close")); self.startButton.SetDefault(); buttons.Add(self.startButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
+        self.SetSizer(mainSizer); self.SetMinSize((700, 340)); self.SetSize((900, 480)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
+    def selectedRelease(self):
+        index = self.targetList.GetSelection()
+        return self.releases[index] if index != wx.NOT_FOUND else None
+    def _onKey(self, event):
+        key = event.GetKeyCode()
+        if key == wx.WXK_ESCAPE: self.Close(); return
+        if self.targetList.HasFocus() and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if self.onStart is not None: self.onStart()
+            return
+        event.Skip()
+
 class ConfirmationDialog(wx.Dialog):
     def __init__(self, parent, title, message, defaultYes=False):
         super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
@@ -399,7 +431,7 @@ class OperationProgressDialog(wx.Dialog):
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     activeInstance = None
     def __init__(self):
-        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._progressDeterminate = False; self._reviewDialog = None; self._approvalDialog = None; self._publishDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
+        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._progressDeterminate = False; self._scanTargetDialog = None; self._reviewDialog = None; self._approvalDialog = None; self._publishDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
         config_path = Path(globalVars.appArgs.configPath); self._statePath = config_path / "addonDeveloperUpdaterState.json"; self._releaseCachePath = config_path / "addonDeveloperUpdaterReleaseCache.json"; self._apiVersionCachePath = config_path / "addonDeveloperUpdaterApiVersions.json"; self._backupRoot = config_path / "addonDeveloperUpdaterBackups"
         if config.conf["addonDeveloperUpdater"]["intervalMinutes"] < 15: config.conf["addonDeveloperUpdater"]["intervalMinutes"] = 15
         if UpdaterSettingsPanel not in gui.settingsDialogs.NVDASettingsDialog.categoryClasses: gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(UpdaterSettingsPanel)
@@ -476,6 +508,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             except OSError: pass
         if self._reviewDialog is not None:
             self._reviewDialog.Destroy(); self._reviewDialog = None
+        if self._scanTargetDialog is not None:
+            self._scanTargetDialog.Destroy(); self._scanTargetDialog = None
         if self._approvalDialog is not None:
             self._approvalDialog.Destroy(); self._approvalDialog = None
         if self._publishDialog is not None:
@@ -505,8 +539,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def script_reportAddonUpdateCheckStatus(self, gesture):
         state = engine.read_json(self._statePath, {}); records = engine.visible_project_records(state)[0]; approved = engine.approved_project_ids(state)
         available = sum(str(item.get("status", "")).startswith("update available: ") for item in records if isinstance(item, dict)); awaiting = sum("awaiting" in str(item.get("status", "")) for item in records if isinstance(item, dict)); failed = sum("failed" in str(item.get("status", "")) for item in records if isinstance(item, dict)); approvedCount = sum(item.get("project_id") in approved for item in records if isinstance(item, dict))
-        source = str(state.get("releaseSource", "unknown")); release = str(state.get("releaseTag", "unknown")); compatibility = str(state.get("manifestVersion", "unknown"))
-        message = _("Latest detected NVDA release %s, compatibility target %s, information source %s. Last successful check %s. Last complete project check %s. Last development-folder discovery %s. %d approved projects, %d updates available, %d awaiting approval, and %d validation failures.") % (release, compatibility, source, self._formatCheckTime(state.get("lastSuccessfulCheckAt")), self._formatCheckTime(state.get("lastScanAt")), self._formatCheckTime(state.get("lastDiscoveryAt")), approvedCount, available, awaiting, failed)
+        source = str(state.get("releaseSource", "unknown")); release = str(state.get("releaseTag", "unknown")); buildVersion = str(state.get("releaseBuildVersion", "")); compatibility = str(state.get("manifestVersion", "unknown"))
+        build = release + (f" ({buildVersion})" if buildVersion and buildVersion != release else "")
+        message = _("Last checked NVDA build %s, manifest compatibility target %s, information source %s. Last successful check %s. Last complete project check %s. Last development-folder discovery %s. %d approved projects, %d updates available, %d awaiting approval, and %d validation failures.") % (build, compatibility, source, self._formatCheckTime(state.get("lastSuccessfulCheckAt")), self._formatCheckTime(state.get("lastScanAt")), self._formatCheckTime(state.get("lastDiscoveryAt")), approvedCount, available, awaiting, failed)
         if state.get("lastDiscoveryDirectories") is not None: message += _(" The last discovery visited %d directories in %s seconds%s.") % (int(state.get("lastDiscoveryDirectories", 0)), state.get("lastDiscoverySeconds", 0), _(", and stopped at its safety limit") if state.get("lastDiscoveryTruncated") else "")
         if config.conf["addonDeveloperUpdater"]["automaticChecks"]: message += _(" The next automatic check is expected in about %d minutes.") % max(1, round(self._nextAutomaticCheckDelay(state, config.conf["addonDeveloperUpdater"]) / 60))
         else: message += _(" Automatic checks are disabled.")
@@ -524,7 +559,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 try: awaiting.append(engine.ProjectResult(**item))
                 except TypeError: pass
         if not awaiting: ui.message(_("No discovered add-on projects are awaiting approval")); return
-        release = engine.Release(str(state.get("releaseTag", "")), str(state.get("manifestVersion", "")), bool(state.get("prerelease")), str(state.get("releaseUrl", "")), str(state.get("releaseSource", "saved")), str(state.get("releaseCheckedAt", "")))
+        release = engine.Release(str(state.get("releaseTag", "")), str(state.get("manifestVersion", "")), bool(state.get("prerelease")), str(state.get("releaseUrl", "")), str(state.get("releaseSource", "saved")), str(state.get("releaseCheckedAt", "")), str(state.get("releaseBuildVersion", "")))
         self._showProjectApprovalDialog(awaiting, release)
     @scriptHandler.script(description=_("Set an older last tested NVDA version for selected add-ons"), gesture="kb:NVDA+alt+shift+d", category=SCRIPT_CATEGORY)
     def script_downgradeAddonCompatibility(self, gesture):
@@ -638,7 +673,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 try: available.append(engine.ProjectResult(**item))
                 except TypeError: pass
         if not available: ui.message(_("No saved add-on compatibility updates are available")); return
-        self._showReviewDialog(available, engine.Release(str(state.get("releaseTag", "")), str(state.get("manifestVersion", "")), bool(state.get("prerelease")), str(state.get("releaseUrl", "")), str(state.get("releaseSource", "saved")), str(state.get("releaseCheckedAt", ""))))
+        self._showReviewDialog(available, engine.Release(str(state.get("releaseTag", "")), str(state.get("manifestVersion", "")), bool(state.get("prerelease")), str(state.get("releaseUrl", "")), str(state.get("releaseSource", "saved")), str(state.get("releaseCheckedAt", "")), str(state.get("releaseBuildVersion", ""))))
     @scriptHandler.script(description=_("Cancel the running add-on developer update scan"), category=SCRIPT_CATEGORY)
     def script_cancelAddonProjectScan(self, gesture):
         if not self._scanActive.is_set(): ui.message(_("No add-on developer scan is running")); return
@@ -1083,12 +1118,46 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     @staticmethod
     def _nextAutomaticCheckDelay(state, settings):
         return engine.automatic_check_delay(state, int(settings["intervalMinutes"]))
-    def _startCheck(self, manual=False, full_system=False):
+    def _startCheck(self, manual=False, full_system=False, selectedRelease=None):
+        if manual and selectedRelease is None:
+            if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+            ui.message(_("Loading available NVDA builds")); self._startProgress(keepFocus=True)
+            try: threading.Thread(target=self._loadManualScanTargets, args=(full_system,), name="addonDeveloperScanTargets", daemon=True).start()
+            except Exception:
+                self._stopProgress(); self._scanLock.release(); log.exception("Could not start NVDA scan-target lookup"); ui.message(_("Available NVDA builds could not be loaded"))
+            return
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer scan is already running")); return
         self._scanCancel.clear(); self._scanActive.set(); ui.message(_("Checking for NVDA releases and add-on projects"))
-        try: threading.Thread(target=self._runCheck, kwargs={"manual": manual, "full_system": full_system, "lock_acquired": True}, name="addonDeveloperManualScan", daemon=True).start()
+        try: threading.Thread(target=self._runCheck, kwargs={"manual": manual, "full_system": full_system, "lock_acquired": True, "selectedRelease": selectedRelease}, name="addonDeveloperManualScan", daemon=True).start()
         except Exception:
             self._scanActive.clear(); self._scanLock.release(); log.exception("Could not start add-on developer scan"); ui.message(_("The add-on developer scan could not be started"))
+    def _loadManualScanTargets(self, full_system):
+        callback = None; arguments = ()
+        try:
+            includePrereleases = bool(config.conf["addonDeveloperUpdater"]["includePrereleases"])
+            releases = engine.available_releases(includePrereleases, self._releaseCachePath)
+            if not releases: raise RuntimeError("no selectable NVDA builds were returned")
+            if includePrereleases or len(releases) > 1:
+                preferred = str(engine.read_json(self._statePath, {}).get("manualReleaseTargetTag", ""))
+                callback, arguments = self._showScanTargetDialog, (releases, preferred, full_system)
+            else:
+                callback, arguments = self._startCheck, (True, full_system, releases[0])
+        except Exception as error:
+            log.exception("NVDA scan-target lookup failed"); callback, arguments = self._showInformation, (_("Available NVDA builds could not be loaded"), _("Available NVDA builds could not be loaded: %s") % error)
+        finally:
+            self._scanLock.release()
+            if callback is not None: self._finishProgressThen(callback, *arguments)
+    def _showScanTargetDialog(self, releases, preferredTag, full_system):
+        if self._scanTargetDialog is not None: self._scanTargetDialog.Raise(); self._scanTargetDialog.targetList.SetFocus(); return
+        dialog = ScanTargetDialog(gui.mainFrame, releases, preferredTag); self._scanTargetDialog = dialog
+        def close(_event=None):
+            if self._scanTargetDialog is dialog: self._scanTargetDialog = None
+            dialog.Destroy()
+        def start(_event=None):
+            release = dialog.selectedRelease()
+            if release is None: ui.message(_("No NVDA build was selected")); return
+            close(); self._startCheck(True, full_system, release)
+        dialog.onStart = start; dialog.startButton.Bind(wx.EVT_BUTTON, start); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close); dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.targetList.SetFocus)
     def _rootStrings(self):
         settings = config.conf["addonDeveloperUpdater"]
         roots = [str(Path.home() / "Documents" / "NVDA Add-on Development" / "Add-ons")]
@@ -1167,8 +1236,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         results = []; operationError = ""
         try:
             state = engine.read_json(self._statePath, {}); approved = engine.approved_project_ids(state)
-            latest = engine.latest_release(bool(config.conf["addonDeveloperUpdater"]["includePrereleases"]), self._releaseCachePath)
-            if engine.version_tuple(latest.manifest_version) >= engine.version_tuple(release.manifest_version): release = latest
+            available = engine.available_releases(release.prerelease or bool(config.conf["addonDeveloperUpdater"]["includePrereleases"]), self._releaseCachePath)
+            refreshed = engine.matching_release(release, available)
+            if refreshed is None: raise RuntimeError(f"the selected NVDA build {release.tag} is no longer an available scan target; run the scan again")
+            release = refreshed
             for index, item in enumerate(selected, 1):
                 path = Path(item.path)
                 wx.CallAfter(self._setProgressStep, progressEvent, _("Validating project %d of %d: %s") % (index, len(selected), item.name), index, len(selected))
@@ -1194,7 +1265,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _showReviewDialog(self, available, release):
         if self._reviewDialog is not None:
             self._reviewDialog.Raise(); self._reviewDialog.checkList.SetFocus(); return
-        dialog = UpdateReviewDialog(gui.mainFrame, available); self._reviewDialog = dialog
+        dialog = UpdateReviewDialog(gui.mainFrame, available, release); self._reviewDialog = dialog
         def closeDialog(_event=None):
             if self._reviewDialog is dialog: self._reviewDialog = None
             dialog.Destroy()
@@ -1203,7 +1274,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if not selected: ui.message(_("No add-on manifests were selected")); return
             details = "; ".join(_("%s: %s; branch %s; %s") % (item.name, item.status.removeprefix("update available: "), item.branch or _("unknown"), item.path) for item in selected)
             dirty = [item.name for item in selected if item.manifest_changed]
-            message = _("Update only lastTestedNVDAVersion for %d selected manifests? The latest official NVDA target will be rechecked before writing. Planned changes: %s.") % (len(selected), details)
+            build = release.tag + (f" ({release.build_version})" if release.build_version and release.build_version != release.tag else "")
+            message = _("Update only lastTestedNVDAVersion for %d selected manifests using NVDA build %s and manifest compatibility target %s? This exact selected build will be rechecked before writing. Planned changes: %s.") % (len(selected), build, release.manifest_version, details)
             if dirty: message += _(" Warning: these manifests have uncommitted changes: %s. Current contents will be backed up before editing.") % "; ".join(dirty)
             self._showConfirmation(_("Confirm add-on compatibility updates"), message, lambda: (closeDialog(), self._startApply(selected, release)))
         dialog.onUpdate = updateSelected
@@ -1218,12 +1290,13 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _applySelected(self, selected, release):
         cancelled = lambda: self._scanCancel.is_set() or self._shutdown.is_set(); results = []
         try:
-            latest = engine.latest_release(bool(config.conf["addonDeveloperUpdater"]["includePrereleases"]), self._releaseCachePath)
-            if engine.version_tuple(latest.manifest_version) > engine.version_tuple(release.manifest_version):
-                results = [engine.ProjectResult(item.project_id, item.name, item.path, _("update deferred because newer NVDA %s is now available; run the update check again") % latest.tag) for item in selected]
+            available = engine.available_releases(release.prerelease or bool(config.conf["addonDeveloperUpdater"]["includePrereleases"]), self._releaseCachePath)
+            refreshed = engine.matching_release(release, available)
+            if refreshed is None:
+                results = [engine.ProjectResult(item.project_id, item.name, item.path, _("update deferred because the selected NVDA build %s is no longer an available target; run the update check again") % release.tag) for item in selected]
                 if not self._shutdown.is_set(): wx.CallAfter(self._finishApply, results)
                 return
-            if engine.version_tuple(latest.manifest_version) == engine.version_tuple(release.manifest_version): release = latest
+            release = refreshed
             for selectedResult in selected:
                 if cancelled(): return
                 path = Path(selectedResult.path)
@@ -1235,7 +1308,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             updated = [result for result in results if result.status.startswith("updated to ")]
             submissionProjects = engine.merge_project_records(state.get("submissionProjects", []), updated)
             channels = state.get("submissionChannels", {}) if isinstance(state.get("submissionChannels"), dict) else {}
-            for result in updated: channels[result.project_id] = "beta" if release.prerelease else "stable"
+            releaseChannel = engine.release_channel(release)
+            for result in updated: channels[result.project_id] = "dev" if releaseChannel == "alpha" else ("beta" if release.prerelease else "stable")
             state["projects"] = projects; state["submissionProjects"] = submissionProjects; state["submissionChannels"] = channels; state["lastScanAt"] = engine.utc_now()
             if updated: state["updateUndo"] = [{"project_id": result.project_id, "name": result.name, "path": result.path, "backup_path": result.backup_path, "previous_last_tested": result.previous_last_tested, "target_last_tested": result.target_last_tested, "target_manifest_hash": result.target_manifest_hash} for result in updated]
             engine.atomic_json_write(self._statePath, state)
@@ -1482,7 +1556,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if "worker" in lowered or "powershell" in lowered:
             return _("The isolated project-discovery worker failed: %s") % detail
         return _("The update check failed: %s") % detail
-    def _runCheck(self, manual=False, full_system=False, lock_acquired=False):
+    def _runCheck(self, manual=False, full_system=False, lock_acquired=False, selectedRelease=None):
         if not lock_acquired and not self._scanLock.acquire(blocking=False): return
         self._scanActive.set(); progressStarted = False; progressEvent = None; finishCallback = None
         cancelled = lambda: self._scanCancel.is_set() or self._shutdown.is_set()
@@ -1493,12 +1567,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             mode = self._workerMode(manual, state, settings["periodicRescanHours"])
             if manual or mode == "periodic":
                 self._startProgress(); progressStarted = True; progressEvent = self._progressStop; wx.CallAfter(self._setProgressMessage, _("Checking official NVDA release information"))
-            release = engine.latest_release(bool(settings["includePrereleases"]), self._releaseCachePath)
+            release = selectedRelease or engine.latest_release(bool(settings["includePrereleases"]), self._releaseCachePath)
             if progressStarted: wx.CallAfter(self._setProgressMessage, _("Discovering add-on development projects in the isolated worker"))
             storedPaths = [str(path) for path in engine.approved_manifest_paths(state)]
             checkedAt = engine.utc_now(); previousAutomaticError = str(state.get("lastAutomaticError", "")); previousReleaseSource = str(state.get("releaseSource", ""))
             if not manual and state.get("releaseTag") == release.tag and not self._rescanDue(state, settings["periodicRescanHours"]):
-                state.update({"lastCheckAt": checkedAt, "lastSuccessfulCheckAt": checkedAt, "lastCheckError": "", "lastAutomaticError": "", "automaticFailureCount": 0, "releaseSource": release.source, "releaseCheckedAt": release.checked_at, "prerelease": release.prerelease, "releaseUrl": release.url})
+                state.update({"lastCheckAt": checkedAt, "lastSuccessfulCheckAt": checkedAt, "lastCheckError": "", "lastAutomaticError": "", "automaticFailureCount": 0, "releaseSource": release.source, "releaseCheckedAt": release.checked_at, "releaseBuildVersion": release.build_version, "prerelease": release.prerelease, "releaseUrl": release.url})
                 engine.atomic_json_write(self._statePath, state)
                 if previousAutomaticError: wx.CallAfter(ui.message, _("Automatic NVDA add-on update checks are working again"))
                 if release.source == "cached" and previousReleaseSource != "cached": wx.CallAfter(ui.message, _("Live NVDA release services are unavailable. Automatic checks are using the last known release information."))
@@ -1551,7 +1625,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             newlyActionable = [result for result in visibleResults if result.project_id in changedNotifications]
             resolvedFailures = [previousRecords[identifier].get("name", identifier) for identifier in resolvedFailureIds if identifier in previousRecords]
             sameCompatibilityFamily = bool(state.get("releaseTag") and state.get("releaseTag") != release.tag and state.get("manifestVersion") == release.manifest_version)
-            state.update({"releaseTag": release.tag, "manifestVersion": release.manifest_version, "prerelease": release.prerelease, "releaseUrl": release.url, "releaseSource": release.source, "releaseCheckedAt": release.checked_at, "lastCheckAt": checkedAt, "lastSuccessfulCheckAt": checkedAt, "lastScanAt": checkedAt, "lastCheckError": "", "lastAutomaticError": "", "automaticFailureCount": 0, "approvedProjects": sorted(approved), "ignoredProjects": sorted(ignored), "projects": projects, "notifiedUpdates": currentUpdates, "notifiedAwaiting": currentAwaiting, "notifiedFailures": currentFailures})
+            state.update({"releaseTag": release.tag, "releaseBuildVersion": release.build_version, "manifestVersion": release.manifest_version, "prerelease": release.prerelease, "releaseUrl": release.url, "releaseSource": release.source, "releaseCheckedAt": release.checked_at, "lastCheckAt": checkedAt, "lastSuccessfulCheckAt": checkedAt, "lastScanAt": checkedAt, "lastCheckError": "", "lastAutomaticError": "", "automaticFailureCount": 0, "approvedProjects": sorted(approved), "ignoredProjects": sorted(ignored), "projects": projects, "notifiedUpdates": currentUpdates, "notifiedAwaiting": currentAwaiting, "notifiedFailures": currentFailures})
+            if manual and selectedRelease is not None: state["manualReleaseTargetTag"] = release.tag
             if mode != "background": state.update({"lastDiscoveryAt": checkedAt, "lastDiscoveryDirectories": int(workerResult.get("directoriesVisited", 0)), "lastDiscoverySeconds": workerResult.get("elapsedSeconds", 0), "lastDiscoveryTruncated": discoveryTruncated})
             engine.atomic_json_write(self._statePath, state)
             for result in results:

@@ -29,6 +29,7 @@ class Release:
     url: str
     source: str = "live"
     checked_at: str = ""
+    build_version: str = ""
 
 @dataclass
 class ProjectResult:
@@ -147,7 +148,7 @@ def parse_release(item: dict) -> Release | None:
     patch = int(match.group(3) or 0)
     manifest_version = f"{int(match.group(1))}.{int(match.group(2))}" + (f".{patch}" if patch else "")
     clean_tag = tag[8:] if tag.lower().startswith("release-") else tag
-    return Release(clean_tag, manifest_version, bool(item.get("prerelease")) or bool(match.group(4)), str(item.get("html_url", "")))
+    return Release(clean_tag, manifest_version, bool(item.get("prerelease")) or bool(match.group(4)), str(item.get("html_url", "")), build_version=clean_tag)
 
 def parse_alpha_snapshot(index_html: str, build_version_source: str) -> Release | None:
     snapshots = [(int(build), commit) for build, commit in re.findall(r"nvda_snapshot_alpha-(\d+),([0-9a-f]+)\.exe", index_html, re.I)]
@@ -159,7 +160,15 @@ def parse_alpha_snapshot(index_html: str, build_version_source: str) -> Release 
     if not snapshots: return None
     build, commit = max(snapshots)
     manifest = f"{fields['year']}.{fields['major']}" + (f".{fields['minor']}" if fields["minor"] else "")
-    return Release(f"alpha-{build},{commit}", manifest, True, ALPHA_SNAPSHOTS_URL + f"nvda_snapshot_alpha-{build},{commit}.exe")
+    full_version = f"{fields['year']}.{fields['major']}.{fields['minor']}.{build}"
+    return Release(f"alpha-{build},{commit}", manifest, True, ALPHA_SNAPSHOTS_URL + f"nvda_snapshot_alpha-{build},{commit}.exe", build_version=full_version)
+
+def release_channel(release: Release) -> str:
+    """Return the user-facing NVDA release channel for an exact build."""
+    if release.tag.casefold().startswith("alpha-"):
+        return "alpha"
+    match = TAG_PATTERN.fullmatch(release.tag)
+    return (match.group(4) or "stable").casefold() if match else ("prerelease" if release.prerelease else "stable")
 
 def _release_sort_key(release: Release):
     alpha = re.fullmatch(r"alpha-(\d+),[0-9a-f]+", release.tag, re.I)
@@ -184,7 +193,92 @@ def _latest_alpha_release() -> Release | None:
     return parse_alpha_snapshot(index_html, build_source)
 
 def _release_with_status(release: Release, source: str, checked_at: str) -> Release:
-    return Release(release.tag, release.manifest_version, release.prerelease, release.url, source, checked_at)
+    return Release(release.tag, release.manifest_version, release.prerelease, release.url, source, checked_at, release.build_version)
+
+def _release_choices(items: list[dict], include_prereleases: bool, alpha: Release | None = None, source="live", checked_at="") -> list[Release]:
+    """Return the newest meaningful build from each available release channel."""
+    newest = {}
+    for item in items:
+        release = parse_release(item)
+        if release is None:
+            continue
+        channel = release_channel(release)
+        if channel != "stable" and not include_prereleases:
+            continue
+        if channel not in newest or _release_sort_key(release) > _release_sort_key(newest[channel]):
+            newest[channel] = release
+    if include_prereleases and alpha is not None:
+        newest["alpha"] = alpha
+    stable = newest.get("stable")
+    prereleases = [release for channel, release in newest.items() if channel != "stable"]
+    if stable is not None:
+        # Once a family is stable, its older beta, RC, or alpha builds are no
+        # longer useful compatibility targets.
+        prereleases = [release for release in prereleases if _release_sort_key(release) > _release_sort_key(stable)]
+    ordered = ([stable] if stable is not None else []) + sorted(prereleases, key=_release_sort_key, reverse=True)
+    return [_release_with_status(release, release.source if release.source not in {"", "live"} else source, release.checked_at or checked_at) for release in ordered]
+
+def _cached_release_choices(cache: dict, include_prereleases: bool) -> list[Release]:
+    raw = cache.get("availableReleases", []) if isinstance(cache, dict) else []
+    choices = []
+    for item in raw if isinstance(raw, list) else []:
+        try:
+            release = Release(**item)
+            version_tuple(release.manifest_version)
+            if include_prereleases or not release.prerelease:
+                choices.append(_release_with_status(release, "cached", release.checked_at or str(cache.get("availableCheckedAt", ""))))
+        except (TypeError, ValueError):
+            continue
+    if choices:
+        return choices
+    # Migrate the older two-entry cache format without losing offline use.
+    fallback = []
+    for include in (False, True) if include_prereleases else (False,):
+        release = _cached_release(cache, include)
+        if release is not None and all(existing.tag.casefold() != release.tag.casefold() for existing in fallback):
+            fallback.append(release)
+    return fallback
+
+def available_releases(include_prereleases: bool = True, cache_path: Path | None = None) -> list[Release]:
+    """Load selectable stable and prerelease builds, with an offline cache fallback."""
+    cache = read_json(cache_path, {}); headers = {"Accept": "application/vnd.github+json", "User-Agent": USER_AGENT}
+    last_error = None
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(RELEASES_URL, headers=headers), timeout=15) as response:
+                items = json.load(response)
+            checked_at = utc_now(); alpha = None
+            if include_prereleases:
+                try:
+                    alpha = _latest_alpha_release()
+                except Exception:
+                    alpha = next((release for release in _cached_release_choices(cache, True) if release_channel(release) == "alpha"), None)
+            choices = _release_choices(items, include_prereleases, alpha, "live", checked_at)
+            if not choices:
+                raise RuntimeError("No selectable NVDA releases were returned.")
+            _save_release_cache(cache_path, {**cache, "availableReleases": [asdict(release) for release in choices], "availableCheckedAt": checked_at})
+            return choices
+        except Exception as error:
+            last_error = error
+        if attempt == 0:
+            time.sleep(1)
+    if cached := _cached_release_choices(cache, include_prereleases):
+        return cached
+    # The existing release-feed fallback still provides at least one safe
+    # choice on a first run when GitHub's releases API is unavailable.
+    try:
+        releases = [latest_release(False, cache_path)]
+        if include_prereleases:
+            prerelease = latest_release(True, cache_path)
+            if all(item.tag.casefold() != prerelease.tag.casefold() for item in releases):
+                releases.append(prerelease)
+        return releases
+    except Exception as fallback_error:
+        raise RuntimeError(f"Selectable NVDA releases could not be loaded: {last_error}; {fallback_error}") from fallback_error
+
+def matching_release(choice: Release, available: list[Release]) -> Release | None:
+    """Return the refreshed copy of an exact user-selected build."""
+    return next((release for release in available if release.tag.casefold() == choice.tag.casefold() and release.manifest_version == choice.manifest_version), None)
 
 def _save_release_cache(path: Path | None, data: dict) -> None:
     if path is None:
@@ -233,7 +327,7 @@ def latest_release(include_prereleases: bool = True, cache_path: Path | None = N
                 cached_releases = {"prerelease": asdict(_release_with_status(prerelease, prerelease_source, prerelease_checked_at))}
                 if stable is not None: cached_releases["stable"] = asdict(_release_with_status(stable, "live", checked_at))
                 response_headers = getattr(response, "headers", {})
-                _save_release_cache(cache_path, {"etag": response_headers.get("ETag"), "releases": cached_releases, "checkedAt": checked_at})
+                _save_release_cache(cache_path, {**cache, "etag": response_headers.get("ETag"), "releases": cached_releases, "checkedAt": checked_at})
                 return _release_with_status(release, prerelease_source, prerelease_checked_at) if include_prereleases else _release_with_status(release, "live", checked_at)
         except urllib.error.HTTPError as error:
             if error.code == 304 and (cached := _cached_release(cache, include_prereleases)):
@@ -271,7 +365,7 @@ def latest_release(include_prereleases: bool = True, cache_path: Path | None = N
         checked_at = utc_now()
         cached_releases = dict(cache.get("releases", {})) if isinstance(cache.get("releases"), dict) else {}
         cached_releases["prerelease" if include_prereleases else "stable"] = asdict(_release_with_status(release, release_source, release_checked_at))
-        _save_release_cache(cache_path, {"releases": cached_releases, "checkedAt": checked_at, "apiError": str(last_error)})
+        _save_release_cache(cache_path, {**cache, "releases": cached_releases, "checkedAt": checked_at, "apiError": str(last_error)})
         return _release_with_status(release, release_source, release_checked_at)
     except Exception as feed_error:
         if cached := _cached_release(cache, include_prereleases): return cached

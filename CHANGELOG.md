@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026.2.41
+
+- Treat the prerelease setting as an availability filter instead of automatically forcing manual scans to the newest alpha build.
+- Before a manual scan, offer an accessible list containing the latest meaningful stable, beta, release candidate, and alpha choices, with stable selected initially and the last successful manual choice remembered.
+- Announce the exact NVDA build separately from the manifest compatibility target, including full alpha build versions such as `2026.3.0.57626`.
+- Revalidate the exact selected build before approval or manifest changes rather than silently replacing it with a newer channel.
+- Keep automatic background scans non-interactive and continue requiring review before any manifest change.
+
 ## 2026.2.40
 
 - Announce every selected project's working branch and GitHub default branch before source publishing begins.

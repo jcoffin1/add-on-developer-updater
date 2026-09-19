@@ -36,6 +36,9 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 - Open Issues and edit, validate, save, and delete a disposable Markdown and YAML template.
 - Confirm no push or release occurs before its explicit confirmation.
 - Confirm matching local and GitHub versions produce one clear current-release message.
+- Enable prereleases and start a manual scan. Confirm the build chooser names stable, beta, release candidate, and alpha independently when each is available; stable is initially selected, every row announces both exact build and manifest target, and Escape closes without scanning.
+- Select an alpha or beta target, scan, and update a disposable manifest. Confirm the review and confirmation retain that exact build even when a newer build exists in another channel, and confirm another scan remembers the choice while it remains available.
+- Disable prereleases and confirm a manual scan uses the stable target without offering experimental builds. Confirm automatic checks never open the target chooser or change a manifest.
 - Publish a disposable development branch whose remote default branch is its direct ancestor; confirm the updater names both branches, offers a separate default-branch update, advances only the remote default branch after Yes, leaves the checked-out local branch unchanged, reverifies it, and then offers the release.
 - Create a disposable diverged or protected default branch; confirm the updater does not merge or force-push it and instead offers the correct GitHub comparison page. Select No and confirm only the source branch remains pushed.
 - Change branches after opening the publishing review and test a detached HEAD; confirm both operations stop before committing or pushing.

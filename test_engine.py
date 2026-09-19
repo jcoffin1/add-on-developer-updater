@@ -39,6 +39,38 @@ class EngineTests(unittest.TestCase):
         self.assertEqual("2026.3beta11", engine._select_release(items, True).tag); self.assertEqual("2026.2.0", engine._select_release(items, False).tag)
         self.assertIsNone(engine.parse_release({"tag_name": "junk-2026.9"}))
 
+    def test_selectable_releases_keep_stable_beta_rc_and_alpha_separate(self):
+        items = [
+            {"tag_name": "release-2026.2.0", "prerelease": False},
+            {"tag_name": "release-2026.3beta9", "prerelease": True},
+            {"tag_name": "release-2026.3beta11", "prerelease": True},
+            {"tag_name": "release-2026.3rc1", "prerelease": True},
+            {"tag_name": "release-2026.2beta8", "prerelease": True},
+        ]
+        alpha = engine.Release("alpha-60000,abcdef", "2026.4", True, "https://example.invalid/alpha", build_version="2026.4.0.60000")
+        choices = engine._release_choices(items, True, alpha, checked_at="now")
+        self.assertEqual(["stable", "alpha", "rc", "beta"], [engine.release_channel(item) for item in choices])
+        self.assertEqual("2026.3beta11", choices[-1].tag)
+        self.assertNotIn("2026.2beta8", [item.tag for item in choices])
+        self.assertEqual(["2026.2.0"], [item.tag for item in engine._release_choices(items, False)])
+
+    def test_available_release_choice_cache_preserves_exact_build_metadata(self):
+        api = io.BytesIO(json.dumps([
+            {"tag_name": "release-2026.2.0", "prerelease": False, "html_url": "https://example.invalid/stable"},
+            {"tag_name": "release-2026.3beta2", "prerelease": True, "html_url": "https://example.invalid/beta"},
+        ]).encode()); api.headers = {}
+        alpha = engine.Release("alpha-57626,71bae80b", "2026.4", True, "https://example.invalid/alpha", build_version="2026.4.0.57626")
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "release.json"
+            with mock.patch.object(engine.urllib.request, "urlopen", return_value=api), mock.patch.object(engine, "_latest_alpha_release", return_value=alpha):
+                choices = engine.available_releases(True, cache)
+            with mock.patch.object(engine.urllib.request, "urlopen", side_effect=OSError("offline")), mock.patch.object(engine.time, "sleep"):
+                cached = engine.available_releases(True, cache)
+        self.assertEqual([item.tag for item in choices], [item.tag for item in cached])
+        self.assertEqual("2026.4.0.57626", cached[1].build_version)
+        self.assertTrue(all(item.source == "cached" for item in cached))
+        self.assertEqual(cached[1], engine.matching_release(choices[1], cached))
+
     def test_release_lookup_selects_alpha_and_saves_one_shared_cache(self):
         api = io.BytesIO(json.dumps([{"tag_name": "release-2026.2.0", "prerelease": False, "html_url": "https://example.invalid/stable"}]).encode()); api.headers = {"ETag": "test-etag"}
         alpha_index = io.BytesIO(b'<a href="nvda_snapshot_alpha-57626,71bae80b.exe">alpha</a>'); alpha_index.headers = {}
@@ -50,6 +82,7 @@ class EngineTests(unittest.TestCase):
             saved = engine.read_json(cache)
         self.assertEqual("alpha-57626,71bae80b", release.tag)
         self.assertEqual("2026.3", release.manifest_version)
+        self.assertEqual("2026.3.0.57626", release.build_version)
         self.assertEqual("live", release.source)
         self.assertEqual("test-etag", saved["etag"])
         self.assertEqual("alpha-57626,71bae80b", saved["releases"]["prerelease"]["tag"])
@@ -642,6 +675,11 @@ class EngineTests(unittest.TestCase):
     def test_update_check_ui_requires_approval_and_reports_status(self):
         plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
         self.assertIn("class ProjectApprovalDialog", plugin)
+        self.assertIn("class ScanTargetDialog", plugin)
+        self.assertIn("engine.available_releases", plugin)
+        self.assertIn("engine.matching_release", plugin)
+        self.assertIn("Selected NVDA build:", plugin)
+        self.assertIn('state["manualReleaseTargetTag"]', plugin)
         self.assertIn("Confirm approved add-on projects", plugin)
         self.assertIn("Report add-on update-check status", plugin)
         self.assertIn("engine.latest_release", plugin)
