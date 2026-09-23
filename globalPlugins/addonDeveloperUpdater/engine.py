@@ -192,6 +192,16 @@ def _latest_alpha_release() -> Release | None:
         build_source = response.read().decode("utf-8", errors="replace")
     return parse_alpha_snapshot(index_html, build_source)
 
+def _release_feed_items() -> list[dict]:
+    request = urllib.request.Request(RELEASES_FEED_URL, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        root = ET.parse(response).getroot()
+    namespace = {"atom": "http://www.w3.org/2005/Atom"}; items = []
+    for entry in root.findall("atom:entry", namespace):
+        title = entry.findtext("atom:title", default="", namespaces=namespace).strip(); link = entry.find("atom:link", namespace)
+        items.append({"tag_name": title, "prerelease": bool(re.search(r"(?:alpha|beta|rc)\d*", title, re.I)), "html_url": link.get("href", "") if link is not None else ""})
+    return items
+
 def _release_with_status(release: Release, source: str, checked_at: str) -> Release:
     return Release(release.tag, release.manifest_version, release.prerelease, release.url, source, checked_at, release.build_version)
 
@@ -262,23 +272,72 @@ def available_releases(include_prereleases: bool = True, cache_path: Path | None
             last_error = error
         if attempt == 0:
             time.sleep(1)
-    if cached := _cached_release_choices(cache, include_prereleases):
-        return cached
-    # The existing release-feed fallback still provides at least one safe
-    # choice on a first run when GitHub's releases API is unavailable.
     try:
-        releases = [latest_release(False, cache_path)]
+        checked_at = utc_now(); alpha = None
         if include_prereleases:
-            prerelease = latest_release(True, cache_path)
-            if all(item.tag.casefold() != prerelease.tag.casefold() for item in releases):
-                releases.append(prerelease)
-        return releases
-    except Exception as fallback_error:
-        raise RuntimeError(f"Selectable NVDA releases could not be loaded: {last_error}; {fallback_error}") from fallback_error
+            try:
+                alpha = _latest_alpha_release()
+            except Exception:
+                alpha = next((release for release in _cached_release_choices(cache, True) if release_channel(release) == "alpha"), None)
+        choices = _release_choices(_release_feed_items(), include_prereleases, alpha, "release feed", checked_at)
+        if not choices: raise RuntimeError("The official NVDA releases feed returned no selectable builds.")
+        _save_release_cache(cache_path, {**cache, "availableReleases": [asdict(release) for release in choices], "availableCheckedAt": checked_at, "apiError": str(last_error)})
+        return choices
+    except Exception as feed_error:
+        if cached := _cached_release_choices(cache, include_prereleases):
+            return cached
+        raise RuntimeError(f"Selectable NVDA releases could not be loaded: {last_error}; {feed_error}") from feed_error
 
 def matching_release(choice: Release, available: list[Release]) -> Release | None:
     """Return the refreshed copy of an exact user-selected build."""
     return next((release for release in available if release.tag.casefold() == choice.tag.casefold() and release.manifest_version == choice.manifest_version), None)
+
+def save_manual_review(state: dict, release: Release, results: list[ProjectResult], merge: bool = False) -> None:
+    """Persist pending manual results independently from background scan state."""
+    available = [result for result in results if result.status.startswith("update available: ")]
+    if merge:
+        saved_release, saved_results = load_manual_review(state)
+        if saved_release is not None and saved_release.tag.casefold() == release.tag.casefold() and saved_release.manifest_version == release.manifest_version:
+            by_project = {result.project_id: result for result in saved_results}
+            by_project.update({result.project_id: result for result in available})
+            available = list(by_project.values())
+    if not available:
+        if not merge:
+            state.pop("manualUpdateReview", None)
+        return
+    state["manualUpdateReview"] = {"release": asdict(release), "results": [asdict(result) for result in available]}
+
+def load_manual_review(state: dict) -> tuple[Release | None, list[ProjectResult]]:
+    """Load a valid pending manual review, ignoring damaged legacy state."""
+    saved = state.get("manualUpdateReview") if isinstance(state, dict) else None
+    if not isinstance(saved, dict) or not isinstance(saved.get("release"), dict) or not isinstance(saved.get("results"), list):
+        return None, []
+    try:
+        release = Release(**saved["release"])
+        version_tuple(release.manifest_version)
+    except (TypeError, ValueError):
+        return None, []
+    results = []
+    for item in saved["results"]:
+        try:
+            result = ProjectResult(**item)
+            if result.status.startswith("update available: "):
+                results.append(result)
+        except (TypeError, ValueError):
+            continue
+    return (release, results) if results else (None, [])
+
+def finish_manual_review_items(state: dict, project_ids: set[str]) -> None:
+    """Remove only successfully completed projects from a pending manual review."""
+    release, results = load_manual_review(state)
+    if release is None:
+        state.pop("manualUpdateReview", None)
+        return
+    remaining = [result for result in results if result.project_id not in project_ids]
+    if remaining:
+        state["manualUpdateReview"] = {"release": asdict(release), "results": [asdict(result) for result in remaining]}
+    else:
+        state.pop("manualUpdateReview", None)
 
 def _save_release_cache(path: Path | None, data: dict) -> None:
     if path is None:
@@ -347,12 +406,7 @@ def latest_release(include_prereleases: bool = True, cache_path: Path | None = N
         except Exception as error: last_error = error
         if attempt == 0: time.sleep(1)
     try:
-        request = urllib.request.Request(RELEASES_FEED_URL, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(request, timeout=15) as response: root = ET.parse(response).getroot()
-        ns = {"atom": "http://www.w3.org/2005/Atom"}; items = []
-        for entry in root.findall("atom:entry", ns):
-            title = entry.findtext("atom:title", default="", namespaces=ns).strip(); link = entry.find("atom:link", ns)
-            items.append({"tag_name": title, "prerelease": bool(re.search(r"(?:alpha|beta|rc)\d*", title, re.I)), "html_url": link.get("href", "") if link is not None else ""})
+        items = _release_feed_items()
         release = _select_release(items, include_prereleases); release_source = "release feed"; release_checked_at = utc_now()
         if include_prereleases:
             try:

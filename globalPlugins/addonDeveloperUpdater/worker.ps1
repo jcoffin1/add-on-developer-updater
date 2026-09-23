@@ -64,7 +64,9 @@ function Find-Manifests($Roots, [int]$MaxDirectories, [int]$MaxSeconds) {
 try {
 	$request = Get-Content -LiteralPath $RequestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 	if ($request.mode -eq 'background') {
-		$manifests = @($request.manifestPaths | Where-Object { $_ -and [System.IO.File]::Exists([string]$_) -and -not (Test-Offline ([string]$_)) })
+		$manifestSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+		$request.manifestPaths | Where-Object { $_ -and [System.IO.File]::Exists([string]$_) -and -not (Test-Offline ([string]$_)) } | ForEach-Object { [void]$manifestSet.Add([System.IO.Path]::GetFullPath([string]$_)) }
+		$manifests = @($manifestSet)
 		$unavailableManifestPaths = @($request.manifestPaths | Where-Object { $_ -and (-not [System.IO.File]::Exists([string]$_) -or (Test-Offline ([string]$_))) })
 		$directoriesVisited = 0; $truncated = $false; $elapsedSeconds = 0
 	} else {
@@ -74,7 +76,16 @@ try {
 		}
 		$maxDirectories = if ($null -ne $request.maxDirectories) { [Math]::Max(1, [Math]::Min(20000, [int]$request.maxDirectories)) } else { 20000 }
 		$maxSeconds = if ($null -ne $request.maxSeconds) { [Math]::Max(1, [Math]::Min(60, [int]$request.maxSeconds)) } else { 60 }
-		$scan = Find-Manifests $roots $maxDirectories $maxSeconds; $manifests = @($scan.manifests); $directoriesVisited = $scan.directoriesVisited; $truncated = $scan.truncated; $elapsedSeconds = $scan.elapsedSeconds
+		$scan = Find-Manifests $roots $maxDirectories $maxSeconds
+		$manifestSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+		$scan.manifests | ForEach-Object { [void]$manifestSet.Add([System.IO.Path]::GetFullPath([string]$_)) }
+		$unavailableManifestPaths = @()
+		foreach ($savedPath in @($request.manifestPaths)) {
+			if (-not $savedPath) { continue }
+			if ([System.IO.File]::Exists([string]$savedPath) -and -not (Test-Offline ([string]$savedPath))) { [void]$manifestSet.Add([System.IO.Path]::GetFullPath([string]$savedPath)) }
+			else { $unavailableManifestPaths += [string]$savedPath }
+		}
+		$manifests = @($manifestSet); $directoriesVisited = $scan.directoriesVisited; $truncated = $scan.truncated; $elapsedSeconds = $scan.elapsedSeconds
 	}
 	Write-WorkerResult @{ ok = $true; manifests = @($manifests); unavailableManifestPaths = @($unavailableManifestPaths); directoriesVisited = $directoriesVisited; truncated = $truncated; elapsedSeconds = $elapsedSeconds; completedAt = [DateTime]::UtcNow.ToString('o') }
 } catch {

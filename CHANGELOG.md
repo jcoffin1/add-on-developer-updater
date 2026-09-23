@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026.2.42
+
+- Preserve a manual scan's exact build and pending add-on results in a separate review snapshot so a later background check cannot replace them before review.
+- Remove only successfully completed add-ons from that snapshot, retaining unselected or failed items for another review.
+- Try the official NVDA releases feed before falling back to a stale selectable-build cache when the GitHub releases API is unavailable.
+- During manual and periodic discovery, always merge every existing approved manifest path into the worker result, including maintained projects outside configured scan roots.
+- Report approved manifests that disappeared or became cloud-only consistently in background, manual, and periodic scans.
+
 ## 2026.2.41
 
 - Treat the prerelease setting as an availability filter instead of automatically forcing manual scans to the newest alpha build.

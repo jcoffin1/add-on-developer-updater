@@ -667,7 +667,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         ui.message(message); self._showInformation(_("Compatibility update undo results") if updateOperation else _("Compatibility undo results"), message)
     @scriptHandler.script(description=_("Review previously discovered NVDA add-on compatibility updates"), category=SCRIPT_CATEGORY)
     def script_reviewAddonProjectUpdates(self, gesture):
-        state = engine.read_json(self._statePath, {}); available = []
+        state = engine.read_json(self._statePath, {}); release, available = engine.load_manual_review(state)
+        if release is not None and available:
+            self._showReviewDialog(available, release); return
+        available = []
         for item in engine.visible_project_records(state)[0]:
             if isinstance(item, dict) and str(item.get("status", "")).startswith("update available: "):
                 try: available.append(engine.ProjectResult(**item))
@@ -1248,7 +1251,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 if "failed" in result.status: result.status = "awaiting manual approval; " + result.status
                 else: approved.add(result.project_id)
                 results.append(result)
-            state["approvedProjects"] = sorted(approved); state["projects"] = engine.merge_project_records(state.get("projects", []), results); engine.atomic_json_write(self._statePath, state)
+            state["approvedProjects"] = sorted(approved); state["projects"] = engine.merge_project_records(state.get("projects", []), results); engine.save_manual_review(state, release, results, merge=True); engine.atomic_json_write(self._statePath, state)
         except Exception as error:
             operationError = str(error); log.exception("Project approval failed")
         finally:
@@ -1294,6 +1297,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             refreshed = engine.matching_release(release, available)
             if refreshed is None:
                 results = [engine.ProjectResult(item.project_id, item.name, item.path, _("update deferred because the selected NVDA build %s is no longer an available target; run the update check again") % release.tag) for item in selected]
+                state = engine.read_json(self._statePath, {}); state.pop("manualUpdateReview", None); engine.atomic_json_write(self._statePath, state)
                 if not self._shutdown.is_set(): wx.CallAfter(self._finishApply, results)
                 return
             release = refreshed
@@ -1312,6 +1316,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             for result in updated: channels[result.project_id] = "dev" if releaseChannel == "alpha" else ("beta" if release.prerelease else "stable")
             state["projects"] = projects; state["submissionProjects"] = submissionProjects; state["submissionChannels"] = channels; state["lastScanAt"] = engine.utc_now()
             if updated: state["updateUndo"] = [{"project_id": result.project_id, "name": result.name, "path": result.path, "backup_path": result.backup_path, "previous_last_tested": result.previous_last_tested, "target_last_tested": result.target_last_tested, "target_manifest_hash": result.target_manifest_hash} for result in updated]
+            completed = {result.project_id for result in results if result.status == "current" or result.status.startswith("updated to ")}
+            engine.finish_manual_review_items(state, completed)
             engine.atomic_json_write(self._statePath, state)
             for result in results: log.info("Add-on Developer Updater selected update: %s: %s", result.path, result.status)
             if not self._shutdown.is_set(): wx.CallAfter(self._finishApply, results)
@@ -1626,7 +1632,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             resolvedFailures = [previousRecords[identifier].get("name", identifier) for identifier in resolvedFailureIds if identifier in previousRecords]
             sameCompatibilityFamily = bool(state.get("releaseTag") and state.get("releaseTag") != release.tag and state.get("manifestVersion") == release.manifest_version)
             state.update({"releaseTag": release.tag, "releaseBuildVersion": release.build_version, "manifestVersion": release.manifest_version, "prerelease": release.prerelease, "releaseUrl": release.url, "releaseSource": release.source, "releaseCheckedAt": release.checked_at, "lastCheckAt": checkedAt, "lastSuccessfulCheckAt": checkedAt, "lastScanAt": checkedAt, "lastCheckError": "", "lastAutomaticError": "", "automaticFailureCount": 0, "approvedProjects": sorted(approved), "ignoredProjects": sorted(ignored), "projects": projects, "notifiedUpdates": currentUpdates, "notifiedAwaiting": currentAwaiting, "notifiedFailures": currentFailures})
-            if manual and selectedRelease is not None: state["manualReleaseTargetTag"] = release.tag
+            if manual and selectedRelease is not None:
+                state["manualReleaseTargetTag"] = release.tag; engine.save_manual_review(state, release, visibleResults)
             if mode != "background": state.update({"lastDiscoveryAt": checkedAt, "lastDiscoveryDirectories": int(workerResult.get("directoriesVisited", 0)), "lastDiscoverySeconds": workerResult.get("elapsedSeconds", 0), "lastDiscoveryTruncated": discoveryTruncated})
             engine.atomic_json_write(self._statePath, state)
             for result in results:

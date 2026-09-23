@@ -71,6 +71,41 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(all(item.source == "cached" for item in cached))
         self.assertEqual(cached[1], engine.matching_release(choices[1], cached))
 
+    def test_available_releases_try_official_feed_before_stale_cache(self):
+        feed = io.BytesIO(b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><title>release-2026.2</title><link href="https://example.invalid/current"/></entry></feed>'); feed.headers = {}
+        stale = engine.Release("2026.1", "2026.1", False, "https://example.invalid/stale")
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "release.json"; engine.atomic_json_write(cache, {"availableReleases": [engine.asdict(stale)]})
+            with mock.patch.object(engine.urllib.request, "urlopen", side_effect=[OSError("API offline"), OSError("API offline"), feed]), mock.patch.object(engine.time, "sleep"):
+                choices = engine.available_releases(False, cache)
+        self.assertEqual(["2026.2"], [item.tag for item in choices])
+        self.assertEqual("release feed", choices[0].source)
+
+    def test_manual_review_survives_background_release_state_changes(self):
+        release = engine.Release("2026.3beta2", "2026.3", True, "https://example.invalid/beta", "live", "now", "2026.3beta2")
+        pending = [
+            engine.ProjectResult("one", "One", "C:/one/manifest.ini", "update available: 2026.2 to 2026.3"),
+            engine.ProjectResult("current", "Current", "C:/current/manifest.ini", "current"),
+        ]
+        state = {}
+        engine.save_manual_review(state, release, pending)
+        state.update(releaseTag="alpha-99999,abcdef", manifestVersion="2027.1", prerelease=True)
+        saved_release, saved_results = engine.load_manual_review(state)
+        self.assertEqual("2026.3beta2", saved_release.tag)
+        self.assertEqual(["one"], [result.project_id for result in saved_results])
+        engine.finish_manual_review_items(state, {"one"})
+        self.assertNotIn("manualUpdateReview", state)
+
+    def test_manual_review_merge_keeps_unselected_projects_and_rejects_corrupt_state(self):
+        release = engine.Release("2026.3beta2", "2026.3", True, "")
+        state = {}
+        engine.save_manual_review(state, release, [engine.ProjectResult("one", "One", "one.ini", "update available: 2026.2 to 2026.3")])
+        engine.save_manual_review(state, release, [engine.ProjectResult("two", "Two", "two.ini", "update available: 2026.1 to 2026.3")], merge=True)
+        _saved_release, results = engine.load_manual_review(state)
+        self.assertEqual({"one", "two"}, {result.project_id for result in results})
+        state["manualUpdateReview"]["release"]["unexpected"] = True
+        self.assertEqual((None, []), engine.load_manual_review(state))
+
     def test_release_lookup_selects_alpha_and_saves_one_shared_cache(self):
         api = io.BytesIO(json.dumps([{"tag_name": "release-2026.2.0", "prerelease": False, "html_url": "https://example.invalid/stable"}]).encode()); api.headers = {"ETag": "test-etag"}
         alpha_index = io.BytesIO(b'<a href="nvda_snapshot_alpha-57626,71bae80b.exe">alpha</a>'); alpha_index.headers = {}
@@ -487,6 +522,19 @@ class EngineTests(unittest.TestCase):
             result = engine.read_json(output)
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertEqual([str(existing)], result["manifests"])
+        self.assertEqual([str(missing)], result["unavailableManifestPaths"])
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "NVDA's scan worker requires Windows PowerShell")
+    def test_manual_worker_always_includes_approved_projects_outside_scan_roots(self):
+        worker = Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "worker.ps1"
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); scan_root = root / "configured"; scan_root.mkdir(); approved = self.make_project(root, "outside"); missing = root / "missing" / "manifest.ini"
+            request = root / "request.json"; output = root / "result.json"
+            request.write_text(json.dumps({"mode": "manual", "fullSystem": False, "roots": [str(scan_root)], "manifestPaths": [str(approved), str(missing)]}), encoding="utf-8")
+            completed = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(worker), "-RequestPath", str(request), "-OutputPath", str(output)], capture_output=True, text=True, timeout=30)
+            result = engine.read_json(output)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual([str(approved)], result["manifests"])
         self.assertEqual([str(missing)], result["unavailableManifestPaths"])
 
     def test_runtime_bounds_external_worker_and_safely_handles_progress_close(self):
