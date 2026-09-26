@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026.2.44
+
+- Use each manifest's public summary throughout GitHub selection, inspection, branch, push, release, repair, error, and completion feedback instead of exposing its internal add-on ID.
+- Keep the internal manifest name exclusively for package identity and validation.
+- Derive a missing repository's proposed name from the public add-on name rather than its internal module identifier.
+- Update both the focused progress field's value and accessibility name at every stage so current status remains synchronized in speech and braille.
+
 ## 2026.2.43
 
 - Inspect up to 1,000 non-draft GitHub Releases so an existing historical tag is not mistaken for a new version merely because it is not the newest release.

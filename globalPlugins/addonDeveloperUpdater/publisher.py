@@ -343,6 +343,11 @@ def release_publish_action(item) -> str:
         verified = bool(value("release_package_verified", True))
     return "" if download and verified else "repair"
 
+def public_name(item) -> str:
+    """Return the human-facing add-on name without changing its package ID."""
+    value = item.get if isinstance(item, dict) else lambda key, default=None: getattr(item, key, default)
+    return str(value("summary", "") or value("name", "") or "add-on").strip()
+
 def _repository_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or "nvda-addon"
 
@@ -663,25 +668,25 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
     except Exception as error: raise RuntimeError(f"current NVDA Add-on Store API versions could not be loaded: {error}") from error
     reports = []
     for index, project in enumerate(projects, 1):
-        if progress: progress(f"Inspecting {project.name}, project {index} of {len(projects)}")
         manifest = Path(project.path).resolve(); root = project_root(manifest)
+        metadata = values_reader(manifest); display_name = str(metadata.get("summary") or project.name)
+        if progress: progress(f"Inspecting {display_name}, project {index} of {len(projects)}")
         has_git = (root / ".git").exists()
         current_branch = _git(root, "branch", "--show-current").strip() if has_git else "main"
         if has_git and not current_branch:
-            raise RuntimeError(f"{project.name} is using a detached Git HEAD; check out the branch to publish before continuing")
+            raise RuntimeError(f"{display_name} is using a detached Git HEAD; check out the branch to publish before continuing")
         if not has_git:
             names = [path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()]
             unsafe = [name for name in names if _is_sensitive_path(name)]
         else: unsafe = _sensitive_files(root)
-        if unsafe: raise RuntimeError(f"{project.name} contains files that may hold credentials: {', '.join(unsafe[:5])}")
-        metadata = values_reader(manifest)
+        if unsafe: raise RuntimeError(f"{display_name} contains files that may hold credentials: {', '.join(unsafe[:5])}")
         remote = ""
         remote_name = ""
         if has_git:
             remote_name, remote = _select_publish_remote(_repository_remotes(root), authenticated_owner)
         if not remote: remote = _manifest_github_remote(metadata)
         if not remote:
-            try: remote = _run([gh, "repo", "view", _repository_name(project.name), "--json", "url", "--jq", ".url"])
+            try: remote = _run([gh, "repo", "view", _repository_name(display_name), "--json", "url", "--jq", ".url"])
             except RuntimeError: pass
         release_download = ""; package_verified = True; package_error = ""
         matching_tag = ""; matching_download = ""; matching_verified = True; matching_error = ""; matching_targets_head = True
@@ -690,8 +695,8 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
             repository_details = json.loads(_run([gh, "repo", "view", _remote_web_url(remote), "--json", "visibility,defaultBranchRef"]) or "{}")
             visibility = str(repository_details.get("visibility", ""))
             default_branch = str((repository_details.get("defaultBranchRef") or {}).get("name") or "")
-            if visibility.upper() != "PUBLIC": raise RuntimeError(f"{project.name} must use a public GitHub repository for NVDA Store submission")
-            if progress: progress(f"Checking the newest GitHub Release for {project.name}")
+            if visibility.upper() != "PUBLIC": raise RuntimeError(f"{display_name} must use a public GitHub repository for NVDA Store submission")
+            if progress: progress(f"Checking the newest GitHub Release for {display_name}")
             release_rows = json.loads(_run([gh, "release", "list", "--repo", _remote_web_url(remote), "--exclude-drafts", "--limit", "1000", "--json", "tagName"]) or "[]")
             release_tags = [str(row.get("tagName") or "") for row in release_rows if isinstance(row, dict) and row.get("tagName")]
             github_release = release_tags[0] if release_tags else ""
@@ -818,21 +823,22 @@ def release_target_blocker(root: Path, remote_name: str, default_branch: str, ta
 def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
     gh = gh_path(); published = []
     for index, report in enumerate(reports, 1):
+        display_name = public_name(report)
         if release_publish_action(report) == "version-conflict":
-            raise RuntimeError(f"{report.name} version {report.version} already has a GitHub Release that does not include the current local changes. Increment the manifest version before publishing the current code")
-        if progress: progress(f"Preparing {report.name}, project {index} of {len(reports)}")
+            raise RuntimeError(f"{display_name} version {report.version} already has a GitHub Release that does not include the current local changes. Increment the manifest version before publishing the current code")
+        if progress: progress(f"Preparing {display_name}, project {index} of {len(reports)}")
         root = Path(report.root)
         if not report.has_git:
-            if progress: progress(f"Creating local Git repository for {report.name}")
+            if progress: progress(f"Creating local Git repository for {display_name}")
             _run(["git", "init", "-b", "main"], root)
         branch = _git(root, "branch", "--show-current").strip()
         if not branch:
-            raise RuntimeError(f"{report.name} is using a detached Git HEAD; check out the branch to publish before continuing")
+            raise RuntimeError(f"{display_name} is using a detached Git HEAD; check out the branch to publish before continuing")
         if report.has_git and report.current_branch and branch != report.current_branch:
-            raise RuntimeError(f"{report.name} changed branches after the publishing review, from {report.current_branch} to {branch}; run the command again")
+            raise RuntimeError(f"{display_name} changed branches after the publishing review, from {report.current_branch} to {branch}; run the command again")
         unsafe = _sensitive_files(root)
         if unsafe:
-            raise RuntimeError(f"{report.name} gained files that may hold credentials after the publishing review: {', '.join(unsafe[:5])}")
+            raise RuntimeError(f"{display_name} gained files that may hold credentials after the publishing review: {', '.join(unsafe[:5])}")
         push_remote = ""
         if report.remote:
             remotes = _repository_remotes(root)
@@ -848,12 +854,12 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
             _git(root, "add", "--all", "--", *publishable_paths)
         staged = subprocess.run(["git", "-C", str(root), "diff", "--cached", "--quiet"], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode != 0
         if staged:
-            if progress: progress(f"Committing changes for {report.name}")
+            if progress: progress(f"Committing changes for {display_name}")
             _git(root, "commit", "-m", "Prepare NVDA add-on store release")
         remote = report.remote
         if not remote:
-            if progress: progress(f"Finding or creating a public GitHub repository for {report.name}")
-            repository = _repository_name(report.name)
+            if progress: progress(f"Finding or creating a public GitHub repository for {display_name}")
+            repository = _repository_name(display_name)
             try:
                 existing = _run([gh, "repo", "view", repository, "--json", "url", "--jq", ".url"])
                 push_remote = "origin"
@@ -862,7 +868,7 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
                 _run([gh, "repo", "create", repository, "--public", "--source", str(root), "--remote", "origin", "--description", report.summary])
                 push_remote = "origin"
             remote = _git(root, "remote", "get-url", push_remote)
-        if progress: progress(f"Pushing {report.name} to GitHub")
+        if progress: progress(f"Pushing {display_name} to GitHub")
         _git(root, "push", "--set-upstream", push_remote, branch)
         # Releases must target the commit we actually pushed.  GitHub otherwise
         # defaults to the repository's default branch, which may be unrelated.
@@ -880,14 +886,14 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
                 pass
         blocker, can_fast_forward = release_target_status(root, push_remote, default_branch, target_commit) if release_pending else ("", False)
         published.append({**report.__dict__, "sourceUrl": repository, "targetCommitish": target_commit, "currentBranch": branch, "defaultBranch": default_branch, "pushRemote": push_remote, "releaseBlocker": blocker, "defaultBranchCanFastForward": can_fast_forward})
-        if progress: progress(f"GitHub push finished for {report.name}, project {index} of {len(reports)}")
+        if progress: progress(f"GitHub push finished for {display_name}, project {index} of {len(reports)}")
     return published
 
 def promote_default_branches(items: list[dict], progress=None) -> list[dict]:
     """Fast-forward confirmed repository default branches without checking out or merging locally."""
     promoted = []
     for index, item in enumerate(items, 1):
-        updated = dict(item); name = str(item.get("name", "add-on")); root = Path(item["root"])
+        updated = dict(item); name = public_name(item); root = Path(item["root"])
         remote_name = str(item.get("pushRemote", "")); default_branch = str(item.get("defaultBranch", "")); target_commit = str(item.get("targetCommitish", ""))
         if progress: progress(f"Rechecking the default branch for {name}, project {index} of {len(items)}")
         blocker, can_fast_forward = release_target_status(root, remote_name, default_branch, target_commit)
@@ -971,14 +977,15 @@ def validate_publish_builds(reports: list[ProjectPublishInfo], progress=None) ->
     """Prove releasable projects build successfully before changing GitHub."""
     pending = [report for report in reports if release_publish_action(report) in {"create", "repair"}]
     for index, report in enumerate(pending, 1):
+        display_name = public_name(report)
         if progress:
-            progress(f"Validating release build for {report.name}, project {index} of {len(pending)}")
+            progress(f"Validating release build for {display_name}, project {index} of {len(pending)}")
         root = Path(report.root)
         package = build_release_package(report.__dict__, root / "outputs")
         verified, error, issues = verify_release_package_file(package, report.name, report.version)
         if not verified or issues:
             detail = error or "; ".join(issues)
-            raise RuntimeError(f"The release package for {report.name} did not pass validation: {detail}")
+            raise RuntimeError(f"The release package for {display_name} did not pass validation: {detail}")
 
 def release_create_arguments(gh: str, tag: str, package: Path, repository: str, target: str, release_name: str, prerelease: bool = False) -> list[str]:
     # Preflight compares the local version with the latest GitHub release, and
@@ -1018,44 +1025,45 @@ def _uploaded_asset_url(gh: str, repository: str, tag: str, package_name: str) -
 def release(items: list[dict], output_folder: Path, progress=None, on_released=None) -> list[dict]:
     gh = gh_path(); released = []
     for index, item in enumerate(items, 1):
+        display_name = public_name(item)
         if item.get("releaseBlocker"):
-            raise RuntimeError(f"Release creation was stopped for {item['name']}: {item['releaseBlocker']}")
+            raise RuntimeError(f"Release creation was stopped for {display_name}: {item['releaseBlocker']}")
         action = release_publish_action(item)
         if action == "version-conflict":
-            raise RuntimeError(f"{item['name']} version {item['version']} already has a GitHub Release that does not include the current local changes. Increment the manifest version before publishing the current code")
-        if progress: progress(f"Packaging {item['name']}, release {index} of {len(items)}")
+            raise RuntimeError(f"{display_name} version {item['version']} already has a GitHub Release that does not include the current local changes. Increment the manifest version before publishing the current code")
+        if progress: progress(f"Packaging {display_name}, release {index} of {len(items)}")
         package = build_release_package(item, output_folder)
         verified, package_error, package_issues = verify_release_package_file(package, item["name"], item["version"])
         if not verified or package_issues:
             detail = package_error or "; ".join(package_issues)
-            raise RuntimeError(f"The release package for {item['name']} did not pass validation: {detail}")
+            raise RuntimeError(f"The release package for {display_name} did not pass validation: {detail}")
         tag = str(item.get("matching_release_tag") or f"v{item['version']}")
         repository = item["sourceUrl"].removeprefix("https://github.com/")
         target = str(item.get("targetCommitish", "")).strip()
-        if not target: raise RuntimeError(f"No pushed commit was recorded for {item['name']}; release creation was stopped")
+        if not target: raise RuntimeError(f"No pushed commit was recorded for {display_name}; release creation was stopped")
         remote_tag = _remote_tag_commit(Path(item["root"]), str(item.get("pushRemote", "")), tag)
         if remote_tag and remote_tag.casefold() != target.casefold():
-            raise RuntimeError(f"GitHub tag {tag} for {item['name']} already points to a different commit. Increment the manifest version before publishing a new release")
+            raise RuntimeError(f"GitHub tag {tag} for {display_name} already points to a different commit. Increment the manifest version before publishing a new release")
         version = item["version"].lower()
         prerelease = item.get("channel") in {"beta", "dev"} or any(stage in version for stage in ("alpha", "beta", "dev", "rc"))
         if action == "repair":
-            if progress: progress(f"Repairing GitHub Release {tag} for {item['name']}")
+            if progress: progress(f"Repairing GitHub Release {tag} for {display_name}")
             _run([gh, "release", "upload", tag, str(package), "--repo", repository, "--clobber"])
         elif action == "create":
             arguments = release_create_arguments(gh, tag, package, repository, target, item.get("summary") or item["name"], prerelease)
-            if progress: progress(f"Uploading GitHub Release {tag} for {item['name']}")
+            if progress: progress(f"Uploading GitHub Release {tag} for {display_name}")
             _run(arguments)
         else:
-            raise RuntimeError(f"GitHub Release {tag} for {item['name']} is already complete; no release change is needed")
+            raise RuntimeError(f"GitHub Release {tag} for {display_name} is already complete; no release change is needed")
         download = _uploaded_asset_url(gh, repository, tag, package.name)
         if not download:
-            raise RuntimeError(f"GitHub accepted release {tag} for {item['name']}, but the uploaded package could not be verified on the release")
+            raise RuntimeError(f"GitHub accepted release {tag} for {display_name}, but the uploaded package could not be verified on the release")
         released_item = {**item, "package": str(package), "downloadUrl": download, "matching_release_tag": tag, "matching_release_download_url": download, "matching_release_package_verified": True, "matching_release_package_error": ""}
         released.append(released_item)
         # GitHub has already accepted this release.  Persist it before attempting
         # the next item so a later failure cannot make this success look missing.
         if on_released is not None: on_released(released_item)
-        if progress: progress(f"GitHub Release published for {item['name']}, release {index} of {len(items)}")
+        if progress: progress(f"GitHub Release published for {display_name}, release {index} of {len(items)}")
     return released
 
 def store_url(item: dict) -> str:

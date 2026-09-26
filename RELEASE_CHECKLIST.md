@@ -36,6 +36,8 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 - Open Issues and edit, validate, save, and delete a disposable Markdown and YAML template.
 - Confirm no push or release occurs before its explicit confirmation.
 - Confirm matching local and GitHub versions produce one clear current-release message.
+- Confirm a project whose public summary differs from its internal manifest name uses the public name in every GitHub selection, progress message, confirmation, error, and completion dialog.
+- With braille connected, confirm the focused progress field changes at every GitHub stage instead of retaining the preceding stage's text.
 - Confirm a historical matching version is recognized without attempting to recreate its release, and a matching release with a missing asset offers a repair rather than a duplicate tag.
 - Make an uncommitted change without incrementing an already released manifest version; confirm publishing stops before staging and explains that the version must be incremented.
 - Point an existing version tag at another commit and confirm publishing refuses to move, overwrite, or reuse it.

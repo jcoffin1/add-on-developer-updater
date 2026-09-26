@@ -543,6 +543,20 @@ class EngineTests(unittest.TestCase):
         self.assertIn("self._progressDialog = None\n            dialog.Destroy()", plugin)
         self.assertIn("Progress window closed. The operation is still running in the background.", plugin)
 
+    def test_github_feedback_uses_public_names_and_refreshes_progress_accessibility(self):
+        report = publisher.ProjectPublishInfo(
+            "id", "internalModuleName", "manifest.ini", ".", "2026.2", "Public Add-on Name", "Justin Coffin",
+            "https://github.com/example/public-addon", 0, True, 0,
+        )
+        self.assertEqual("Public Add-on Name", publisher.public_name(report))
+        self.assertEqual("Public Add-on Name", publisher.public_name({"name": "internalModuleName", "summary": "Public Add-on Name"}))
+        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn("_projectDisplayName(result)", plugin)
+        self.assertIn("publisher.public_name(report)", plugin)
+        self.assertIn("publisher.public_name(item)", plugin)
+        self.assertIn("self.status.SetName(message)", plugin)
+        self.assertIn("self._progressDialog.setStatus(message)", plugin)
+
     def test_documentation_does_not_advertise_nonexistent_automatic_changes(self):
         documentation = (Path(__file__).parent / "doc" / "en" / "readme.html").read_text(encoding="utf-8")
         self.assertNotIn("opt-in automatic changes", documentation)
