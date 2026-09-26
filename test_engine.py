@@ -567,6 +567,93 @@ class EngineTests(unittest.TestCase):
             "jcoffin1/chatgpt-desktop-access", target, "ChatGPT Desktop Access", True,
         ))
 
+    def test_release_plan_finds_historical_versions_and_repairs_bad_assets(self):
+        self.assertEqual("2026.2", publisher.matching_release_tag(["v2026.3", "2026.2"], "v2026.2"))
+        self.assertEqual("release-2026.2", publisher.matching_release_tag(["release-2026.2"], "2026.2"))
+        current = publisher.ProjectPublishInfo(
+            "id", "Demo", "manifest.ini", ".", "2026.2", "Demo", "Justin Coffin",
+            "https://github.com/example/demo", 0, True, 0, "2026.2",
+            "https://github.com/example/demo/releases/download/v2026.2/demo.nvda-addon",
+        )
+        self.assertEqual("", publisher.release_publish_action(current))
+        current.matching_release_tag = "v2026.2"
+        current.matching_release_download_url = ""
+        self.assertEqual("repair", publisher.release_publish_action(current))
+        current.github_release_version = "2026.3"
+        current.matching_release_download_url = "https://github.com/example/demo/releases/download/v2026.2/demo.nvda-addon"
+        self.assertEqual("", publisher.release_publish_action(current))
+        current.changed_files = 1
+        self.assertEqual("version-conflict", publisher.release_publish_action(current))
+        current.changed_files = 0
+        current.matching_release_tag = ""
+        current.matching_release_download_url = ""
+        self.assertEqual("create", publisher.release_publish_action(current))
+        current.matching_release_tag = "v2026.2"
+        current.matching_release_targets_head = False
+        self.assertEqual("version-conflict", publisher.release_publish_action(current))
+        self.assertTrue(any("older commit" in reason for reason in publisher.store_readiness_reasons(current)))
+
+    def test_existing_matching_release_is_repaired_instead_of_recreated(self):
+        with tempfile.TemporaryDirectory() as folder:
+            package = Path(folder) / "Demo-2026.2.nvda-addon"
+            with zipfile.ZipFile(package, "w") as archive:
+                archive.writestr("manifest.ini", 'name = Demo\nversion = 2026.2\n')
+            item = {
+                "project_id": "demo", "name": "Demo", "summary": "Demo", "version": "2026.2",
+                "manifest": str(Path(folder) / "manifest.ini"), "root": folder,
+                "sourceUrl": "https://github.com/example/demo", "pushRemote": "origin",
+                "targetCommitish": "a" * 40, "matching_release_tag": "2026.2",
+                "matching_release_download_url": "", "releaseBlocker": "", "channel": "stable",
+            }
+            with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "build_release_package", return_value=package), mock.patch.object(publisher, "_remote_tag_commit", return_value="a" * 40), mock.patch.object(publisher, "_uploaded_asset_url", return_value="https://github.com/example/demo/releases/download/2026.2/Demo-2026.2.nvda-addon"), mock.patch.object(publisher, "_run", return_value="") as run:
+                released = publisher.release([item], Path(folder))
+        command = run.call_args.args[0]
+        self.assertEqual(["gh", "release", "upload"], command[:3])
+        self.assertIn("--clobber", command)
+        self.assertEqual("2026.2", released[0]["matching_release_tag"])
+
+    def test_release_never_reuses_a_version_tag_from_another_commit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            package = Path(folder) / "Demo-2026.2.nvda-addon"
+            with zipfile.ZipFile(package, "w") as archive:
+                archive.writestr("manifest.ini", 'name = Demo\nversion = 2026.2\n')
+            item = {
+                "name": "Demo", "summary": "Demo", "version": "2026.2", "root": folder,
+                "manifest": str(Path(folder) / "manifest.ini"), "sourceUrl": "https://github.com/example/demo",
+                "pushRemote": "origin", "targetCommitish": "a" * 40, "matching_release_tag": "v2026.2",
+                "matching_release_download_url": "", "releaseBlocker": "", "channel": "stable",
+            }
+            with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "build_release_package", return_value=package), mock.patch.object(publisher, "_remote_tag_commit", return_value="b" * 40):
+                with self.assertRaisesRegex(RuntimeError, "different commit"):
+                    publisher.release([item], Path(folder))
+
+    def test_release_validation_checks_the_actual_package_before_upload(self):
+        with tempfile.TemporaryDirectory() as folder:
+            package = Path(folder) / "Demo-2026.2.nvda-addon"
+            with zipfile.ZipFile(package, "w") as archive:
+                archive.writestr("manifest.ini", 'name = OtherAddon\nversion = 2026.2\n')
+            verified, error, _issues = publisher.verify_release_package_file(package, "Demo", "2026.2")
+        self.assertFalse(verified)
+        self.assertIn("OtherAddon", error)
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required for the publish safety test")
+    def test_push_rechecks_credentials_after_the_user_confirms(self):
+        self.assertTrue(publisher._is_sensitive_path("config/.env.production"))
+        self.assertTrue(publisher._is_sensitive_path("keys/signing.PFX"))
+        self.assertFalse(publisher._is_sensitive_path("doc/environment.md"))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            (root / ".env.production").write_text("TOKEN=secret\n", encoding="utf-8")
+            report = publisher.ProjectPublishInfo(
+                "id", "Demo", str(root / "manifest.ini"), str(root), "2026.2", "Demo", "Justin Coffin",
+                "https://github.com/example/demo", 1, True, 0, "",
+                current_branch="main",
+            )
+            with mock.patch.object(publisher, "gh_path", return_value="gh"):
+                with self.assertRaisesRegex(RuntimeError, "gained files that may hold credentials"):
+                    publisher.push([report])
+
     def test_release_target_must_be_on_repository_default_branch(self):
         missing = subprocess.CompletedProcess([], 1, "", "")
         fast_forward = subprocess.CompletedProcess([], 0, "", "")
@@ -691,8 +778,9 @@ class EngineTests(unittest.TestCase):
         current = publisher.ProjectPublishInfo(
             "current", "Current", "manifest.ini", ".", "2026.2", "Current", "Justin Coffin",
             "https://github.com/jcoffin1/current", 1, True, 0, "2026.2",
+            "https://github.com/jcoffin1/current/releases/download/v2026.2/current.nvda-addon",
         )
-        with mock.patch.object(publisher, "build_release_package") as build:
+        with mock.patch.object(publisher, "build_release_package") as build, mock.patch.object(publisher, "verify_release_package_file", return_value=(True, "", ())):
             publisher.validate_publish_builds([report, current])
         build.assert_called_once()
         self.assertEqual("Demo", build.call_args.args[0]["name"])

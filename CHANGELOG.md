@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026.2.43
+
+- Inspect up to 1,000 non-draft GitHub Releases so an existing historical tag is not mistaken for a new version merely because it is not the newest release.
+- Distinguish release creation from repair, and upload a missing or invalid `.nvda-addon` asset to the matching release instead of attempting to recreate its tag.
+- Refuse to reuse a released version when its tag does not identify the current commit or when current local changes are not part of that release; require a manifest version increment instead.
+- Resolve lightweight and annotated remote tags and stop before publishing when an existing version tag points to a different commit.
+- Validate the exact locally built package before any push and again before upload, including its archive, root manifest, add-on ID, version, and disclosure scan.
+- Confirm that GitHub exposes the newly uploaded asset before saving store-submission metadata.
+- Recheck credential-like files after confirmation and immediately before staging, including `.env.*` files in projects that do not yet have a Git repository.
+- Compare unpushed commits with the selected owned remote and its default branch instead of assuming the remote is named `origin`.
+
 ## 2026.2.42
 
 - Preserve a manual scan's exact build and pending add-on results in a separate review snapshot so a later background check cannot replace them before review.

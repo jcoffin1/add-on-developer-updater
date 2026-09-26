@@ -36,6 +36,10 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 - Open Issues and edit, validate, save, and delete a disposable Markdown and YAML template.
 - Confirm no push or release occurs before its explicit confirmation.
 - Confirm matching local and GitHub versions produce one clear current-release message.
+- Confirm a historical matching version is recognized without attempting to recreate its release, and a matching release with a missing asset offers a repair rather than a duplicate tag.
+- Make an uncommitted change without incrementing an already released manifest version; confirm publishing stops before staging and explains that the version must be incremented.
+- Point an existing version tag at another commit and confirm publishing refuses to move, overwrite, or reuse it.
+- Add a credential-like file after the publishing review and confirm the immediate pre-stage check stops the operation.
 - Enable prereleases and start a manual scan. Confirm the build chooser names stable, beta, release candidate, and alpha independently when each is available; stable is initially selected, every row announces both exact build and manifest target, and Escape closes without scanning.
 - Select an alpha or beta target, scan, and update a disposable manifest. Confirm the review and confirmation retain that exact build even when a newer build exists in another channel, and confirm another scan remembers the choice while it remains available.
 - Close a manual beta review without updating, allow or trigger a background alpha check, then run the review command. Confirm the saved beta build and its pending add-ons remain unchanged. Update only one of two pending add-ons and confirm the other remains available for review.

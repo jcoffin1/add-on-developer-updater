@@ -1404,8 +1404,15 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         notOwned = [report.name for report in reports if not getattr(report, "repository_owned_by_user", True)]
         reports = [report for report in reports if getattr(report, "repository_owned_by_user", True)]
         if notOwned: ui.message(_("Skipped repositories that are not owned by the signed-in GitHub account: %s") % "; ".join(notOwned))
-        reports = [report for report in reports if report.changed_files or report.unpushed_commits or not report.remote or publisher.release_needed(getattr(report, "version", ""), getattr(report, "github_release_version", ""))]
+        versionConflicts = [report for report in reports if publisher.release_publish_action(report) == "version-conflict"]
+        reports = [report for report in reports if publisher.release_publish_action(report) != "version-conflict"]
+        if versionConflicts:
+            ui.message(_("Skipped add-ons whose current version already has a GitHub Release that does not include the current local changes. Increment each manifest version before publishing: %s") % "; ".join(report.name for report in versionConflicts))
+        reports = [report for report in reports if report.changed_files or report.unpushed_commits or not report.remote or publisher.release_publish_action(report)]
         if not reports:
+            if versionConflicts:
+                message = _("No add-ons can be published yet. Their current versions already have GitHub Releases that do not include the current local changes. Increment the manifest version for: %s. Press OK to exit.") % "; ".join(report.name for report in versionConflicts)
+                ui.message(message); self._showInformation(_("Manifest version increment required"), message); return
             message = _("The newest local releases are already current on GitHub. Press OK to exit.")
             ui.message(message); self._showInformation(_("GitHub releases are current"), message); return
         create = [report.name for report in reports if not report.remote]; changed = sum(report.changed_files for report in reports)
@@ -1443,18 +1450,18 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         blocked = [item for item in published if item.get("releaseBlocker")]
         if blocked:
             ui.message(_("GitHub release deferred for: %s") % "; ".join(_("%s: %s") % (item["name"], item["releaseBlocker"]) for item in blocked))
-        promotable = [item for item in blocked if item.get("defaultBranchCanFastForward") and publisher.release_needed(item.get("version", ""), item.get("github_release_version", ""))]
+        promotable = [item for item in blocked if item.get("defaultBranchCanFastForward") and publisher.release_publish_action(item)]
         if allowDefaultPromotion and promotable:
             details = self._limitedDetails(promotable, lambda item: _("%s: %s to %s") % (item["name"], item.get("currentBranch") or _("unknown branch"), item.get("defaultBranch") or _("unknown default branch")))
             message = _("The following release commits are on development branches, but their repository default branches have no competing commits and can be updated safely: %s. Select Yes to push each exact commit to its named default branch, verify it again, and continue to release confirmation. Select No to leave only the development branches pushed.") % details
             self._showConfirmation(_("Update repository default branches"), message, lambda: self._startGitHubDefaultPromotion(published, promotable), onNo=lambda: self._offerGitHubRelease(published, False, False)); return
-        differing = [item for item in published if not item.get("releaseBlocker") and publisher.release_needed(item.get("version", ""), item.get("github_release_version", ""))]
+        differing = [item for item in published if not item.get("releaseBlocker") and publisher.release_publish_action(item)]
         if not differing:
             if blocked:
                 self._offerGitHubPullRequests(blocked); return
             message = _("The newest local releases are already current on GitHub. Press OK to exit.")
             ui.message(message); self._showInformation(_("GitHub releases are current"), message); return
-        comparisons = "; ".join(_("%s: GitHub %s, local %s") % (item["name"], item.get("github_release_version") or _("no release"), item.get("version") or _("unknown")) for item in differing)
+        comparisons = "; ".join(_("%s: GitHub %s, local %s, action %s") % (item["name"], item.get("github_release_version") or _("no release"), item.get("version") or _("unknown"), _("repair matching release asset") if publisher.release_publish_action(item) == "repair" else _("create release")) for item in differing)
         blockedText = _(" Releases deferred until their commits reach the default branch: %s.") % "; ".join(item["name"] for item in blocked) if blocked else ""
         onNo = (lambda: self._offerGitHubPullRequests(blocked, _("No eligible GitHub Releases were created. "))) if blocked else (lambda: self._showGitHubResult(_("Source changes were pushed, but no new GitHub Release was created. Press OK to exit.")))
         self._showConfirmation(_("Release new add-on versions"), _("The following local versions differ from the newest GitHub Releases: %s.%s Release the eligible local versions now? Select No to leave only the source repositories pushed.") % (comparisons, blockedText), lambda: self._startGitHubRelease(differing, blocked), onNo=onNo)
