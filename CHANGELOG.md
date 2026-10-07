@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026.2.45
+
+- Load, inspect, and de-duplicate approved project manifests on a worker thread before opening GitHub or Store selection windows, preventing synchronized or unavailable folders from blocking NVDA's main thread.
+- Keep GitHub publishing and Add-on Store selection dialogs independent, and distinguish Issues, repository-template, and template-file selection actions so another shortcut never raises the wrong window.
+- Reject unsupported GitHub YAML question types when moving from raw text to the accessible form instead of silently converting or discarding their properties.
+- Fully terminate a timed-out or interrupted GitHub CLI device sign-in process.
+- Refresh an existing information window with the newest result instead of silently retaining an unrelated older message.
+- Include an existing `Documents\Codex` workspace in bounded, isolated development-project discovery.
+
 ## 2026.2.44
 
 - Use each manifest's public summary throughout GitHub selection, inspection, branch, push, release, repair, error, and completion feedback instead of exposing its internal add-on ID.

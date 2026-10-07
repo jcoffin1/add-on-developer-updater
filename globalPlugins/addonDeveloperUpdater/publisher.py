@@ -101,6 +101,8 @@ class IssueTemplateDocument:
     data: dict
     markdown_body: str = ""
 
+SUPPORTED_ISSUE_FORM_TYPES = frozenset({"input", "textarea", "dropdown", "checkboxes", "markdown"})
+
 _ADDON_REPOSITORIES_QUERY = r"""
 query($endCursor: String) {
   viewer {
@@ -550,6 +552,18 @@ def parse_issue_template_document(template: GitHubIssueTemplate, content: str | 
         data = parsed; body = text[match.end():]
     return IssueTemplateDocument("markdown", data, body)
 
+def issue_template_form_supported(template: GitHubIssueTemplate, document: IssueTemplateDocument | None, content: str | None = None) -> bool:
+    """Return whether the accessible form can round-trip this template safely."""
+    text = template.content if content is None else content
+    if document is None or len(text.encode("utf-8")) > 256 * 1024 or template.name.casefold() in {"config.yml", "config.yaml"}:
+        return False
+    if document.kind == "markdown":
+        return True
+    if document.kind != "yaml":
+        return False
+    body = document.data.get("body", []) if isinstance(document.data, dict) else []
+    return isinstance(body, list) and all(isinstance(item, dict) and item.get("type") in SUPPORTED_ISSUE_FORM_TYPES for item in body)
+
 def render_issue_template_document(document: IssueTemplateDocument) -> str:
     """Render a form document as valid UTF-8 GitHub template text."""
     if document.kind == "yaml":
@@ -567,10 +581,10 @@ def validate_issue_template_document(template: GitHubIssueTemplate, document: Is
         if not isinstance(data.get(key), str) or not data[key].strip(): raise ValueError(f"The issue form requires a non-empty {key} field")
     body = data.get("body")
     if not isinstance(body, list) or not body: raise ValueError("The issue form requires at least one form question")
-    identifiers = set(); supported = {"input", "textarea", "dropdown", "checkboxes", "markdown"}
+    identifiers = set()
     for index, item in enumerate(body, 1):
         kind = item.get("type"); attributes = item.get("attributes")
-        if kind not in supported: raise ValueError(f"Question {index} has unsupported type {kind!r}")
+        if kind not in SUPPORTED_ISSUE_FORM_TYPES: raise ValueError(f"Question {index} has unsupported type {kind!r}")
         if not isinstance(attributes, dict): raise ValueError(f"Question {index} requires an attributes section")
         if kind == "markdown":
             if not isinstance(attributes.get("value"), str) or not attributes["value"].strip(): raise ValueError(f"Markdown item {index} requires text")
@@ -747,15 +761,27 @@ def login() -> None:
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
+    output = ""
     try:
         process.stdin.write("y\n"); process.stdin.flush(); time.sleep(0.5)
         process.stdin.write("\n"); process.stdin.flush(); time.sleep(0.5)
         try: os.startfile(GITHUB_DEVICE_URL)
         except OSError:
             if not webbrowser.open(GITHUB_DEVICE_URL): raise RuntimeError("The GitHub device sign-in page could not be opened")
-        process.stdin.close(); process.wait(timeout=600); output = process.stdout.read()
-    except subprocess.TimeoutExpired:
-        process.terminate(); raise RuntimeError("GitHub sign-in timed out after 10 minutes")
+        output, _unused = process.communicate(timeout=600)
+    except subprocess.TimeoutExpired as error:
+        process.terminate()
+        try: process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill(); process.wait(timeout=5)
+        raise RuntimeError("GitHub sign-in timed out after 10 minutes") from error
+    except Exception:
+        if process.poll() is None:
+            process.terminate()
+            try: process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill(); process.wait(timeout=5)
+        raise
     if process.returncode: raise RuntimeError((output or "GitHub login failed").strip()[-2000:])
     _run([gh, "auth", "status", "--active", "--hostname", "github.com"])
 

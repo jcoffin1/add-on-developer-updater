@@ -23,11 +23,8 @@ config.conf.spec["addonDeveloperUpdater"] = {
 }
 
 def _projectDisplayName(result):
-    """Read the public manifest summary while preserving the internal add-on ID."""
-    try:
-        return engine.values(Path(result.path)).get("summary") or result.name
-    except (OSError, TypeError, ValueError):
-        return result.name
+    """Return public metadata prepared by a worker without touching the filesystem."""
+    return str(getattr(result, "public_name", "") or getattr(result, "summary", "") or result.name)
 
 class UpdaterSettingsPanel(SettingsPanel):
     title = SCRIPT_CATEGORY
@@ -185,8 +182,7 @@ class IssueTemplateEditorDialog(wx.Dialog):
         super().__init__(parent, title=_("Edit GitHub issue template"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.template = template; self.onSave = None; self.onDelete = None; self._questionIndex = -1
         self.document = document
-        self.formSupported = self.document is not None and len(template.content.encode("utf-8")) <= 256 * 1024 and template.name.casefold() not in {"config.yml", "config.yaml"}
-        if self.formSupported and self.document.kind == "yaml": self.formSupported = all(item.get("type") in {"input", "textarea", "dropdown", "checkboxes", "markdown"} for item in self.document.data.get("body", []))
+        self.formSupported = publisher.issue_template_form_supported(template, self.document)
         mainSizer = wx.BoxSizer(wx.VERTICAL)
         mainSizer.Add(wx.StaticText(self, label=_("Editing %s in %s on branch %s. Use the Form tab for common fields or Raw text for advanced changes. Control+S saves after confirmation; Escape closes without saving.") % (template.name, repository.full_name, repository.default_branch)), 0, wx.ALL, 10)
         self.notebook = wx.Notebook(self)
@@ -323,6 +319,8 @@ class IssueTemplateEditorDialog(wx.Dialog):
             try: document = publisher.parse_issue_template_document(self.template, self.editor.GetValue())
             except (TypeError, ValueError) as error:
                 ui.message(_("The raw template cannot be shown as a form: %s") % error); event.Veto(); return
+            if not publisher.issue_template_form_supported(self.template, document, self.editor.GetValue()):
+                ui.message(_("This template contains a question type that the accessible form cannot safely edit. Continue editing it as raw text.")); event.Veto(); return
             self.document = document; self._populateForm()
         event.Skip()
     def getContent(self):
@@ -442,7 +440,7 @@ class OperationProgressDialog(wx.Dialog):
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     activeInstance = None
     def __init__(self):
-        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._progressDeterminate = False; self._scanTargetDialog = None; self._reviewDialog = None; self._approvalDialog = None; self._publishDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
+        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._progressDeterminate = False; self._scanTargetDialog = None; self._reviewDialog = None; self._approvalDialog = None; self._publishDialog = None; self._storeDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._githubSelectionAction = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
         config_path = Path(globalVars.appArgs.configPath); self._statePath = config_path / "addonDeveloperUpdaterState.json"; self._releaseCachePath = config_path / "addonDeveloperUpdaterReleaseCache.json"; self._apiVersionCachePath = config_path / "addonDeveloperUpdaterApiVersions.json"; self._backupRoot = config_path / "addonDeveloperUpdaterBackups"
         if config.conf["addonDeveloperUpdater"]["intervalMinutes"] < 15: config.conf["addonDeveloperUpdater"]["intervalMinutes"] = 15
         if UpdaterSettingsPanel not in gui.settingsDialogs.NVDASettingsDialog.categoryClasses: gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(UpdaterSettingsPanel)
@@ -525,10 +523,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._approvalDialog.Destroy(); self._approvalDialog = None
         if self._publishDialog is not None:
             self._publishDialog.Destroy(); self._publishDialog = None
+        if self._storeDialog is not None:
+            self._storeDialog.Destroy(); self._storeDialog = None
         if self._repositoryDialog is not None:
             self._repositoryDialog.Destroy(); self._repositoryDialog = None
         if self._githubSelectionDialog is not None:
-            self._githubSelectionDialog.Destroy(); self._githubSelectionDialog = None
+            self._githubSelectionDialog.Destroy(); self._githubSelectionDialog = None; self._githubSelectionAction = None
         if self._templateEditorDialog is not None:
             self._templateEditorDialog.Destroy(); self._templateEditorDialog = None
         if self._downgradeDialog is not None:
@@ -698,15 +698,13 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         ui.message(_("Add-on developer scan cancellation requested"))
     @scriptHandler.script(description=_("Submit updated add-ons to the NVDA Add-on Store"), gesture="kb:NVDA+alt+shift+s", category=SCRIPT_CATEGORY)
     def script_submitUpdatedAddons(self, gesture):
-        ready = self._approvedProjectResults(engine.read_json(self._statePath, {}))
-        if not ready: ui.message(_("No approved add-on development projects are available to check for store submission")); return
-        self._showStoreSubmissionDialog(ready)
+        self._beginApprovedProjectSelection("store")
     def _showStoreSubmissionDialog(self, ready):
-        if self._publishDialog is not None:
-            self._publishDialog.Raise(); self._publishDialog.checkList.SetFocus(); return
-        dialog = StoreSubmissionDialog(gui.mainFrame, ready); self._publishDialog = dialog
+        if self._storeDialog is not None:
+            self._storeDialog.Raise(); self._storeDialog.checkList.SetFocus(); return
+        dialog = StoreSubmissionDialog(gui.mainFrame, ready); self._storeDialog = dialog
         def close(_event=None):
-            if self._publishDialog is dialog: self._publishDialog = None
+            if self._storeDialog is dialog: self._storeDialog = None
             dialog.Destroy()
         def inspect(_event=None):
             selected = dialog.selectedResults()
@@ -720,15 +718,49 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         try: threading.Thread(target=self._storePreflight, args=(ready,), name="addonDeveloperStorePreflight", daemon=True).start()
         except Exception:
             self._stopProgress(); self._scanLock.release(); log.exception("Could not start store submission preflight"); ui.message(_("The store submission check could not be started"))
-    def _approvedProjectResults(self, state):
-        approved = engine.approved_project_ids(state); records = engine.newest_local_project_records(engine.visible_project_records(state)[0])[0]; ready = []
-        for item in records:
-            if not isinstance(item, dict) or item.get("project_id") not in approved: continue
-            try:
-                result = engine.ProjectResult(**item)
-                if Path(result.path).is_file(): ready.append(result)
-            except (OSError, TypeError, ValueError): pass
-        return ready
+    def _beginApprovedProjectSelection(self, action):
+        if action not in {"github", "store"}: return
+        existing = self._publishDialog if action == "github" else self._storeDialog
+        if existing is not None:
+            existing.Raise(); existing.checkList.SetFocus(); return
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        message = _("Loading approved add-ons for GitHub publishing") if action == "github" else _("Loading approved add-ons for store-submission review")
+        ui.message(message); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._loadApprovedProjectSelection, args=(action,), name="addonDeveloperProjectSelection", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start approved-project loading"); ui.message(_("Approved add-on projects could not be loaded"))
+    def _loadApprovedProjectSelection(self, action):
+        ready = []; ignoredCount = 0; olderCount = 0; errorMessage = ""
+        try:
+            state = engine.read_json(self._statePath, {}); records, ignored = engine.visible_project_records(state); records, older = engine.newest_local_project_records(records)
+            approved = engine.approved_project_ids(state)
+            for item in records:
+                if not isinstance(item, dict) or item.get("project_id") not in approved: continue
+                try:
+                    result = engine.ProjectResult(**item); path = Path(result.path)
+                    if not path.is_file(): continue
+                    metadata = engine.values(path); result.public_name = metadata.get("summary") or result.name; ready.append(result)
+                except (OSError, TypeError, ValueError):
+                    log.exception("Could not load approved project metadata for %s", item.get("path"))
+            ignoredCount = len(ignored); olderCount = len(older)
+            if action == "github" and ignored:
+                saved = set(state.get("ignoredProjects", [])) if isinstance(state.get("ignoredProjects"), list) else set()
+                if ignored != saved: state["ignoredProjects"] = sorted(ignored); engine.atomic_json_write(self._statePath, state)
+        except Exception as error:
+            log.exception("Approved-project loading failed"); errorMessage = str(error)
+        finally:
+            self._scanLock.release(); self._finishProgressThen(self._finishApprovedProjectSelection, action, ready, ignoredCount, olderCount, errorMessage)
+    def _finishApprovedProjectSelection(self, action, ready, ignoredCount, olderCount, errorMessage=""):
+        if errorMessage:
+            self._showInformation(_("Approved projects could not be loaded"), _("Approved add-on projects could not be loaded: %s") % errorMessage); return
+        if not ready:
+            message = _("No approved add-on development projects are available to publish to GitHub") if action == "github" else _("No approved add-on development projects are available to check for store submission")
+            ui.message(message); return
+        if action == "github":
+            if ignoredCount: ui.message(_("Ignored %d duplicate Codex work copies because primary development copies are available") % ignoredCount)
+            if olderCount: ui.message(_("Ignored %d older local add-on copies. Only the newest local version of each add-on is available for GitHub publishing.") % olderCount)
+            self._showGitHubPublishDialog(ready)
+        else: self._showStoreSubmissionDialog(ready)
     def _storePreflight(self, ready):
         callback = None; arguments = ()
         try:
@@ -797,22 +829,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self._showConfirmation(_("Submit add-ons to the NVDA Add-on Store"), message, submit, onNo=lambda: self._showGitHubResult(_("Store submission was canceled. No store pages were opened. Press OK to exit.")))
     @scriptHandler.script(description=_("Publish updated add-ons to GitHub and optionally create releases"), gestures=("kb:NVDA+alt+g", "kb:NVDA+alt+shift+g"), category=SCRIPT_CATEGORY)
     def script_publishUpdatedAddonsToGitHub(self, gesture):
-        state = engine.read_json(self._statePath, {}); ready = []; approved = engine.approved_project_ids(state); records, ignored = engine.visible_project_records(state)
-        records, older = engine.newest_local_project_records(records)
-        for item in records:
-            if not isinstance(item, dict) or item.get("project_id") not in approved: continue
-            try:
-                result = engine.ProjectResult(**item)
-                if Path(result.path).is_file(): ready.append(result)
-            except (OSError, TypeError, ValueError): pass
-        if not ready: ui.message(_("No approved add-on development projects are available to publish to GitHub")); return
-        if ignored:
-            saved = set(state.get("ignoredProjects", [])) if isinstance(state.get("ignoredProjects"), list) else set()
-            if ignored != saved: state["ignoredProjects"] = sorted(ignored); engine.atomic_json_write(self._statePath, state)
-            ui.message(_("Ignored %d duplicate Codex work copies because primary development copies are available") % len(ignored))
-        if older:
-            ui.message(_("Ignored %d older local add-on copies. Only the newest local version of each add-on is available for GitHub publishing.") % len(older))
-        self._showGitHubPublishDialog(ready)
+        self._beginApprovedProjectSelection("github")
     @scriptHandler.script(description=_("Copy a download or repository link for a released NVDA add-on"), gesture="kb:NVDA+alt+shift+f", category=SCRIPT_CATEGORY)
     def script_copyGitHubAddonRepositoryUrl(self, gesture):
         if self._repositoryDialog is not None:
@@ -889,9 +906,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _beginGitHubProjectAction(self, action):
         if action not in {"issues", "templates"}: return
         if self._githubSelectionDialog is not None:
-            self._githubSelectionDialog.Raise(); self._githubSelectionDialog.itemList.SetFocus(); return
+            if self._githubSelectionAction == action:
+                self._githubSelectionDialog.Raise(); self._githubSelectionDialog.itemList.SetFocus(); return
+            dialog = self._githubSelectionDialog; self._githubSelectionDialog = None; self._githubSelectionAction = None; dialog.Destroy()
         if self._templateEditorDialog is not None:
-            self._templateEditorDialog.Raise(); self._templateEditorDialog.initialFocus().SetFocus(); return
+            self._templateEditorDialog.Raise(); self._templateEditorDialog.initialFocus().SetFocus(); ui.message(_("Close the open issue-template editor before starting another repository action")); return
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
         message = _("Loading add-on repositories and Issues settings from GitHub") if action == "issues" else _("Loading add-on repositories and issue templates from GitHub")
         ui.message(message); self._startProgress(keepFocus=True)
@@ -924,9 +943,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         title = _("Open an add-on repository's Issues page") if action == "issues" else _("Choose a repository whose issue template should be edited")
         instruction = _("Select a repository owned by %s. Press Enter to continue or Escape to close.") % owner
         actionLabel = _("&Open Issues") if action == "issues" else _("&Choose repository")
-        dialog = GitHubSingleSelectionDialog(gui.mainFrame, title, instruction, repositories, choices, actionLabel); self._githubSelectionDialog = dialog
+        dialog = GitHubSingleSelectionDialog(gui.mainFrame, title, instruction, repositories, choices, actionLabel); self._githubSelectionDialog = dialog; self._githubSelectionAction = action
         def close(_event=None):
-            if self._githubSelectionDialog is dialog: self._githubSelectionDialog = None
+            if self._githubSelectionDialog is dialog: self._githubSelectionDialog = None; self._githubSelectionAction = None
             dialog.Destroy()
         def act(_event=None):
             repository = dialog.selectedItem()
@@ -970,9 +989,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if callback is not None: self._finishProgressThen(callback, *arguments)
     def _showIssueTemplateDialog(self, repository, templates):
         choices = [_('%s; path %s') % (template.name, template.path) for template in templates]
-        dialog = GitHubSingleSelectionDialog(gui.mainFrame, _("Choose a GitHub issue template"), _("Select an issue template from %s and press Enter to edit it.") % repository.full_name, templates, choices, _("&Edit template")); self._githubSelectionDialog = dialog
+        dialog = GitHubSingleSelectionDialog(gui.mainFrame, _("Choose a GitHub issue template"), _("Select an issue template from %s and press Enter to edit it.") % repository.full_name, templates, choices, _("&Edit template")); self._githubSelectionDialog = dialog; self._githubSelectionAction = "template-file"
         def close(_event=None):
-            if self._githubSelectionDialog is dialog: self._githubSelectionDialog = None
+            if self._githubSelectionDialog is dialog: self._githubSelectionDialog = None; self._githubSelectionAction = None
             dialog.Destroy()
         def edit(_event=None):
             template = dialog.selectedItem()
@@ -1174,7 +1193,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         dialog.onStart = start; dialog.startButton.Bind(wx.EVT_BUTTON, start); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close); dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.targetList.SetFocus)
     def _rootStrings(self):
         settings = config.conf["addonDeveloperUpdater"]
-        roots = [str(Path.home() / "Documents" / "NVDA Add-on Development" / "Add-ons")]
+        roots = [str(Path.home() / "Documents" / "NVDA Add-on Development" / "Add-ons"), str(Path.home() / "Documents" / "Codex")]
         for variable in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial", "Dropbox", "GoogleDrive", "iCloudDrive"):
             if value := os.environ.get(variable): roots.append(value)
         roots.extend(str(Path.home() / name) for name in ("OneDrive", "Dropbox", "Google Drive", "iCloudDrive"))
@@ -1352,7 +1371,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         dialog.yesButton.Bind(wx.EVT_BUTTON, yes); dialog.noButton.Bind(wx.EVT_BUTTON, no); dialog.Bind(wx.EVT_CLOSE, close)
         dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.defaultButton.SetFocus)
     def _showInformation(self, title, message):
-        if self._informationDialog is not None: self._informationDialog.Raise(); return
+        if self._informationDialog is not None:
+            self._informationDialog.SetTitle(title); self._informationDialog.message.SetValue(message); self._informationDialog.message.SetInsertionPoint(0); self._informationDialog.Raise(); self._informationDialog.okButton.SetFocus(); return
         dialog = InformationDialog(gui.mainFrame, title, message); self._informationDialog = dialog
         def close(_event=None):
             if self._informationDialog is dialog: self._informationDialog = None

@@ -37,6 +37,9 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 - Confirm no push or release occurs before its explicit confirmation.
 - Confirm matching local and GitHub versions produce one clear current-release message.
 - Confirm a project whose public summary differs from its internal manifest name uses the public name in every GitHub selection, progress message, confirmation, error, and completion dialog.
+- Open GitHub and Store selection in either order; confirm each shortcut opens or returns to its own correctly titled window and that project metadata loads without blocking speech or braille.
+- From raw YAML, add an unsupported issue-form question type and confirm the editor refuses to reopen the Form tab without changing the raw text.
+- Simulate a GitHub device-login timeout and confirm the hidden GitHub CLI process is terminated before the failure is reported.
 - With braille connected, confirm the focused progress field changes at every GitHub stage instead of retaining the preceding stage's text.
 - Confirm a historical matching version is recognized without attempting to recreate its release, and a matching release with a missing asset offers a repair rather than a duplicate tag.
 - Make an uncommitted change without incrementing an already released manifest version; confirm publishing stops before staging and explains that the version must be incremented.

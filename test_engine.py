@@ -156,6 +156,12 @@ class EngineTests(unittest.TestCase):
             manifest = self.make_project(folder); self.assertEqual([manifest.resolve()], engine.discover_manifests([Path(folder)]))
             result = engine.update(manifest, engine.Release("2026.2beta1", "2026.2", True, ""), Path(folder) / "backups")
             self.assertTrue(result.status.startswith("update available")); self.assertIn("2025.4", manifest.read_text())
+    def test_default_development_roots_include_the_codex_workspace(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder); codex = home / "Documents" / "Codex"; codex.mkdir(parents=True)
+            with mock.patch.object(engine.Path, "home", return_value=home), mock.patch.object(engine, "cloud_roots", return_value=[]):
+                roots = engine.default_development_roots()
+        self.assertIn(codex, roots)
     def test_non_project_and_runtime_test_are_ignored(self):
         with tempfile.TemporaryDirectory() as folder:
             plain = Path(folder) / "plain"; plain.mkdir(); (plain / "manifest.ini").write_text(MANIFEST)
@@ -1016,6 +1022,43 @@ class EngineTests(unittest.TestCase):
         publisher.validate_issue_template_document(template, document)
         rendered = publisher.render_issue_template_document(document)
         self.assertIn("- 'Yes'", rendered)
+
+    def test_accessible_issue_form_rejects_unsupported_question_types(self):
+        supported = publisher.GitHubIssueTemplate(".github/ISSUE_TEMPLATE/bug.yml", "bug.yml", "sha", "name: Bug\ndescription: Report\nbody:\n  - type: input\n    id: summary\n    attributes:\n      label: Summary\n")
+        unsupported_text = "name: Bug\ndescription: Report\nbody:\n  - type: custom-widget\n    id: summary\n    attributes:\n      label: Summary\n"
+        unsupported = publisher.GitHubIssueTemplate(supported.path, supported.name, "sha", unsupported_text)
+        self.assertTrue(publisher.issue_template_form_supported(supported, publisher.parse_issue_template_document(supported)))
+        self.assertFalse(publisher.issue_template_form_supported(unsupported, publisher.parse_issue_template_document(unsupported)))
+        self.assertFalse(publisher.issue_template_form_supported(supported, publisher.parse_issue_template_document(supported), "x" * (256 * 1024 + 1)))
+
+    def test_github_login_timeout_terminates_and_kills_the_cli(self):
+        class Input:
+            def write(self, _text): return None
+            def flush(self): return None
+        class Process:
+            def __init__(self): self.stdin = Input(); self.returncode = None; self.terminated = False; self.killed = False; self.waits = 0
+            def communicate(self, timeout=None): raise subprocess.TimeoutExpired("gh", timeout)
+            def terminate(self): self.terminated = True
+            def wait(self, timeout=None):
+                self.waits += 1
+                if not self.killed: raise subprocess.TimeoutExpired("gh", timeout)
+                self.returncode = -9; return self.returncode
+            def kill(self): self.killed = True
+            def poll(self): return None
+        process = Process()
+        with mock.patch.object(publisher, "gh_path", return_value="gh.exe"), mock.patch.object(publisher.subprocess, "Popen", return_value=process), mock.patch.object(publisher.os, "startfile"), mock.patch.object(publisher.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                publisher.login()
+        self.assertTrue(process.terminated); self.assertTrue(process.killed); self.assertEqual(2, process.waits)
+
+    def test_keyboard_project_selection_is_async_and_dialogs_are_independent(self):
+        source = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        display_helper = source[source.index("def _projectDisplayName"):source.index("class UpdaterSettingsPanel")]
+        self.assertNotIn("engine.values", display_helper)
+        self.assertIn('self._beginApprovedProjectSelection("github")', source)
+        self.assertIn('self._beginApprovedProjectSelection("store")', source)
+        self.assertIn("self._storeDialog", source)
+        self.assertIn("self._githubSelectionAction", source)
 
     def test_markdown_issue_template_form_preserves_body(self):
         content = "---\nname: Bug\nabout: Report a bug\ntitle: ''\nlabels: bug\nassignees: ''\n---\n## Steps\nTell us what happened.\n"

@@ -442,7 +442,7 @@ def cloud_roots() -> list[Path]:
     return candidates
 
 def default_development_roots() -> list[Path]:
-    return [p for p in [Path.home() / "Documents" / "NVDA Add-on Development" / "Add-ons", *cloud_roots()] if p.exists()]
+    return [p for p in [Path.home() / "Documents" / "NVDA Add-on Development" / "Add-ons", Path.home() / "Documents" / "Codex", *cloud_roots()] if p.exists()]
 
 def is_offline(path: Path) -> bool:
     try:
