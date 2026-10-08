@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import base64, io, json, os, re, shutil, subprocess, tempfile, time, urllib.parse, urllib.request, webbrowser, zipfile
+import base64, hashlib, io, json, os, re, shutil, stat, subprocess, tempfile, threading, time, urllib.parse, urllib.request, webbrowser, zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,6 +43,43 @@ class AuthenticationRequired(RuntimeError):
 class GitHubCliRequired(RuntimeError):
     pass
 
+
+_PROCESS_LOCK = threading.Lock()
+_ACTIVE_PROCESSES = set()
+
+
+def _track_process(process) -> None:
+    with _PROCESS_LOCK:
+        _ACTIVE_PROCESSES.add(process)
+
+
+def _untrack_process(process) -> None:
+    with _PROCESS_LOCK:
+        _ACTIVE_PROCESSES.discard(process)
+
+
+def _terminate_process(process, timeout: float = 1.0) -> None:
+    try:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try: process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired: pass
+    except OSError:
+        pass
+
+
+def cancel_running_commands() -> None:
+    """Stop GitHub and project-builder commands when the add-on terminates."""
+    with _PROCESS_LOCK:
+        processes = list(_ACTIVE_PROCESSES)
+    for process in processes:
+        _terminate_process(process)
+
 @dataclass
 class ProjectPublishInfo:
     project_id: str
@@ -70,6 +107,8 @@ class ProjectPublishInfo:
     matching_release_package_verified: bool = True
     matching_release_package_error: str = ""
     matching_release_targets_head: bool = True
+    unpushed_check_error: str = ""
+    source_fingerprint: str = ""
 
 @dataclass(frozen=True)
 class GitHubAddonRepository:
@@ -176,6 +215,7 @@ def store_readiness_reasons(report: ProjectPublishInfo) -> list[str]:
         reasons.append(report.release_package_error or "release package manifest could not be verified")
     if report.changed_files: reasons.append(f"{report.changed_files} local changed {'file is' if report.changed_files == 1 else 'files are'} not included in the release")
     if report.unpushed_commits: reasons.append(f"{report.unpushed_commits} local commits are not pushed")
+    if report.unpushed_check_error: reasons.append(report.unpushed_check_error)
     if report.matching_release_tag and not report.matching_release_targets_head:
         reasons.append(f"GitHub Release {report.matching_release_tag} points to an older commit; increment the manifest version before releasing the current code")
     reasons.extend(report.store_guideline_issues)
@@ -359,17 +399,74 @@ def _manifest_github_remote(metadata: dict) -> str:
         if value.startswith("https://github.com/") or value.startswith("git@github.com:"): return value
     return ""
 
+def _command_failure_detail(stdout: str | None, stderr: str | None, limit: int = 1800) -> str:
+    """Keep useful, bounded tails from both output streams."""
+    streams = []
+    for label, value in (("Output", stdout), ("Error output", stderr)):
+        if not value or not value.strip():
+            continue
+        useful = "\n".join(
+            line for line in value.strip().splitlines()
+            if not re.search(r"\s\.\.\.\s+ok\s*$", line)
+        ).strip()
+        streams.append((label, useful or value.strip()))
+    if not streams:
+        return "the command returned no error details"
+    stream_limit = max(200, (limit - (40 * len(streams))) // len(streams))
+    excerpts = []
+    for label, value in streams:
+        if len(value) > stream_limit:
+            value = "... earlier command output omitted ...\n" + value[-stream_limit:]
+        excerpts.append(f"{label}:\n{value}")
+    return "\n".join(excerpts)
+
+
 def _run(arguments: list[str], cwd: Path | None = None, input_text: str | None = None) -> str:
-    completed = subprocess.run(arguments, cwd=cwd, input=input_text, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    if completed.returncode:
-        detail = (completed.stderr or completed.stdout).strip()
-        raise RuntimeError(f"{Path(arguments[0]).name} failed: {detail}"[:2000])
-    return completed.stdout.strip()
+    process = subprocess.Popen(arguments, cwd=cwd, stdin=subprocess.PIPE if input_text is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    _track_process(process)
+    try:
+        try:
+            stdout, stderr = process.communicate(input_text, timeout=180)
+        except subprocess.TimeoutExpired as error:
+            _terminate_process(process)
+            raise RuntimeError(f"{Path(arguments[0]).name} exceeded the 180-second safety limit") from error
+    finally:
+        _untrack_process(process)
+    if process.returncode:
+        detail = _command_failure_detail(stdout, stderr)
+        raise RuntimeError(f"{Path(arguments[0]).name} failed with exit code {process.returncode}:\n{detail}")
+    return (stdout or "").strip()
+
+def _archive_structure_error(archive: zipfile.ZipFile) -> str:
+    """Reject archive names that are unsafe or ambiguous on common filesystems."""
+    names = set()
+    manifest_count = 0
+    for info in archive.infolist():
+        raw = info.filename
+        normalized = raw.replace("\\", "/")
+        parts = normalized.split("/")
+        if not raw or normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized) or any(part == ".." for part in parts):
+            return f"release package contains unsafe path {raw or '<empty>'}"
+        key = normalized.rstrip("/").casefold()
+        if key in names:
+            return f"release package contains duplicate or case-colliding path {raw}"
+        names.add(key)
+        if normalized == "manifest.ini":
+            manifest_count += 1
+        if stat.S_IFMT(info.external_attr >> 16) == stat.S_IFLNK:
+            return f"release package contains unsupported symbolic link {raw}"
+    if manifest_count != 1:
+        return "release package must contain exactly one root manifest.ini"
+    return ""
+
 
 def _verify_release_payload(payload: bytes, expected_name: str, expected_version: str, api_versions=None, submission_channel="") -> tuple[bool, str, tuple[str, ...]]:
     """Verify the archive that will be, or already was, published."""
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            structure_error = _archive_structure_error(archive)
+            if structure_error:
+                return False, structure_error, ()
             info = archive.getinfo("manifest.ini")
             if info.file_size > 1024 * 1024: return False, "release package manifest is unexpectedly large", ()
             manifest = archive.read(info).decode("utf-8-sig")
@@ -626,9 +723,30 @@ def _select_publish_remote(remotes: dict[str, str], authenticated_owner: str) ->
                 return name, url
         except RuntimeError:
             continue
-    if "origin" in remotes:
-        return "origin", remotes["origin"]
-    return next(iter(remotes.items()), ("", ""))
+    supported = {}
+    for name, url in remotes.items():
+        try:
+            _remote_web_url(url)
+        except RuntimeError:
+            continue
+        supported[name] = url
+    if "origin" in supported:
+        return "origin", supported["origin"]
+    return next(iter(supported.items()), ("", ""))
+
+
+def _matching_remote_name(remotes: dict[str, str], target: str) -> str:
+    try:
+        target_url = _remote_web_url(target).casefold()
+    except RuntimeError:
+        return ""
+    for name, url in remotes.items():
+        try:
+            if _remote_web_url(url).casefold() == target_url:
+                return name
+        except RuntimeError:
+            continue
+    return ""
 
 def _sensitive_files(root: Path) -> list[str]:
     names = _git(root, "ls-files", "-co", "--exclude-standard", "-z").split("\0")
@@ -644,7 +762,57 @@ def _is_generated_path(relative: str) -> bool:
 
 def _publishable_paths(root: Path) -> list[str]:
     names = _git(root, "ls-files", "-m", "-d", "-o", "--exclude-standard", "-z").split("\0")
-    return [name for name in filter(None, names) if not _is_generated_path(name)]
+    names += _git(root, "diff", "--cached", "--name-only", "-z").split("\0")
+    return sorted({name for name in filter(None, names) if not _is_generated_path(name)})
+
+
+def _staged_paths(root: Path) -> list[str]:
+    return [name for name in _git(root, "diff", "--cached", "--name-only", "-z").split("\0") if name]
+
+
+def _has_staged_changes(root: Path, display_name: str) -> bool:
+    completed = subprocess.run(["git", "-C", str(root), "diff", "--cached", "--quiet"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if completed.returncode not in {0, 1}:
+        detail = _command_failure_detail(completed.stdout, completed.stderr)
+        raise RuntimeError(f"Git could not inspect staged changes for {display_name} (exit code {completed.returncode}): {detail}")
+    return completed.returncode == 1
+
+
+def _source_fingerprint(root: Path, has_git: bool | None = None) -> str:
+    """Hash publishable source so a builder or concurrent edit cannot bypass review."""
+    if has_git is None:
+        has_git = (root / ".git").exists()
+    if has_git:
+        names = [name for name in _git(root, "ls-files", "-co", "--exclude-standard", "-z").split("\0") if name]
+        paths = [(name, root / name) for name in names if not _is_generated_path(name)]
+    else:
+        paths = []
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            if ".git" in Path(relative).parts or _is_generated_path(relative):
+                continue
+            paths.append((relative, path))
+    digest = hashlib.sha256()
+    for relative, path in sorted(paths, key=lambda item: item[0].casefold()):
+        digest.update(relative.replace("\\", "/").encode("utf-8", "surrogatepass")); digest.update(b"\0")
+        try:
+            if path.is_symlink():
+                digest.update(b"link\0" + os.readlink(path).encode("utf-8", "surrogatepass"))
+            else:
+                with path.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+        except OSError as error:
+            digest.update(f"unreadable:{error.__class__.__name__}".encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _require_source_fingerprint(root: Path, expected: str, has_git: bool, display_name: str) -> None:
+    if expected and _source_fingerprint(root, has_git) != expected:
+        raise RuntimeError(f"{display_name} source files changed after the publishing review; run the GitHub command again so the final files are reviewed and tested")
 
 def _release_asset_urls(gh: str, remote: str, tag: str) -> list[str]:
     if not tag:
@@ -655,6 +823,21 @@ def _release_asset_urls(gh: str, remote: str, tag: str) -> list[str]:
         for asset in payload.get("assets") or []
         if isinstance(asset, dict) and str(asset.get("name") or "").casefold().endswith(".nvda-addon") and asset.get("url")
     ]
+
+
+def _unpushed_status(root: Path, remote_name: str, default_branch: str) -> tuple[int, str]:
+    """Return a proven unpushed count, or an explicit verification blocker."""
+    try:
+        return int(_git(root, "rev-list", "--count", "@{upstream}..HEAD") or "0"), ""
+    except (RuntimeError, ValueError):
+        try:
+            if not remote_name or not default_branch:
+                raise RuntimeError("the selected GitHub remote or its default branch is unknown")
+            comparison = f"refs/remotes/{remote_name}/{default_branch}"
+            _git(root, "fetch", "--no-tags", remote_name, f"+refs/heads/{default_branch}:{comparison}")
+            return int(_git(root, "rev-list", "--count", f"{comparison}..HEAD") or "0"), ""
+        except (RuntimeError, ValueError) as error:
+            return 0, f"local commit publication could not be verified: {error}"
 
 def _verify_first_release_asset(urls: list[str], metadata: dict, api_versions: dict, channel: str) -> tuple[str, bool, str, tuple[str, ...]]:
     if not urls:
@@ -723,20 +906,9 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
         else: github_release = ""
         changed = len(_publishable_paths(root)) if has_git else len([name for name in names if not _is_generated_path(name)])
         unpushed = 0
+        unpushed_error = ""
         if has_git and remote:
-            try: unpushed = int(_git(root, "rev-list", "--count", "@{upstream}..HEAD") or "0")
-            except (RuntimeError, ValueError):
-                try:
-                    # A topic branch may have been deleted after its commit was merged.
-                    # Do not label the repository's entire history as unpushed merely
-                    # because that local branch no longer has an upstream.
-                    containing = _git(root, "branch", "--remotes", "--contains", "HEAD")
-                    if containing:
-                        unpushed = 0
-                    else:
-                        comparison = f"refs/remotes/{remote_name}/{default_branch}" if remote_name and default_branch else f"refs/remotes/{remote_name}/HEAD"
-                        unpushed = int(_git(root, "rev-list", "--count", f"{comparison}..HEAD") or "0")
-                except (RuntimeError, ValueError): unpushed = 0
+            unpushed, unpushed_error = _unpushed_status(root, remote_name, default_branch)
         owned = not remote or repository_owner(remote).casefold() == authenticated_owner.casefold()
         api_details = api_versions.get(metadata.get("lasttestednvdaversion", ""), {})
         version_lower = metadata.get("version", "").casefold()
@@ -751,7 +923,7 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
                 matching_download, matching_verified, matching_error = release_download, package_verified, package_error
             else:
                 matching_download, matching_verified, matching_error, _matching_issues = _verify_first_release_asset(matching_urls, metadata, api_versions, channel)
-        reports.append(ProjectPublishInfo(project.project_id, project.name, str(manifest), str(root), metadata.get("version", ""), metadata.get("summary", project.name), metadata.get("author", ""), remote, changed, has_git, unpushed, normalized_version(github_release), release_download, owned, package_verified, package_error, guideline_issues, channel, default_branch, current_branch, matching_tag, matching_download, matching_verified, matching_error, matching_targets_head))
+        reports.append(ProjectPublishInfo(project.project_id, project.name, str(manifest), str(root), metadata.get("version", ""), metadata.get("summary", project.name), metadata.get("author", ""), remote, changed, has_git, unpushed, normalized_version(github_release), release_download, owned, package_verified, package_error, guideline_issues, channel, default_branch, current_branch, matching_tag, matching_download, matching_verified, matching_error, matching_targets_head, unpushed_error, _source_fingerprint(root, has_git)))
     return reports
 
 def login() -> None:
@@ -761,27 +933,23 @@ def login() -> None:
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    output = ""
+    _track_process(process); output = ""
     try:
-        process.stdin.write("y\n"); process.stdin.flush(); time.sleep(0.5)
-        process.stdin.write("\n"); process.stdin.flush(); time.sleep(0.5)
-        try: os.startfile(GITHUB_DEVICE_URL)
-        except OSError:
-            if not webbrowser.open(GITHUB_DEVICE_URL): raise RuntimeError("The GitHub device sign-in page could not be opened")
-        output, _unused = process.communicate(timeout=600)
-    except subprocess.TimeoutExpired as error:
-        process.terminate()
-        try: process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill(); process.wait(timeout=5)
-        raise RuntimeError("GitHub sign-in timed out after 10 minutes") from error
-    except Exception:
-        if process.poll() is None:
-            process.terminate()
-            try: process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill(); process.wait(timeout=5)
-        raise
+        try:
+            process.stdin.write("y\n"); process.stdin.flush(); time.sleep(0.5)
+            process.stdin.write("\n"); process.stdin.flush(); time.sleep(0.5)
+            try: os.startfile(GITHUB_DEVICE_URL)
+            except OSError:
+                if not webbrowser.open(GITHUB_DEVICE_URL): raise RuntimeError("The GitHub device sign-in page could not be opened")
+            output, _unused = process.communicate(timeout=600)
+        except subprocess.TimeoutExpired as error:
+            _terminate_process(process, 5)
+            raise RuntimeError("GitHub sign-in timed out after 10 minutes") from error
+        except Exception:
+            _terminate_process(process, 5)
+            raise
+    finally:
+        _untrack_process(process)
     if process.returncode: raise RuntimeError((output or "GitHub login failed").strip()[-2000:])
     _run([gh, "auth", "status", "--active", "--hostname", "github.com"])
 
@@ -854,34 +1022,43 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
             raise RuntimeError(f"{display_name} version {report.version} already has a GitHub Release that does not include the current local changes. Increment the manifest version before publishing the current code")
         if progress: progress(f"Preparing {display_name}, project {index} of {len(reports)}")
         root = Path(report.root)
-        if not report.has_git:
-            if progress: progress(f"Creating local Git repository for {display_name}")
-            _run(["git", "init", "-b", "main"], root)
-        branch = _git(root, "branch", "--show-current").strip()
+        _require_source_fingerprint(root, report.source_fingerprint, report.has_git, display_name)
+        if report.has_git:
+            unsafe = _sensitive_files(root)
+            branch = _git(root, "branch", "--show-current").strip()
+            staged_excluded = [name for name in _staged_paths(root) if _is_generated_path(name)]
+        else:
+            names = [path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()]
+            unsafe = [name for name in names if _is_sensitive_path(name)]
+            branch = "main"; staged_excluded = []
+        if unsafe:
+            raise RuntimeError(f"{display_name} gained files that may hold credentials after the publishing review: {', '.join(unsafe[:5])}")
         if not branch:
             raise RuntimeError(f"{display_name} is using a detached Git HEAD; check out the branch to publish before continuing")
         if report.has_git and report.current_branch and branch != report.current_branch:
             raise RuntimeError(f"{display_name} changed branches after the publishing review, from {report.current_branch} to {branch}; run the command again")
-        unsafe = _sensitive_files(root)
-        if unsafe:
-            raise RuntimeError(f"{display_name} gained files that may hold credentials after the publishing review: {', '.join(unsafe[:5])}")
+        if staged_excluded:
+            raise RuntimeError(f"{display_name} has generated files already staged in Git: {', '.join(staged_excluded[:5])}; unstage them before publishing")
+        if not report.has_git:
+            if progress: progress(f"Creating local Git repository for {display_name}")
+            _run(["git", "init", "-b", "main"], root)
+        publishable_paths = _publishable_paths(root)
+        if publishable_paths:
+            _git(root, "add", "--all", "--", *publishable_paths)
+        staged = _has_staged_changes(root, display_name)
+        if staged:
+            if progress: progress(f"Committing changes for {display_name}")
+            _git(root, "commit", "-m", "Prepare NVDA add-on store release")
         push_remote = ""
         if report.remote:
             remotes = _repository_remotes(root)
-            push_remote = next((name for name, url in remotes.items() if _remote_web_url(url).casefold() == _remote_web_url(report.remote).casefold()), "")
+            push_remote = _matching_remote_name(remotes, report.remote)
             if not push_remote:
                 push_remote = "publisher"
                 suffix = 2
                 while push_remote in remotes:
                     push_remote = f"publisher{suffix}"; suffix += 1
                 _git(root, "remote", "add", push_remote, report.remote)
-        publishable_paths = _publishable_paths(root)
-        if publishable_paths:
-            _git(root, "add", "--all", "--", *publishable_paths)
-        staged = subprocess.run(["git", "-C", str(root), "diff", "--cached", "--quiet"], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode != 0
-        if staged:
-            if progress: progress(f"Committing changes for {display_name}")
-            _git(root, "commit", "-m", "Prepare NVDA add-on store release")
         remote = report.remote
         if not remote:
             if progress: progress(f"Finding or creating a public GitHub repository for {display_name}")
@@ -984,7 +1161,10 @@ def build_release_package(item: dict, output_folder: Path) -> Path:
         path.resolve(): (path.stat().st_mtime_ns, path.stat().st_size)
         for path in outputs.glob("*.nvda-addon")
     } if outputs.is_dir() else {}
+    before_build = _source_fingerprint(source)
     _run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(build_script), "-Version", str(item["version"])], cwd=source)
+    if _source_fingerprint(source) != before_build:
+        raise RuntimeError(f"The project builder for {item['name']} changed source files; review those changes and run publishing again")
     candidates = [
         path for path in outputs.glob("*.nvda-addon")
         if str(item["version"]).casefold() in path.name.casefold()

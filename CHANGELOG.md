@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026.2.46
+
+- Show the decisive end of failed build and command output instead of the beginning of verbose passing-test output.
+- Preserve useful text from both standard output and standard error so release-build failures identify the check that actually needs attention.
+- Label failed publishing dialogs as failures instead of saying publishing completed.
+- Ignore unsupported local-only Git remotes while finding the correct GitHub repository, including repositories with both local and GitHub remotes.
+- Count staged-only source changes, reject staged generated packages, and distinguish real Git inspection errors from ordinary staged differences.
+- Stop publication when commit status cannot be verified instead of treating an unknown result as fully pushed.
+- Fingerprint reviewed source and stop if files change before push or if a project builder modifies source during release validation.
+- Reject release archives containing traversal, absolute, duplicate, case-colliding, or symbolic-link paths.
+- Keep saved project filtering free of manifest reads on NVDA's main thread, serialize saved GitHub release metadata with the publishing preflight, and report state-save failures after compatibility changes.
+- Make selected manifest application cancellable and stop tracked GitHub or project-builder processes when the add-on terminates.
+
 ## 2026.2.45
 
 - Load, inspect, and de-duplicate approved project manifests on a worker thread before opening GitHub or Store selection windows, preventing synchronized or unavailable folders from blocking NVDA's main thread.

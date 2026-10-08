@@ -44,6 +44,7 @@ class ProjectResult:
     minimum_version: str = ""
     branch: str = ""
     manifest_changed: bool = False
+    addon_version: str = ""
 
 @dataclass(frozen=True)
 class CompatibilityTargetProject:
@@ -518,6 +519,11 @@ def approved_project_ids(state: dict) -> set[str]:
         except (OSError, TypeError, ValueError): pass
     return approved
 
+
+def saved_approved_project_ids(state: dict) -> set[str]:
+    """Return saved IDs without resolving paths; safe for NVDA's main thread."""
+    return set(state.get("approvedProjects", [])) if isinstance(state, dict) and isinstance(state.get("approvedProjects"), list) else set()
+
 def path_kind(path: str) -> str:
     normalized = os.path.normcase(os.path.abspath(path)).replace("/", "\\")
     if "\\documents\\nvda add-on development\\add-ons\\" in normalized: return "primary"
@@ -534,10 +540,11 @@ def duplicate_codex_work_copy_ids(projects: list[dict]) -> set[str]:
         primary = [item for item in items if path_kind(item["path"]) == "primary"]
         if not primary: continue
         def local_version(item):
-            try: return addon_version_key(values(Path(item["path"])).get("version", ""))
-            except (OSError, UnicodeError, ValueError): return addon_version_key("")
-        newest_primary = max(local_version(item) for item in primary)
-        ignored.update(item["project_id"] for item in items if path_kind(item["path"]) == "codex" and local_version(item) <= newest_primary)
+            return addon_version_key(item.get("addon_version", ""))
+        known_primary = [item for item in primary if item.get("addon_version")]
+        if not known_primary: continue
+        newest_primary = max(local_version(item) for item in known_primary)
+        ignored.update(item["project_id"] for item in items if path_kind(item["path"]) == "codex" and item.get("addon_version") and local_version(item) <= newest_primary)
     return ignored
 
 def ignored_project_ids(state: dict) -> set[str]:
@@ -579,11 +586,9 @@ def newest_local_project_records(projects: list[dict]) -> tuple[list[dict], list
     path_priority = {"codex": 0, "other": 1, "primary": 2}
     for item in projects:
         if not isinstance(item, dict) or not item.get("path"): continue
-        try: metadata = values(Path(item["path"]))
-        except (OSError, UnicodeError, ValueError): metadata = {}
-        name = str(metadata.get("name") or item.get("name") or "").strip()
-        key = name.casefold() or str(item.get("project_id") or item["path"]).casefold()
-        candidate = (addon_version_key(metadata.get("version", "")), path_priority[path_kind(item["path"])], str(item["path"]).casefold())
+        name = str(item.get("name") or "").strip()
+        key = name.casefold() if name and item.get("addon_version") else str(item.get("project_id") or item["path"]).casefold()
+        candidate = (addon_version_key(item.get("addon_version", "")), path_priority[path_kind(item["path"])], str(item["path"]).casefold())
         previous = selected.get(key)
         if previous is None or candidate > previous[0]:
             if previous is not None: skipped.append(previous[1])
@@ -596,7 +601,11 @@ def merge_project_records(previous: list[dict], current: list[ProjectResult]) ->
     """Retain known projects when a bounded or root-specific scan does not encounter them."""
     if not isinstance(previous, list): previous = []
     merged = {os.path.normcase(str(item.get("path"))): dict(item) for item in previous if isinstance(item, dict) and item.get("project_id") and item.get("path")}
-    merged.update({os.path.normcase(item.path): item.__dict__ for item in current})
+    for item in current:
+        key = os.path.normcase(item.path); updated = dict(item.__dict__)
+        if not updated.get("addon_version") and key in merged:
+            updated["addon_version"] = merged[key].get("addon_version", "")
+        merged[key] = updated
     return sorted(merged.values(), key=lambda item: (str(item.get("name", "")).lower(), str(item.get("path", "")).lower()))
 
 def unavailable_manifest_results(paths: list[str], previous: list[dict]) -> list[ProjectResult]:

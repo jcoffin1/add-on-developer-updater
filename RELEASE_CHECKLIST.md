@@ -29,6 +29,12 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 
 ## GitHub workflow
 
+- Force a local builder check to fail after verbose passing tests; confirm the dialog is titled as a failure and includes the final cause from both output streams.
+- Test a repository with only a local `file://` remote and one with a local origin plus an owned GitHub fork; confirm the correct GitHub repository is found or created.
+- Stage a source-only change and confirm it is counted. Force-stage an `outputs` package and confirm publishing stops before any commit or remote change.
+- Change a source file after the confirmation review and simulate a builder that changes source; confirm both operations stop before push.
+- Verify an unknown upstream/default-branch comparison blocks Store readiness, and verify unsafe or ambiguous package paths are rejected.
+
 - Test signed-in, signed-out, offline, inaccessible-repository, and disabled-Issues cases. Confirm every signed-out GitHub entry point, including store readiness, offers device sign-in and retries the original operation.
 - Test without GitHub CLI installed; confirm every GitHub entry point offers the official installation page, makes no installation changes itself, and explains how to continue afterward.
 - Verify each selection and confirmation dialog retains focus and every editable field has a meaningful spoken name.

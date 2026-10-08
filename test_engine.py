@@ -184,6 +184,25 @@ class EngineTests(unittest.TestCase):
         merged = engine.merge_project_records([{"project_id": "old", "name": "Old", "path": "D:/old/manifest.ini", "status": "current"}], [current])
         self.assertEqual({"old", "new"}, {item["project_id"] for item in merged})
 
+    def test_saved_project_filtering_never_reads_manifests(self):
+        state = {
+            "approvedProjects": ["primary", "codex"],
+            "projects": [
+                {"project_id": "primary", "name": "Demo", "path": r"C:\Users\tester\Documents\NVDA Add-on Development\Add-ons\Demo\manifest.ini", "status": "current", "addon_version": "2026.2"},
+                {"project_id": "codex", "name": "Demo", "path": r"C:\Users\tester\Documents\Codex\demo\manifest.ini", "status": "current", "addon_version": "2026.2"},
+            ],
+        }
+        with mock.patch.object(engine, "values", side_effect=AssertionError("main-thread manifest read")):
+            visible, ignored = engine.visible_project_records(state)
+            newest, _older = engine.newest_local_project_records(visible)
+        self.assertEqual({"codex"}, ignored)
+        self.assertEqual(["primary"], [item["project_id"] for item in newest])
+        self.assertEqual({"primary", "codex"}, engine.saved_approved_project_ids(state))
+        legacy = {"projects": [{key: value for key, value in item.items() if key != "addon_version"} for item in state["projects"]]}
+        legacy_visible, legacy_ignored = engine.visible_project_records(legacy)
+        self.assertEqual(set(), legacy_ignored)
+        self.assertEqual(2, len(engine.newest_local_project_records(legacy_visible)[0]))
+
     def test_worker_confirmed_unavailable_manifest_replaces_stale_status(self):
         path = "C:/removed/manifest.ini"
         results = engine.unavailable_manifest_results([path], [{"project_id": "old-id", "name": "Removed", "path": path, "status": "update available: 2026.1 to 2026.2"}])
@@ -563,6 +582,26 @@ class EngineTests(unittest.TestCase):
         self.assertIn("self.status.SetName(message)", plugin)
         self.assertIn("self._progressDialog.setStatus(message)", plugin)
 
+    def test_failed_command_reports_the_cause_at_the_end_of_verbose_output(self):
+        verbose_tests = "\n".join(f"test_{index} ... ok" for index in range(400))
+        long_warning_output = "warning line\n" * 300
+        process = mock.Mock()
+        process.communicate.return_value = (
+            "Translation template is out of date; run tools/extract_messages.py\n",
+            verbose_tests + "\n" + long_warning_output + "Translation template validation failed\n",
+        )
+        process.returncode = 1
+        with mock.patch.object(publisher.subprocess, "Popen", return_value=process):
+            with self.assertRaises(RuntimeError) as caught:
+                publisher._run(["powershell.exe", "-File", "build.ps1"])
+        message = str(caught.exception)
+        self.assertIn("earlier command output omitted", message)
+        self.assertIn("Output:", message)
+        self.assertIn("Error output:", message)
+        self.assertIn("Translation template is out of date", message)
+        self.assertIn("Translation template validation failed", message)
+        self.assertNotIn("test_0 ... ok", message)
+
     def test_documentation_does_not_advertise_nonexistent_automatic_changes(self):
         documentation = (Path(__file__).parent / "doc" / "en" / "readme.html").read_text(encoding="utf-8")
         self.assertNotIn("opt-in automatic changes", documentation)
@@ -655,6 +694,25 @@ class EngineTests(unittest.TestCase):
             verified, error, _issues = publisher.verify_release_package_file(package, "Demo", "2026.2")
         self.assertFalse(verified)
         self.assertIn("OtherAddon", error)
+
+    def test_release_validation_rejects_unsafe_ambiguous_and_symlink_paths(self):
+        def package(extra_info, content=b"data"):
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
+                archive.writestr("manifest.ini", "name = Demo\nversion = 2026.2\n")
+                archive.writestr(extra_info, content)
+            return payload.getvalue()
+
+        for name in ("../outside.py", "/absolute.py", "C:/absolute.py", "MANIFEST.INI"):
+            verified, error, _issues = publisher._verify_release_payload(package(name), "Demo", "2026.2")
+            self.assertFalse(verified, name)
+            self.assertTrue("unsafe path" in error or "duplicate or case-colliding" in error, error)
+        link = zipfile.ZipInfo("globalPlugins/link.py")
+        link.create_system = 3
+        link.external_attr = (stat.S_IFLNK | 0o777) << 16
+        verified, error, _issues = publisher._verify_release_payload(package(link, b"target.py"), "Demo", "2026.2")
+        self.assertFalse(verified)
+        self.assertIn("symbolic link", error)
 
     @unittest.skipUnless(shutil.which("git"), "Git is required for the publish safety test")
     def test_push_rechecks_credentials_after_the_user_confirms(self):
@@ -790,6 +848,23 @@ class EngineTests(unittest.TestCase):
                         Path(folder) / "packages",
                     )
 
+    def test_project_builder_cannot_change_source_during_release_validation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "project"; root.mkdir()
+            manifest = root / "manifest.ini"; manifest.write_text(MANIFEST, encoding="utf-8")
+            (root / "build.ps1").write_text("# builder\n", encoding="utf-8")
+            def mutating_builder(_arguments, **_kwargs):
+                manifest.write_text(MANIFEST.replace("1.0", "1.1"), encoding="utf-8")
+                outputs = root / "outputs"; outputs.mkdir()
+                (outputs / "demo-1.0.nvda-addon").write_bytes(b"package")
+                return ""
+            with mock.patch.object(publisher.shutil, "which", return_value="pwsh"), mock.patch.object(publisher, "_run", side_effect=mutating_builder):
+                with self.assertRaisesRegex(RuntimeError, "changed source files"):
+                    publisher.build_release_package(
+                        {"name": "demo", "version": "1.0", "manifest": str(manifest)},
+                        Path(folder) / "packages",
+                    )
+
     def test_new_release_builds_are_validated_before_github_push(self):
         report = publisher.ProjectPublishInfo(
             "id", "Demo", "manifest.ini", ".", "2026.2.1", "Demo", "Justin Coffin",
@@ -867,11 +942,68 @@ class EngineTests(unittest.TestCase):
         remotes = {"origin": "https://github.com/samtupy/b32tts_wrapper.git"}
         self.assertEqual(("origin", remotes["origin"]), publisher._select_publish_remote(remotes, "jcoffin1"))
 
+    def test_non_github_remotes_do_not_block_github_discovery_or_matching(self):
+        local_only = {"origin": "file:///C:/repositories/demo.git"}
+        self.assertEqual(("", ""), publisher._select_publish_remote(local_only, "jcoffin1"))
+        mixed = {
+            "origin": "file:///C:/repositories/demo.git",
+            "fork": "https://github.com/jcoffin1/demo.git",
+        }
+        self.assertEqual("fork", publisher._matching_remote_name(mixed, "https://github.com/jcoffin1/demo"))
+
+    def test_staged_change_check_distinguishes_changes_from_git_errors(self):
+        for returncode, expected in ((0, False), (1, True)):
+            completed = subprocess.CompletedProcess([], returncode, "", "")
+            with mock.patch.object(publisher.subprocess, "run", return_value=completed):
+                self.assertEqual(expected, publisher._has_staged_changes(Path("C:/project"), "Demo"))
+        failed = subprocess.CompletedProcess([], 128, "", "fatal: bad repository")
+        with mock.patch.object(publisher.subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "exit code 128"):
+                publisher._has_staged_changes(Path("C:/project"), "Demo")
+
+    def test_unpushed_status_never_turns_an_unknown_comparison_into_zero(self):
+        with mock.patch.object(publisher, "_git", side_effect=RuntimeError("missing ref")):
+            count, error = publisher._unpushed_status(Path("C:/project"), "origin", "main")
+        self.assertEqual(0, count)
+        self.assertIn("could not be verified", error)
+        report = publisher.ProjectPublishInfo(
+            "id", "Demo", "manifest.ini", "C:/project", "2026.2", "Demo", "Justin Coffin",
+            "https://github.com/example/demo", 0, True, count, unpushed_check_error=error,
+        )
+        self.assertTrue(any("could not be verified" in reason for reason in publisher.store_readiness_reasons(report)))
+
+    def test_source_change_after_review_blocks_push(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); source = root / "manifest.ini"; source.write_text(MANIFEST, encoding="utf-8")
+            fingerprint = publisher._source_fingerprint(root, False)
+            source.write_text(MANIFEST.replace("1.0", "1.1"), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "changed after the publishing review"):
+                publisher._require_source_fingerprint(root, fingerprint, False, "Demo")
+
     def test_generated_build_and_python_cache_paths_are_not_published(self):
         self.assertTrue(publisher._is_generated_path("build-local/package/file.dll"))
         self.assertTrue(publisher._is_generated_path("synthDrivers/__pycache__/driver.cpython-313.pyc"))
         self.assertTrue(publisher._is_generated_path("outputs/demo.nvda-addon"))
         self.assertFalse(publisher._is_generated_path("synthDrivers/bestspeech.py"))
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required for staged-path safety tests")
+    def test_staged_only_source_is_counted_and_staged_generated_output_is_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            source = root / "manifest.ini"; source.write_text(MANIFEST, encoding="utf-8")
+            subprocess.run(["git", "add", "manifest.ini"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
+            source.write_text(MANIFEST.replace("1.0", "1.1"), encoding="utf-8")
+            subprocess.run(["git", "add", "manifest.ini"], cwd=root, check=True)
+            self.assertIn("manifest.ini", publisher._publishable_paths(root))
+            output = root / "outputs" / "demo.nvda-addon"; output.parent.mkdir(); output.write_bytes(b"package")
+            subprocess.run(["git", "add", "-f", "outputs/demo.nvda-addon"], cwd=root, check=True)
+            self.assertNotIn("outputs/demo.nvda-addon", publisher._publishable_paths(root))
+            excluded = [name for name in publisher._staged_paths(root) if publisher._is_generated_path(name)]
+            self.assertEqual(["outputs/demo.nvda-addon"], excluded)
         self.assertFalse(publisher._is_generated_path("docs/building.md"))
 
     def test_github_addon_repository_lookup_filters_and_paginates(self):
@@ -1050,6 +1182,35 @@ class EngineTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "timed out"):
                 publisher.login()
         self.assertTrue(process.terminated); self.assertTrue(process.killed); self.assertEqual(2, process.waits)
+
+    def test_addon_termination_can_stop_tracked_external_commands(self):
+        class Process:
+            def __init__(self): self.returncode = None; self.terminated = False
+            def poll(self): return self.returncode
+            def terminate(self): self.terminated = True; self.returncode = -15
+            def wait(self, timeout=None): return self.returncode
+            def kill(self): self.returncode = -9
+        process = Process(); publisher._track_process(process)
+        try:
+            publisher.cancel_running_commands()
+        finally:
+            publisher._untrack_process(process)
+        self.assertTrue(process.terminated)
+
+    def test_runtime_keeps_state_and_cancellation_work_off_the_main_thread(self):
+        source = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        status_start = source.index("def script_reportAddonUpdateCheckStatus")
+        status = source[status_start:source.index("@staticmethod", status_start)]
+        self.assertIn("engine.saved_approved_project_ids", status)
+        self.assertNotIn("engine.approved_project_ids", status)
+        preflight = source[source.index("def _githubPreflight"):source.index("def _offerGitHubLogin")]
+        self.assertLess(preflight.index("self._rememberExistingReleases(reports)"), preflight.index("self._scanLock.release()"))
+        apply_start = source[source.index("def _startApply"):source.index("def _finishApply")]
+        self.assertIn("self._scanActive.set()", apply_start)
+        self.assertIn("self._scanActive.clear()", apply_start)
+        self.assertIn("manifest results or undo history could not be saved", source)
+        self.assertIn("Finish the current confirmation", source)
+        self.assertIn("publisher.cancel_running_commands()", source)
 
     def test_keyboard_project_selection_is_async_and_dialogs_are_independent(self):
         source = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")

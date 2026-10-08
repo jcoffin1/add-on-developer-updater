@@ -512,6 +512,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._informationDialog.Raise(); self._informationDialog.okButton.SetFocus()
     def terminate(self):
         self._shutdown.set(); self._scanCancel.set(); self._wakeMonitor.set(); self._stopProgress()
+        publisher.cancel_running_commands()
         if self._workerProcess is not None:
             try: self._workerProcess.terminate()
             except OSError: pass
@@ -548,7 +549,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def script_discoverAddonProjects(self, gesture): self._startCheck(manual=True, full_system=True)
     @scriptHandler.script(description=_("Report add-on update-check status"), category=SCRIPT_CATEGORY)
     def script_reportAddonUpdateCheckStatus(self, gesture):
-        state = engine.read_json(self._statePath, {}); records = engine.visible_project_records(state)[0]; approved = engine.approved_project_ids(state)
+        state = engine.read_json(self._statePath, {}); records = engine.visible_project_records(state)[0]; approved = engine.saved_approved_project_ids(state)
         available = sum(str(item.get("status", "")).startswith("update available: ") for item in records if isinstance(item, dict)); awaiting = sum("awaiting" in str(item.get("status", "")) for item in records if isinstance(item, dict)); failed = sum("failed" in str(item.get("status", "")) for item in records if isinstance(item, dict)); approvedCount = sum(item.get("project_id") in approved for item in records if isinstance(item, dict))
         source = str(state.get("releaseSource", "unknown")); release = str(state.get("releaseTag", "unknown")); buildVersion = str(state.get("releaseBuildVersion", "")); compatibility = str(state.get("manifestVersion", "unknown"))
         build = release + (f" ({buildVersion})" if buildVersion and buildVersion != release else "")
@@ -620,7 +621,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         try: threading.Thread(target=self._downgradeSelected, args=(selected, target, officialVersions), name="addonDeveloperCompatibilityChange", daemon=True).start()
         except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start compatibility change"); ui.message(_("The compatibility change could not be started"))
     def _downgradeSelected(self, selected, target, officialVersions):
-        results = []
+        results = []; saveError = ""
         try:
             for item in selected:
                 try: results.append(engine.downgrade(Path(item.path), target, self._backupRoot, officialVersions))
@@ -631,13 +632,16 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if changed:
                 state["compatibilityUndo"] = [{"project_id": result.project_id, "name": result.name, "path": result.path, "backup_path": result.backup_path, "previous_last_tested": result.previous_last_tested, "target_last_tested": result.target_last_tested, "target_manifest_hash": result.target_manifest_hash} for result in changed]
             engine.atomic_json_write(self._statePath, state)
+        except Exception as error:
+            saveError = str(error); log.exception("Compatibility target results could not be saved")
         finally:
             self._scanLock.release()
-            self._finishProgressThen(self._finishDowngrade, results)
-    def _finishDowngrade(self, results):
+            self._finishProgressThen(self._finishDowngrade, results, saveError)
+    def _finishDowngrade(self, results, saveError=""):
         changed = [item for item in results if item.status.startswith("set last tested NVDA from ")]; failed = [item for item in results if item not in changed]
         message = _("Compatibility target change complete. %d manifests changed: %s. Use the Undo most recent compatibility target changes command if these changes need to be restored.") % (len(changed), self._limitedDetails(changed, lambda item: _("%s %s") % (item.name, item.status))) if changed else _("Compatibility target change complete. No manifests were changed.")
         if failed: message += _(" %d projects were not changed: %s.") % (len(failed), "; ".join(_("%s: %s") % (item.name, item.status.removeprefix("validation failed: ")) for item in failed))
+        if saveError: message += _(" Warning: the manifest results or undo history could not be saved: %s. Keep the backup files and inspect the changed manifests before continuing.") % saveError
         ui.message(message); self._showInformation(_("Compatibility target results"), message)
     @scriptHandler.script(description=_("Undo the most recent compatibility target changes"), category=SCRIPT_CATEGORY)
     def script_undoCompatibilityTargetChanges(self, gesture):
@@ -658,7 +662,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         try: threading.Thread(target=self._undoCompatibilityTargets, args=(entries, stateKey, updateOperation), name="addonDeveloperCompatibilityUndo", daemon=True).start()
         except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start compatibility undo"); ui.message(_("The compatibility changes could not be restored"))
     def _undoCompatibilityTargets(self, entries, stateKey="compatibilityUndo", updateOperation=False):
-        results = []
+        results = []; saveError = ""
         try:
             for entry in entries:
                 try: results.append(engine.undo_compatibility_target(Path(entry["path"]), Path(entry["backup_path"]), str(entry.get("target_last_tested", "")), str(entry.get("target_manifest_hash", "")), self._backupRoot))
@@ -666,15 +670,18 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             restored = {os.path.normcase(result.path) for result in results if result.status.startswith("restored last tested NVDA from ")}
             state = engine.read_json(self._statePath, {}); state["projects"] = engine.merge_project_records(state.get("projects", []), results); state[stateKey] = [entry for entry in entries if os.path.normcase(str(entry.get("path", ""))) not in restored]; engine.atomic_json_write(self._statePath, state)
             for result in results: log.info("Add-on Developer Updater compatibility undo: %s: %s", result.path, result.status)
+        except Exception as error:
+            saveError = str(error); log.exception("Compatibility undo results could not be saved")
         finally:
-            self._scanLock.release(); self._finishProgressThen(self._finishUndoCompatibilityTargets, results, updateOperation)
-    def _finishUndoCompatibilityTargets(self, results, updateOperation=False):
+            self._scanLock.release(); self._finishProgressThen(self._finishUndoCompatibilityTargets, results, updateOperation, saveError)
+    def _finishUndoCompatibilityTargets(self, results, updateOperation=False, saveError=""):
         restored = [result for result in results if result.status.startswith("restored last tested NVDA from ")]; failed = [result for result in results if result not in restored]
         if restored:
             template = _("Compatibility update undo complete. %d manifests restored: %s.") if updateOperation else _("Compatibility undo complete. %d manifests restored: %s.")
             message = template % (len(restored), self._limitedDetails(restored, lambda item: _("%s %s") % (item.name, item.status)))
         else: message = _("Compatibility update undo complete. No manifests were restored.") if updateOperation else _("Compatibility undo complete. No manifests were restored.")
         if failed: message += _(" %d manifests were not restored: %s.") % (len(failed), "; ".join(_("%s: %s") % (item.name, item.status) for item in failed))
+        if saveError: message += _(" Warning: restored manifests were not recorded in updater state: %s. Verify the manifests and backups manually.") % saveError
         ui.message(message); self._showInformation(_("Compatibility update undo results") if updateOperation else _("Compatibility undo results"), message)
     @scriptHandler.script(description=_("Review previously discovered NVDA add-on compatibility updates"), category=SCRIPT_CATEGORY)
     def script_reviewAddonProjectUpdates(self, gesture):
@@ -1244,7 +1251,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     @staticmethod
     def _addProjectContext(result, path):
         try:
-            metadata = engine.values(path); result.minimum_version = metadata.get("minimumnvdaversion", ""); result.branch, result.manifest_changed = engine.git_manifest_state(path)
+            metadata = engine.values(path); result.minimum_version = metadata.get("minimumnvdaversion", ""); result.addon_version = metadata.get("version", ""); result.branch, result.manifest_changed = engine.git_manifest_state(path)
         except (OSError, UnicodeError, ValueError):
             pass
         return result
@@ -1316,10 +1323,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.checkList.SetFocus)
     def _startApply(self, selected, release):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        self._scanCancel.clear(); ui.message(_("Updating %d selected add-on manifests") % len(selected)); self._startProgress()
+        self._scanCancel.clear(); self._scanActive.set(); ui.message(_("Updating %d selected add-on manifests") % len(selected)); self._startProgress()
         try: threading.Thread(target=self._applySelected, args=(selected, release), name="addonDeveloperApplySelected", daemon=True).start()
         except Exception:
-            self._stopProgress(); self._scanLock.release(); log.exception("Could not start selected manifest updates"); ui.message(_("The selected manifest updates could not be started"))
+            self._scanActive.clear(); self._stopProgress(); self._scanLock.release(); log.exception("Could not start selected manifest updates"); ui.message(_("The selected manifest updates could not be started"))
     def _applySelected(self, selected, release):
         cancelled = lambda: self._scanCancel.is_set() or self._shutdown.is_set(); results = []
         try:
@@ -1332,7 +1339,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 return
             release = refreshed
             for selectedResult in selected:
-                if cancelled(): return
+                if cancelled():
+                    results.append(engine.ProjectResult(selectedResult.project_id, selectedResult.name, selectedResult.path, "cancelled")); continue
                 path = Path(selectedResult.path)
                 try: results.append(self._addProjectContext(engine.update(path, release, self._backupRoot, True, cancelled), path))
                 except Exception as error:
@@ -1355,11 +1363,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             log.exception("Selected manifest update operation failed")
             results = [engine.ProjectResult(item.project_id, item.name, item.path, _("update operation failed while saving complete results; inspect the manifest and its backup: %s") % error) for item in selected]
             if not self._shutdown.is_set(): wx.CallAfter(self._finishApply, results)
-        finally: self._stopProgress(); self._scanLock.release()
+        finally: self._scanActive.clear(); self._stopProgress(); self._scanLock.release()
     def _finishApply(self, results):
         ui.message(self._completionMessage(results))
     def _showConfirmation(self, title, message, onYes, defaultYes=False, onNo=None):
-        if self._confirmDialog is not None: self._confirmDialog.Raise(); return
+        if self._confirmDialog is not None:
+            ui.message(_("Finish the current confirmation before starting another add-on developer action")); self._confirmDialog.Raise(); self._confirmDialog.defaultButton.SetFocus(); return
         dialog = ConfirmationDialog(gui.mainFrame, title, message, defaultYes=defaultYes); self._confirmDialog = dialog
         def close(_event=None):
             if self._confirmDialog is dialog: self._confirmDialog = None
@@ -1379,19 +1388,20 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             dialog.Destroy()
         dialog.okButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
         dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.okButton.SetFocus)
-    def _showGitHubResult(self, message):
-        ui.message(message); self._showInformation(_("GitHub publishing complete"), message)
+    def _showGitHubResult(self, message, title=None):
+        ui.message(message); self._showInformation(title or _("GitHub publishing result"), message)
     def _githubPreflight(self, ready):
         callback = None; arguments = ()
         try:
             reports = publisher.preflight(ready, engine.values, self._githubProgress)
+            self._rememberExistingReleases(reports)
             callback, arguments = self._offerGitHubPush, (reports,)
         except publisher.GitHubCliRequired:
             callback, arguments = self._offerGitHubCliInstall, ()
         except publisher.AuthenticationRequired:
             callback, arguments = self._offerGitHubLogin, (ready,)
         except Exception as error:
-            log.exception("GitHub publishing preflight failed"); callback, arguments = self._showGitHubResult, (_("GitHub publishing preflight failed: %s. Press OK to exit.") % error,)
+            log.exception("GitHub publishing preflight failed"); callback, arguments = self._showGitHubResult, (_("GitHub publishing preflight failed: %s. Press OK to exit.") % error, _("GitHub publishing failed"))
         finally:
             self._scanLock.release()
             if callback is not None: self._finishProgressThen(callback, *arguments)
@@ -1431,7 +1441,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _offerGitHubPush(self, reports):
         comparisons = "; ".join(_("%s: current GitHub release %s, newest local version %s") % (publisher.public_name(report), getattr(report, "github_release_version", "") or _("none"), getattr(report, "version", "") or _("unknown")) for report in reports)
         if comparisons: ui.message(_("GitHub release version comparison: %s") % comparisons)
-        self._rememberExistingReleases(reports)
         notOwned = [publisher.public_name(report) for report in reports if not getattr(report, "repository_owned_by_user", True)]
         reports = [report for report in reports if getattr(report, "repository_owned_by_user", True)]
         if notOwned: ui.message(_("Skipped repositories that are not owned by the signed-in GitHub account: %s") % "; ".join(notOwned))
@@ -1471,7 +1480,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             publisher.validate_publish_builds(reports, self._githubProgress)
             published = publisher.push(reports, self._githubProgress); callback, arguments = self._offerGitHubRelease, (published,)
         except Exception as error:
-            log.exception("GitHub publishing failed"); callback, arguments = self._showGitHubResult, (_("GitHub publishing failed: %s. Press OK to exit.") % error,)
+            log.exception("GitHub publishing failed"); callback, arguments = self._showGitHubResult, (_("GitHub publishing failed: %s. Press OK to exit.") % error, _("GitHub publishing failed"))
         finally:
             self._scanLock.release()
             if callback is not None: self._finishProgressThen(callback, *arguments)
@@ -1510,7 +1519,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             published = [byProject.get(item["project_id"], item) for item in published]
             callback, arguments = self._offerGitHubRelease, (published, False, False)
         except Exception as error:
-            log.exception("GitHub default-branch update failed"); callback, arguments = self._showGitHubResult, (_("GitHub default-branch update failed: %s. No release was created. Press OK to exit.") % error,)
+            log.exception("GitHub default-branch update failed"); callback, arguments = self._showGitHubResult, (_("GitHub default-branch update failed: %s. No release was created. Press OK to exit.") % error, _("GitHub publishing failed"))
         finally:
             self._scanLock.release()
             if callback is not None: self._finishProgressThen(callback, *arguments)
@@ -1559,9 +1568,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if blocked:
                 callback, arguments = self._offerGitHubPullRequests, (blocked, _("GitHub Releases were published and store submission details saved for: %s. ") % names)
             else:
-                callback, arguments = self._showGitHubResult, (_("GitHub Releases published and store submission details saved for: %s. Press OK to exit.") % names,)
+                callback, arguments = self._showGitHubResult, (_("GitHub Releases published and store submission details saved for: %s. Press OK to exit.") % names, _("GitHub publishing complete"))
         except Exception as error:
-            log.exception("GitHub release publishing failed"); callback, arguments = self._showGitHubResult, (_("GitHub release publishing failed: %s. Press OK to exit.") % error,)
+            log.exception("GitHub release publishing failed"); callback, arguments = self._showGitHubResult, (_("GitHub release publishing failed: %s. Press OK to exit.") % error, _("GitHub publishing failed"))
         finally:
             self._scanLock.release()
             if callback is not None: self._finishProgressThen(callback, *arguments)
