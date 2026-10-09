@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os, subprocess, threading, uuid
+import ctypes, os, subprocess, threading, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -435,12 +435,16 @@ class OperationProgressDialog(wx.Dialog):
         self.gauge = wx.Gauge(self, range=100); self.gauge.SetValue(0); sizer.Add(self.gauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10); self.SetSizerAndFit(sizer)
     def setStatus(self, message):
         """Keep the focused control's value and accessibility name synchronized."""
-        message = _(message); self.status.SetName(message); self.status.SetValue(message); self.status.SetInsertionPoint(0); self.status.Refresh(); self.status.Update()
+        message = _(message); self.status.SetName(message); self.status.ChangeValue(message); self.status.SetInsertionPoint(0); self.status.Refresh(); self.status.Update()
+        # A focused read-only edit can retain NVDA's old cached value even after
+        # WM_SETTEXT. Send the native value-change event so braille follows speech.
+        try: ctypes.windll.user32.NotifyWinEvent(0x800E, int(self.status.GetHandle()), -4, 0)
+        except (AttributeError, OSError, TypeError, ValueError): pass
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     activeInstance = None
     def __init__(self):
-        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._progressDialog = None; self._progressValue = 0; self._progressDeterminate = False; self._scanTargetDialog = None; self._reviewDialog = None; self._approvalDialog = None; self._publishDialog = None; self._storeDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._githubSelectionAction = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
+        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._manifestThread = None; self._progressDialog = None; self._progressValue = 0; self._progressDeterminate = False; self._scanTargetDialog = None; self._reviewDialog = None; self._approvalDialog = None; self._publishDialog = None; self._storeDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._githubSelectionAction = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
         config_path = Path(globalVars.appArgs.configPath); self._statePath = config_path / "addonDeveloperUpdaterState.json"; self._releaseCachePath = config_path / "addonDeveloperUpdaterReleaseCache.json"; self._apiVersionCachePath = config_path / "addonDeveloperUpdaterApiVersions.json"; self._backupRoot = config_path / "addonDeveloperUpdaterBackups"
         if config.conf["addonDeveloperUpdater"]["intervalMinutes"] < 15: config.conf["addonDeveloperUpdater"]["intervalMinutes"] = 15
         if UpdaterSettingsPanel not in gui.settingsDialogs.NVDASettingsDialog.categoryClasses: gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(UpdaterSettingsPanel)
@@ -516,6 +520,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if self._workerProcess is not None:
             try: self._workerProcess.terminate()
             except OSError: pass
+        manifestThread = self._manifestThread
+        if manifestThread is not None and manifestThread.is_alive() and threading.current_thread() is not manifestThread:
+            manifestThread.join(timeout=2)
         if self._reviewDialog is not None:
             self._reviewDialog.Destroy(); self._reviewDialog = None
         if self._scanTargetDialog is not None:
@@ -617,14 +624,16 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         dialog.onUpdate = apply; dialog.applyButton.Bind(wx.EVT_BUTTON, apply); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close); dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.checkList.SetFocus)
     def _startDowngrade(self, selected, target, officialVersions):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        ui.message(_("Setting %d selected manifests to last tested NVDA %s") % (len(selected), target)); self._startProgress()
-        try: threading.Thread(target=self._downgradeSelected, args=(selected, target, officialVersions), name="addonDeveloperCompatibilityChange", daemon=True).start()
-        except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start compatibility change"); ui.message(_("The compatibility change could not be started"))
+        self._scanCancel.clear(); self._scanActive.set(); ui.message(_("Setting %d selected manifests to last tested NVDA %s") % (len(selected), target)); self._startProgress()
+        try:
+            self._manifestThread = threading.Thread(target=self._downgradeSelected, args=(selected, target, officialVersions), name="addonDeveloperCompatibilityChange", daemon=True); self._manifestThread.start()
+        except Exception: self._manifestThread = None; self._scanActive.clear(); self._stopProgress(); self._scanLock.release(); log.exception("Could not start compatibility change"); ui.message(_("The compatibility change could not be started"))
     def _downgradeSelected(self, selected, target, officialVersions):
-        results = []; saveError = ""
+        results = []; saveError = ""; cancelled = lambda: self._scanCancel.is_set() or self._shutdown.is_set()
         try:
             for item in selected:
-                try: results.append(engine.downgrade(Path(item.path), target, self._backupRoot, officialVersions))
+                if cancelled(): results.append(engine.ProjectResult(item.project_id, item.name, item.path, "cancelled")); continue
+                try: results.append(engine.downgrade(Path(item.path), target, self._backupRoot, officialVersions, cancelled))
                 except Exception as error: results.append(engine.ProjectResult(item.project_id, item.name, item.path, f"validation failed: {error}"))
             for result in results: log.info("Add-on Developer Updater compatibility target: %s: %s", result.path, result.status)
             changed = [result for result in results if result.status.startswith("set last tested NVDA from ")]
@@ -635,7 +644,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         except Exception as error:
             saveError = str(error); log.exception("Compatibility target results could not be saved")
         finally:
-            self._scanLock.release()
+            self._scanActive.clear(); self._scanLock.release()
             self._finishProgressThen(self._finishDowngrade, results, saveError)
     def _finishDowngrade(self, results, saveError=""):
         changed = [item for item in results if item.status.startswith("set last tested NVDA from ")]; failed = [item for item in results if item not in changed]
@@ -658,13 +667,15 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self._showConfirmation(_("Undo compatibility updates"), _("Restore manifests from the most recent update operation? Later edits will never be overwritten. Planned restores: %s.") % details, lambda: self._startUndoCompatibilityTargets(entries, "updateUndo", True))
     def _startUndoCompatibilityTargets(self, entries, stateKey="compatibilityUndo", updateOperation=False):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        ui.message(_("Restoring manifests from the most recent compatibility update") if updateOperation else _("Restoring manifests from the most recent compatibility target operation")); self._startProgress()
-        try: threading.Thread(target=self._undoCompatibilityTargets, args=(entries, stateKey, updateOperation), name="addonDeveloperCompatibilityUndo", daemon=True).start()
-        except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start compatibility undo"); ui.message(_("The compatibility changes could not be restored"))
+        self._scanCancel.clear(); self._scanActive.set(); ui.message(_("Restoring manifests from the most recent compatibility update") if updateOperation else _("Restoring manifests from the most recent compatibility target operation")); self._startProgress()
+        try:
+            self._manifestThread = threading.Thread(target=self._undoCompatibilityTargets, args=(entries, stateKey, updateOperation), name="addonDeveloperCompatibilityUndo", daemon=True); self._manifestThread.start()
+        except Exception: self._manifestThread = None; self._scanActive.clear(); self._stopProgress(); self._scanLock.release(); log.exception("Could not start compatibility undo"); ui.message(_("The compatibility changes could not be restored"))
     def _undoCompatibilityTargets(self, entries, stateKey="compatibilityUndo", updateOperation=False):
         results = []; saveError = ""
         try:
             for entry in entries:
+                if self._scanCancel.is_set() or self._shutdown.is_set(): results.append(engine.ProjectResult(str(entry.get("project_id", "")), str(entry.get("name", "add-on")), str(entry.get("path", "")), "cancelled")); continue
                 try: results.append(engine.undo_compatibility_target(Path(entry["path"]), Path(entry["backup_path"]), str(entry.get("target_last_tested", "")), str(entry.get("target_manifest_hash", "")), self._backupRoot))
                 except Exception as error: results.append(engine.ProjectResult(str(entry.get("project_id", "")), str(entry.get("name", "add-on")), str(entry.get("path", "")), f"undo failed: {error}"))
             restored = {os.path.normcase(result.path) for result in results if result.status.startswith("restored last tested NVDA from ")}
@@ -673,7 +684,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         except Exception as error:
             saveError = str(error); log.exception("Compatibility undo results could not be saved")
         finally:
-            self._scanLock.release(); self._finishProgressThen(self._finishUndoCompatibilityTargets, results, updateOperation, saveError)
+            self._scanActive.clear(); self._scanLock.release(); self._finishProgressThen(self._finishUndoCompatibilityTargets, results, updateOperation, saveError)
     def _finishUndoCompatibilityTargets(self, results, updateOperation=False, saveError=""):
         restored = [result for result in results if result.status.startswith("restored last tested NVDA from ")]; failed = [result for result in results if result not in restored]
         if restored:
@@ -695,14 +706,14 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 except TypeError: pass
         if not available: ui.message(_("No saved add-on compatibility updates are available")); return
         self._showReviewDialog(available, engine.Release(str(state.get("releaseTag", "")), str(state.get("manifestVersion", "")), bool(state.get("prerelease")), str(state.get("releaseUrl", "")), str(state.get("releaseSource", "saved")), str(state.get("releaseCheckedAt", "")), str(state.get("releaseBuildVersion", ""))))
-    @scriptHandler.script(description=_("Cancel the running add-on developer update scan"), category=SCRIPT_CATEGORY)
+    @scriptHandler.script(description=_("Cancel the running add-on developer operation"), category=SCRIPT_CATEGORY)
     def script_cancelAddonProjectScan(self, gesture):
-        if not self._scanActive.is_set(): ui.message(_("No add-on developer scan is running")); return
+        if not self._scanActive.is_set(): ui.message(_("No cancellable add-on developer operation is running")); return
         self._scanCancel.set()
         if self._workerProcess is not None:
             try: self._workerProcess.terminate()
             except OSError: pass
-        ui.message(_("Add-on developer scan cancellation requested"))
+        ui.message(_("Add-on developer operation cancellation requested"))
     @scriptHandler.script(description=_("Submit updated add-ons to the NVDA Add-on Store"), gesture="kb:NVDA+alt+shift+s", category=SCRIPT_CATEGORY)
     def script_submitUpdatedAddons(self, gesture):
         self._beginApprovedProjectSelection("store")
@@ -819,7 +830,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _offerStoreSubmission(self, reports, inspectionFailures=()):
         self._rememberExistingReleases(reports); eligible = []; blocked = list(inspectionFailures)
         for report in reports:
-            item = {**report.__dict__, "sourceUrl": publisher.repository_url(report.remote) if report.remote else "", "downloadUrl": report.github_release_download_url}
+            item = publisher.store_release_item(report)
             reasons = publisher.store_readiness_reasons(report)
             if reasons: blocked.append(_("%s: %s") % (publisher.public_name(report), ", ".join(reasons)))
             else: eligible.append((report, item))
@@ -1324,9 +1335,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _startApply(self, selected, release):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
         self._scanCancel.clear(); self._scanActive.set(); ui.message(_("Updating %d selected add-on manifests") % len(selected)); self._startProgress()
-        try: threading.Thread(target=self._applySelected, args=(selected, release), name="addonDeveloperApplySelected", daemon=True).start()
+        try:
+            self._manifestThread = threading.Thread(target=self._applySelected, args=(selected, release), name="addonDeveloperApplySelected", daemon=True); self._manifestThread.start()
         except Exception:
-            self._scanActive.clear(); self._stopProgress(); self._scanLock.release(); log.exception("Could not start selected manifest updates"); ui.message(_("The selected manifest updates could not be started"))
+            self._manifestThread = None; self._scanActive.clear(); self._stopProgress(); self._scanLock.release(); log.exception("Could not start selected manifest updates"); ui.message(_("The selected manifest updates could not be started"))
     def _applySelected(self, selected, release):
         cancelled = lambda: self._scanCancel.is_set() or self._shutdown.is_set(); results = []
         try:

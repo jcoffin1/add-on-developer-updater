@@ -29,6 +29,8 @@ SENSITIVE_NAMES = {".env", "credentials.json", "id_dsa", "id_ed25519", "id_rsa",
 SENSITIVE_SUFFIXES = {".key", ".p12", ".pem", ".pfx"}
 GENERATED_DIRECTORIES = {"__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "build-local", "dist", "outputs"}
 GENERATED_SUFFIXES = {".pyc", ".pyo"}
+MAX_PACKAGE_BYTES = 100 * 1024 * 1024
+MAX_EXPANDED_PACKAGE_BYTES = 512 * 1024 * 1024
 _AI_DISCLOSURE_PATTERNS = (
     re.compile(r"\b" + "A" + "I" + r"\b", re.I),
     re.compile(r"\bAI(?:[- ]generated|[- ]written|[- ]authored)\b", re.I),
@@ -205,14 +207,17 @@ def store_readiness_reasons(report: ProjectPublishInfo) -> list[str]:
     reasons = []
     if not report.remote: reasons.append("no GitHub repository")
     elif not report.repository_owned_by_user: reasons.append("repository is not owned by the signed-in GitHub account")
-    item = {**report.__dict__, "sourceUrl": repository_url(report.remote) if report.remote else "", "downloadUrl": report.github_release_download_url}
+    item = store_release_item(report)
+    latest_matches = bool(report.github_release_version) and not release_needed(report.version, report.github_release_version)
+    exact_release = bool(report.matching_release_tag) or latest_matches
+    exact_verified = report.matching_release_package_verified if report.matching_release_tag else report.release_package_verified
+    exact_error = report.matching_release_package_error if report.matching_release_tag else report.release_package_error
     if report.remote and report.repository_owned_by_user and not valid_store_release(item, report.version):
-        if not report.github_release_version: reasons.append("no GitHub Release")
-        elif release_needed(report.version, report.github_release_version): reasons.append(f"GitHub Release {report.github_release_version} does not match local version {report.version}")
-        elif not report.github_release_download_url: reasons.append("matching release has no .nvda-addon asset")
-    release_matches_local = bool(report.github_release_version) and not release_needed(report.version, report.github_release_version)
-    if release_matches_local and report.github_release_download_url and report.repository_owned_by_user and not report.release_package_verified:
-        reasons.append(report.release_package_error or "release package manifest could not be verified")
+        if not report.github_release_version and not report.matching_release_tag: reasons.append("no GitHub Release")
+        elif not exact_release: reasons.append(f"GitHub Release {report.github_release_version} does not match local version {report.version}")
+        elif not item["downloadUrl"]: reasons.append("matching release has no .nvda-addon asset")
+    if exact_release and item["downloadUrl"] and report.repository_owned_by_user and not exact_verified:
+        reasons.append(exact_error or "release package manifest could not be verified")
     if report.changed_files: reasons.append(f"{report.changed_files} local changed {'file is' if report.changed_files == 1 else 'files are'} not included in the release")
     if report.unpushed_commits: reasons.append(f"{report.unpushed_commits} local commits are not pushed")
     if report.unpushed_check_error: reasons.append(report.unpushed_check_error)
@@ -220,6 +225,17 @@ def store_readiness_reasons(report: ProjectPublishInfo) -> list[str]:
         reasons.append(f"GitHub Release {report.matching_release_tag} points to an older commit; increment the manifest version before releasing the current code")
     reasons.extend(report.store_guideline_issues)
     return reasons
+
+
+def store_release_item(report: ProjectPublishInfo) -> dict:
+    """Build store data from the exact local-version release, never merely the newest release."""
+    latest_matches = bool(report.github_release_version) and not release_needed(report.version, report.github_release_version)
+    download = report.matching_release_download_url or (report.github_release_download_url if latest_matches else "")
+    return {
+        **report.__dict__,
+        "sourceUrl": repository_url(report.remote) if report.remote else "",
+        "downloadUrl": download,
+    }
 
 def _manifest_guideline_issues(fields: dict, api_versions: dict, submission_channel="") -> list[str]:
     issues = []
@@ -441,6 +457,7 @@ def _archive_structure_error(archive: zipfile.ZipFile) -> str:
     """Reject archive names that are unsafe or ambiguous on common filesystems."""
     names = set()
     manifest_count = 0
+    expanded_size = 0
     for info in archive.infolist():
         raw = info.filename
         normalized = raw.replace("\\", "/")
@@ -455,8 +472,27 @@ def _archive_structure_error(archive: zipfile.ZipFile) -> str:
             manifest_count += 1
         if stat.S_IFMT(info.external_attr >> 16) == stat.S_IFLNK:
             return f"release package contains unsupported symbolic link {raw}"
+        if info.flag_bits & 0x1:
+            return f"release package contains encrypted file {raw}"
+        expanded_size += info.file_size
+        if expanded_size > MAX_EXPANDED_PACKAGE_BYTES:
+            return "release package exceeds the 512 MB expanded-size verification limit"
     if manifest_count != 1:
         return "release package must contain exactly one root manifest.ini"
+    return ""
+
+
+def _archive_integrity_error(archive: zipfile.ZipFile) -> str:
+    """Read every member with bounded expansion so CRC failures cannot hide in binaries."""
+    try:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            with archive.open(info) as member:
+                while member.read(1024 * 1024):
+                    pass
+    except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as error:
+        return f"release package contains a damaged or unsupported file: {error}"
     return ""
 
 
@@ -467,6 +503,9 @@ def _verify_release_payload(payload: bytes, expected_name: str, expected_version
             structure_error = _archive_structure_error(archive)
             if structure_error:
                 return False, structure_error, ()
+            integrity_error = _archive_integrity_error(archive)
+            if integrity_error:
+                return False, integrity_error, ()
             info = archive.getinfo("manifest.ini")
             if info.file_size > 1024 * 1024: return False, "release package manifest is unexpectedly large", ()
             manifest = archive.read(info).decode("utf-8-sig")
@@ -481,23 +520,21 @@ def _verify_release_payload(payload: bytes, expected_name: str, expected_version
 
 def verify_release_package_file(path: Path, expected_name: str, expected_version: str) -> tuple[bool, str, tuple[str, ...]]:
     """Verify a local package immediately before it can be uploaded."""
-    maximum = 100 * 1024 * 1024
     try:
-        if path.stat().st_size > maximum: return False, "release package exceeds the 100 MB verification limit", ()
+        if path.stat().st_size > MAX_PACKAGE_BYTES: return False, "release package exceeds the 100 MB verification limit", ()
         return _verify_release_payload(path.read_bytes(), expected_name, expected_version)
     except OSError as error:
         return False, f"release package could not be verified: {error}", ()
 
 def verify_release_package(url: str, expected_name: str, expected_version: str, api_versions=None, submission_channel="") -> tuple[bool, str, tuple[str, ...]]:
     """Download a release asset and verify its root manifest, not its cosmetic filename."""
-    maximum = 100 * 1024 * 1024
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "NVDA-Addon-Developer-Updater"})
         with urllib.request.urlopen(request, timeout=30) as response:
             length = response.headers.get("Content-Length")
-            if length and int(length) > maximum: return False, "release package exceeds the 100 MB verification limit", ()
-            payload = response.read(maximum + 1)
-        if len(payload) > maximum: return False, "release package exceeds the 100 MB verification limit", ()
+            if length and int(length) > MAX_PACKAGE_BYTES: return False, "release package exceeds the 100 MB verification limit", ()
+            payload = response.read(MAX_PACKAGE_BYTES + 1)
+        if len(payload) > MAX_PACKAGE_BYTES: return False, "release package exceeds the 100 MB verification limit", ()
         return _verify_release_payload(payload, expected_name, expected_version, api_versions or {}, submission_channel)
     except (OSError, ValueError, UnicodeError, zipfile.BadZipFile, KeyError) as error:
         return False, f"release package could not be verified: {error}", ()
@@ -715,6 +752,14 @@ def _repository_remotes(root: Path) -> dict[str, str]:
             continue
     return remotes
 
+
+def _require_reviewed_push_url(root: Path, remote_name: str, reviewed_remote: str, display_name: str) -> str:
+    """Reject a Git pushurl that redirects a reviewed remote to another repository."""
+    push_url = _git(root, "remote", "get-url", "--push", remote_name)
+    if _remote_web_url(push_url).casefold() != _remote_web_url(reviewed_remote).casefold():
+        raise RuntimeError(f"{display_name} remote {remote_name} pushes to a different repository than the one reviewed; remove or correct its Git pushurl before publishing")
+    return push_url
+
 def _select_publish_remote(remotes: dict[str, str], authenticated_owner: str) -> tuple[str, str]:
     """Prefer a repository owned by the signed-in user, even when it is named fork."""
     for name, url in remotes.items():
@@ -747,6 +792,19 @@ def _matching_remote_name(remotes: dict[str, str], target: str) -> str:
         except RuntimeError:
             continue
     return ""
+
+
+def _available_remote_name(remotes: dict[str, str], preferred: str = "origin") -> str:
+    """Choose a deterministic remote name without colliding with local-only remotes."""
+    if preferred not in remotes:
+        return preferred
+    number = 1
+    while True:
+        candidate = "publisher" if number == 1 else f"publisher{number}"
+        if candidate not in remotes:
+            return candidate
+        number += 1
+
 
 def _sensitive_files(root: Path) -> list[str]:
     names = _git(root, "ls-files", "-co", "--exclude-standard", "-z").split("\0")
@@ -828,16 +886,13 @@ def _release_asset_urls(gh: str, remote: str, tag: str) -> list[str]:
 def _unpushed_status(root: Path, remote_name: str, default_branch: str) -> tuple[int, str]:
     """Return a proven unpushed count, or an explicit verification blocker."""
     try:
-        return int(_git(root, "rev-list", "--count", "@{upstream}..HEAD") or "0"), ""
-    except (RuntimeError, ValueError):
-        try:
-            if not remote_name or not default_branch:
-                raise RuntimeError("the selected GitHub remote or its default branch is unknown")
-            comparison = f"refs/remotes/{remote_name}/{default_branch}"
-            _git(root, "fetch", "--no-tags", remote_name, f"+refs/heads/{default_branch}:{comparison}")
-            return int(_git(root, "rev-list", "--count", f"{comparison}..HEAD") or "0"), ""
-        except (RuntimeError, ValueError) as error:
-            return 0, f"local commit publication could not be verified: {error}"
+        if not remote_name or not default_branch:
+            raise RuntimeError("the selected GitHub remote or its default branch is unknown")
+        comparison = f"refs/remotes/{remote_name}/{default_branch}"
+        _git(root, "fetch", "--no-tags", remote_name, f"+refs/heads/{default_branch}:{comparison}")
+        return int(_git(root, "rev-list", "--count", f"{comparison}..HEAD") or "0"), ""
+    except (RuntimeError, ValueError) as error:
+        return 0, f"local commit publication could not be verified: {error}"
 
 def _verify_first_release_asset(urls: list[str], metadata: dict, api_versions: dict, channel: str) -> tuple[str, bool, str, tuple[str, ...]]:
     if not urls:
@@ -1042,6 +1097,18 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
         if not report.has_git:
             if progress: progress(f"Creating local Git repository for {display_name}")
             _run(["git", "init", "-b", "main"], root)
+        push_remote = ""
+        remote = report.remote
+        remotes = _repository_remotes(root)
+        if remote:
+            push_remote = _matching_remote_name(remotes, remote)
+            if not push_remote:
+                push_remote = _available_remote_name(remotes, "publisher")
+                _git(root, "remote", "add", push_remote, remote)
+                remotes[push_remote] = remote
+            # Perform this before staging or committing so a redirecting pushurl
+            # cannot mutate the local repository before publication is stopped.
+            _require_reviewed_push_url(root, push_remote, remote, display_name)
         publishable_paths = _publishable_paths(root)
         if publishable_paths:
             _git(root, "add", "--all", "--", *publishable_paths)
@@ -1049,29 +1116,19 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
         if staged:
             if progress: progress(f"Committing changes for {display_name}")
             _git(root, "commit", "-m", "Prepare NVDA add-on store release")
-        push_remote = ""
-        if report.remote:
-            remotes = _repository_remotes(root)
-            push_remote = _matching_remote_name(remotes, report.remote)
-            if not push_remote:
-                push_remote = "publisher"
-                suffix = 2
-                while push_remote in remotes:
-                    push_remote = f"publisher{suffix}"; suffix += 1
-                _git(root, "remote", "add", push_remote, report.remote)
-        remote = report.remote
         if not remote:
             if progress: progress(f"Finding or creating a public GitHub repository for {display_name}")
             repository = _repository_name(display_name)
+            push_remote = _available_remote_name(remotes)
             try:
                 existing = _run([gh, "repo", "view", repository, "--json", "url", "--jq", ".url"])
-                push_remote = "origin"
-                _git(root, "remote", "add", push_remote, existing + ".git")
             except RuntimeError:
-                _run([gh, "repo", "create", repository, "--public", "--source", str(root), "--remote", "origin", "--description", report.summary])
-                push_remote = "origin"
+                _run([gh, "repo", "create", repository, "--public", "--source", str(root), "--remote", push_remote, "--description", report.summary])
+            else:
+                _git(root, "remote", "add", push_remote, existing + ".git")
             remote = _git(root, "remote", "get-url", push_remote)
         if progress: progress(f"Pushing {display_name} to GitHub")
+        _require_reviewed_push_url(root, push_remote, remote, display_name)
         _git(root, "push", "--set-upstream", push_remote, branch)
         # Releases must target the commit we actually pushed.  GitHub otherwise
         # defaults to the repository's default branch, which may be unrelated.
@@ -1106,6 +1163,7 @@ def promote_default_branches(items: list[dict], progress=None) -> list[dict]:
             updated.update(releaseBlocker=blocker, defaultBranchCanFastForward=False); promoted.append(updated); continue
         try:
             if progress: progress(f"Fast-forwarding {default_branch} for {name}, project {index} of {len(items)}")
+            _require_reviewed_push_url(root, remote_name, str(item.get("sourceUrl", "")), name)
             _git(root, "push", remote_name, f"{target_commit}:refs/heads/{default_branch}")
             blocker, can_fast_forward = release_target_status(root, remote_name, default_branch, target_commit)
             if blocker:
@@ -1127,9 +1185,21 @@ def pull_request_url(item: dict) -> str:
 def _package_source(manifest: Path) -> Path:
     return manifest.parent
 
+
+def _safe_package_filename(name: str, version: str) -> str:
+    """Return a portable package filename without permitting path traversal."""
+    invalid = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+    for label, value in (("add-on name", str(name or "")), ("version", str(version or ""))):
+        if not value or value in {".", ".."} or invalid.search(value) or value.rstrip(" .") != value:
+            raise RuntimeError(f"The manifest {label} cannot be used in a safe release-package filename: {value or 'missing'}")
+    return f"{name}-{version}.nvda-addon"
+
+
 def build_package(item: dict, output_folder: Path) -> Path:
-    manifest = Path(item["manifest"]); source = _package_source(manifest); output_folder.mkdir(parents=True, exist_ok=True)
-    filename = f"{item['name']}-{item['version']}.nvda-addon"; output = output_folder / filename
+    manifest = Path(item["manifest"]); source = _package_source(manifest); output_folder = output_folder.resolve(); output_folder.mkdir(parents=True, exist_ok=True)
+    filename = _safe_package_filename(item["name"], item["version"]); output = (output_folder / filename).resolve()
+    if output.parent != output_folder:
+        raise RuntimeError("The release-package destination is outside the selected output folder")
     files = {}
     roots = [(source, False)]
     if (source / "addon").is_dir(): roots.append((source / "addon", True))
@@ -1150,20 +1220,21 @@ def build_package(item: dict, output_folder: Path) -> Path:
 def build_release_package(item: dict, output_folder: Path) -> Path:
     """Use a project's audited builder when it supplies one; otherwise use the safe generic builder."""
     source = _package_source(Path(item["manifest"]))
-    build_script = source / "build.ps1"
+    project = Path(item.get("root") or source)
+    build_script = project / "build.ps1"
     if not build_script.is_file():
         return build_package(item, output_folder)
     shell = shutil.which("pwsh") or shutil.which("powershell")
     if not shell:
         raise RuntimeError(f"PowerShell is required to run the project builder for {item['name']}")
-    outputs = source / "outputs"
+    outputs = project / "outputs"
     previous = {
         path.resolve(): (path.stat().st_mtime_ns, path.stat().st_size)
         for path in outputs.glob("*.nvda-addon")
     } if outputs.is_dir() else {}
-    before_build = _source_fingerprint(source)
-    _run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(build_script), "-Version", str(item["version"])], cwd=source)
-    if _source_fingerprint(source) != before_build:
+    before_build = _source_fingerprint(project)
+    _run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(build_script), "-Version", str(item["version"])], cwd=project)
+    if _source_fingerprint(project) != before_build:
         raise RuntimeError(f"The project builder for {item['name']} changed source files; review those changes and run publishing again")
     candidates = [
         path for path in outputs.glob("*.nvda-addon")
@@ -1228,6 +1299,19 @@ def _uploaded_asset_url(gh: str, repository: str, tag: str, package_name: str) -
             return str(asset.get("url") or "")
     return ""
 
+
+def _require_release_source(item: dict, display_name: str) -> None:
+    """Prove release bytes still come from the reviewed and pushed commit."""
+    root = Path(item["root"])
+    has_git = bool(item.get("has_git", (root / ".git").exists()))
+    _require_source_fingerprint(root, str(item.get("source_fingerprint", "")), has_git, display_name)
+    if has_git:
+        target = str(item.get("targetCommitish", "")).strip()
+        head = _git(root, "rev-parse", "HEAD").strip()
+        if not target or head.casefold() != target.casefold():
+            raise RuntimeError(f"{display_name} is no longer at the commit that was pushed and reviewed; run the GitHub command again")
+
+
 def release(items: list[dict], output_folder: Path, progress=None, on_released=None) -> list[dict]:
     gh = gh_path(); released = []
     for index, item in enumerate(items, 1):
@@ -1237,6 +1321,7 @@ def release(items: list[dict], output_folder: Path, progress=None, on_released=N
         action = release_publish_action(item)
         if action == "version-conflict":
             raise RuntimeError(f"{display_name} version {item['version']} already has a GitHub Release that does not include the current local changes. Increment the manifest version before publishing the current code")
+        _require_release_source(item, display_name)
         if progress: progress(f"Packaging {display_name}, release {index} of {len(items)}")
         package = build_release_package(item, output_folder)
         verified, package_error, package_issues = verify_release_package_file(package, item["name"], item["version"])
@@ -1247,6 +1332,7 @@ def release(items: list[dict], output_folder: Path, progress=None, on_released=N
         repository = item["sourceUrl"].removeprefix("https://github.com/")
         target = str(item.get("targetCommitish", "")).strip()
         if not target: raise RuntimeError(f"No pushed commit was recorded for {display_name}; release creation was stopped")
+        _require_release_source(item, display_name)
         remote_tag = _remote_tag_commit(Path(item["root"]), str(item.get("pushRemote", "")), tag)
         if remote_tag and remote_tag.casefold() != target.casefold():
             raise RuntimeError(f"GitHub tag {tag} for {display_name} already points to a different commit. Increment the manifest version before publishing a new release")

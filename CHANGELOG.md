@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026.2.47
+
+- Stop release creation if source files or Git HEAD change after the reviewed commit is pushed.
+- Reject Git remotes whose effective push URL redirects publication to a different repository.
+- Fetch and compare the selected repository's default branch instead of trusting a stale or unrelated upstream tracking reference.
+- Validate every archive member's CRC with bounded expansion, reject encrypted packages, and prevent unsafe package filenames from escaping the output folder.
+- Use the exact GitHub Release matching the local add-on version for Store readiness and submission, even when a newer prerelease exists.
+- Run repository-root project builders when the add-on manifest lives in an `addon` subfolder.
+- Avoid remote-name collisions when a local-only `origin` already exists.
+- Restore the original manifest when post-write validation or hashing raises an exception.
+- Make compatibility changes and undo operations cancellable, wait briefly for their mutation worker during NVDA shutdown, and refresh the progress field's braille value explicitly.
+
 ## 2026.2.46
 
 - Show the decisive end of failed build and command output instead of the beginning of verbose passing-test output.

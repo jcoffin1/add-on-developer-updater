@@ -290,6 +290,27 @@ class EngineTests(unittest.TestCase):
                 result = engine.update(manifest, engine.Release("2026.2", "2026.2", False, ""), Path(folder) / "backups", True)
             self.assertIn("original manifest was restored", result.status)
             self.assertEqual(original, manifest.read_bytes())
+
+    def test_post_write_exception_restores_original_update_and_downgrade_manifests(self):
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = self.make_project(folder); original = manifest.read_bytes(); backups = Path(folder) / "backups"
+            with mock.patch.object(engine, "validate", side_effect=[[], OSError("simulated read failure")]):
+                with self.assertRaisesRegex(OSError, "simulated read failure"):
+                    engine.update(manifest, engine.Release("2026.2", "2026.2", False, ""), backups, True)
+            self.assertEqual(original, manifest.read_bytes())
+            manifest.write_text(MANIFEST.replace("lastTestedNVDAVersion = 2025.4", "lastTestedNVDAVersion = 2026.2"), encoding="utf-8")
+            downgrade_original = manifest.read_bytes()
+            with mock.patch.object(engine, "validate", side_effect=[[], OSError("simulated hash failure")]):
+                with self.assertRaisesRegex(OSError, "simulated hash failure"):
+                    engine.downgrade(manifest, "2025.4", backups, {"2025.4": False})
+            self.assertEqual(downgrade_original, manifest.read_bytes())
+
+    def test_downgrade_cancellation_stops_before_manifest_write(self):
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = self.make_project(folder); manifest.write_text(MANIFEST.replace("lastTestedNVDAVersion = 2025.4", "lastTestedNVDAVersion = 2026.2"), encoding="utf-8"); original = manifest.read_bytes()
+            result = engine.downgrade(manifest, "2025.4", Path(folder) / "backups", {"2025.4": False}, cancelled=lambda: True)
+            self.assertEqual("cancelled", result.status)
+            self.assertEqual(original, manifest.read_bytes())
     def test_atomic_state_round_trip_and_corrupt_fallback(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "state.json"; engine.atomic_json_write(path, {"ok": True}); self.assertEqual({"ok": True}, engine.read_json(path)); path.write_text("{"); self.assertEqual({}, engine.read_json(path))
@@ -652,6 +673,18 @@ class EngineTests(unittest.TestCase):
         self.assertEqual("version-conflict", publisher.release_publish_action(current))
         self.assertTrue(any("older commit" in reason for reason in publisher.store_readiness_reasons(current)))
 
+    def test_store_submission_uses_exact_local_version_release_not_newest_release(self):
+        report = publisher.ProjectPublishInfo(
+            "id", "Demo", "manifest.ini", ".", "2026.2", "Demo", "Justin Coffin",
+            "https://github.com/jcoffin1/demo", 0, True, 0, "2026.3",
+            "https://github.com/jcoffin1/demo/releases/download/v2026.3/demo-2026.3.nvda-addon",
+            matching_release_tag="v2026.2",
+            matching_release_download_url="https://github.com/jcoffin1/demo/releases/download/v2026.2/demo-2026.2.nvda-addon",
+        )
+        item = publisher.store_release_item(report)
+        self.assertTrue(item["downloadUrl"].endswith("/v2026.2/demo-2026.2.nvda-addon"))
+        self.assertEqual([], publisher.store_readiness_reasons(report))
+
     def test_existing_matching_release_is_repaired_instead_of_recreated(self):
         with tempfile.TemporaryDirectory() as folder:
             package = Path(folder) / "Demo-2026.2.nvda-addon"
@@ -714,6 +747,18 @@ class EngineTests(unittest.TestCase):
         self.assertFalse(verified)
         self.assertIn("symbolic link", error)
 
+    def test_release_validation_reads_every_member_and_rejects_corrupt_binary_data(self):
+        payload = io.BytesIO()
+        marker = b"unique-binary-member-content"
+        with zipfile.ZipFile(payload, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("manifest.ini", "name = Demo\nversion = 2026.2\n")
+            archive.writestr("synthDrivers/demo.dll", marker)
+        damaged = bytearray(payload.getvalue()); offset = damaged.find(marker)
+        self.assertGreaterEqual(offset, 0); damaged[offset] ^= 0xFF
+        verified, error, _issues = publisher._verify_release_payload(bytes(damaged), "Demo", "2026.2")
+        self.assertFalse(verified)
+        self.assertIn("damaged or unsupported", error)
+
     @unittest.skipUnless(shutil.which("git"), "Git is required for the publish safety test")
     def test_push_rechecks_credentials_after_the_user_confirms(self):
         self.assertTrue(publisher._is_sensitive_path("config/.env.production"))
@@ -767,7 +812,8 @@ class EngineTests(unittest.TestCase):
             git("switch", "-c", "development/current", cwd=root); (root / "file.txt").write_text("release\n", encoding="utf-8"); git("commit", "-am", "release", cwd=root)
             git("push", "-u", "origin", "development/current", cwd=root); target = git("rev-parse", "HEAD", cwd=root)
             item = {"project_id": "demo", "name": "Demo", "root": str(root), "pushRemote": "origin", "defaultBranch": "main", "currentBranch": "development/current", "targetCommitish": target, "sourceUrl": "https://github.com/example/demo", "releaseBlocker": "pending", "defaultBranchCanFastForward": True}
-            promoted = publisher.promote_default_branches([item])[0]
+            with mock.patch.object(publisher, "_require_reviewed_push_url", return_value=str(remote)):
+                promoted = publisher.promote_default_branches([item])[0]
             remote_main = git("--git-dir", str(remote), "rev-parse", "refs/heads/main")
             current_branch = git("branch", "--show-current", cwd=root)
         self.assertEqual(target, remote_main)
@@ -831,6 +877,30 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(b"audited", package.read_bytes())
             self.assertIn("-ExecutionPolicy", run.call_args.args[0])
             self.assertIn("Bypass", run.call_args.args[0])
+
+    def test_release_package_finds_repository_builder_above_addon_manifest(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "project"; addon = root / "addon"; addon.mkdir(parents=True)
+            manifest = addon / "manifest.ini"; manifest.write_text(MANIFEST, encoding="utf-8")
+            (root / "build.ps1").write_text("# repository builder\n", encoding="utf-8")
+            def run_builder(_arguments, **kwargs):
+                self.assertEqual(root, kwargs["cwd"])
+                outputs = root / "outputs"; outputs.mkdir()
+                (outputs / "demo-1.0.nvda-addon").write_bytes(b"audited")
+                return ""
+            with mock.patch.object(publisher.shutil, "which", return_value="pwsh"), mock.patch.object(publisher, "_run", side_effect=run_builder) as run:
+                package = publisher.build_release_package(
+                    {"name": "demo", "version": "1.0", "manifest": str(manifest), "root": str(root)},
+                    Path(folder) / "packages",
+                )
+            self.assertEqual(b"audited", package.read_bytes())
+            run.assert_called_once()
+
+    def test_generic_package_filename_cannot_escape_output_folder(self):
+        for name, version in (("../outside", "1.0"), ("C:\\outside", "1.0"), ("demo", "../1.0"), ("demo", "1.0/other")):
+            with self.subTest(name=name, version=version):
+                with self.assertRaisesRegex(RuntimeError, "safe release-package filename"):
+                    publisher._safe_package_filename(name, version)
 
     def test_project_builder_cannot_reuse_a_stale_package(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -942,6 +1012,11 @@ class EngineTests(unittest.TestCase):
         remotes = {"origin": "https://github.com/samtupy/b32tts_wrapper.git"}
         self.assertEqual(("origin", remotes["origin"]), publisher._select_publish_remote(remotes, "jcoffin1"))
 
+    def test_pushurl_cannot_redirect_a_reviewed_remote_to_another_repository(self):
+        with mock.patch.object(publisher, "_git", return_value="https://github.com/other-account/other-repository.git"):
+            with self.assertRaisesRegex(RuntimeError, "pushes to a different repository"):
+                publisher._require_reviewed_push_url(Path("C:/project"), "origin", "https://github.com/jcoffin1/demo.git", "Demo")
+
     def test_non_github_remotes_do_not_block_github_discovery_or_matching(self):
         local_only = {"origin": "file:///C:/repositories/demo.git"}
         self.assertEqual(("", ""), publisher._select_publish_remote(local_only, "jcoffin1"))
@@ -950,6 +1025,8 @@ class EngineTests(unittest.TestCase):
             "fork": "https://github.com/jcoffin1/demo.git",
         }
         self.assertEqual("fork", publisher._matching_remote_name(mixed, "https://github.com/jcoffin1/demo"))
+        self.assertEqual("publisher", publisher._available_remote_name(local_only))
+        self.assertEqual("publisher3", publisher._available_remote_name({"origin": "local", "publisher": "one", "publisher2": "two"}))
 
     def test_staged_change_check_distinguishes_changes_from_git_errors(self):
         for returncode, expected in ((0, False), (1, True)):
@@ -972,6 +1049,18 @@ class EngineTests(unittest.TestCase):
         )
         self.assertTrue(any("could not be verified" in reason for reason in publisher.store_readiness_reasons(report)))
 
+    def test_unpushed_status_fetches_and_compares_the_selected_remote_branch(self):
+        commands = []
+        def git(_root, *arguments):
+            commands.append(arguments)
+            return "2" if arguments[:2] == ("rev-list", "--count") else ""
+        with mock.patch.object(publisher, "_git", side_effect=git):
+            count, error = publisher._unpushed_status(Path("C:/project"), "fork", "main")
+        self.assertEqual((2, ""), (count, error))
+        self.assertIn(("fetch", "--no-tags", "fork", "+refs/heads/main:refs/remotes/fork/main"), commands)
+        self.assertIn(("rev-list", "--count", "refs/remotes/fork/main..HEAD"), commands)
+        self.assertFalse(any("@{upstream}" in argument for command in commands for argument in command))
+
     def test_source_change_after_review_blocks_push(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder); source = root / "manifest.ini"; source.write_text(MANIFEST, encoding="utf-8")
@@ -979,6 +1068,26 @@ class EngineTests(unittest.TestCase):
             source.write_text(MANIFEST.replace("1.0", "1.1"), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "changed after the publishing review"):
                 publisher._require_source_fingerprint(root, fingerprint, False, "Demo")
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required for release source-integrity tests")
+    def test_release_source_must_still_match_reviewed_files_and_pushed_commit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            manifest = root / "manifest.ini"; manifest.write_text(MANIFEST, encoding="utf-8")
+            subprocess.run(["git", "add", "manifest.ini"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
+            target = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+            item = {"root": str(root), "has_git": True, "targetCommitish": target, "source_fingerprint": publisher._source_fingerprint(root, True)}
+            manifest.write_text(MANIFEST.replace("1.0", "1.1"), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "changed after the publishing review"):
+                publisher._require_release_source(item, "Demo")
+            manifest.write_text(MANIFEST, encoding="utf-8")
+            subprocess.run(["git", "commit", "--allow-empty", "-m", "later"], cwd=root, check=True, capture_output=True)
+            with self.assertRaisesRegex(RuntimeError, "no longer at the commit"):
+                publisher._require_release_source(item, "Demo")
 
     def test_generated_build_and_python_cache_paths_are_not_published(self):
         self.assertTrue(publisher._is_generated_path("build-local/package/file.dll"))

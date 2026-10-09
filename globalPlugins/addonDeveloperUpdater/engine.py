@@ -757,14 +757,18 @@ def update(path: Path, release: Release, backup_root: Path, apply_changes: bool 
     backup = _next_backup_path(backup_folder); shutil.copy2(path, backup)
     changed = original[:match.start()] + f"{match.group(1)}{match.group('quote')}{release.manifest_version}{match.group('quote')}{match.group('suffix')}{match.group('cr')}" + original[match.end():]
     _write_manifest_preserving_format(path, changed)
-    errors = validate(path, check_python=False)
+    try:
+        errors = validate(path, check_python=False)
+        target_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        _atomic_replace_bytes(path, raw)
+        raise
     if errors:
         _atomic_replace_bytes(path, raw)
         return ProjectResult(identifier, name, str(path), "validation failed after the update; the original manifest was restored: " + "; ".join(errors))
-    target_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     return ProjectResult(identifier, name, str(path), f"updated to {release.manifest_version}", str(backup), current, release.manifest_version, target_hash)
 
-def downgrade(path: Path, target_version: str, backup_root: Path, official_versions: dict[str, bool]) -> ProjectResult:
+def downgrade(path: Path, target_version: str, backup_root: Path, official_versions: dict[str, bool], cancelled=lambda: False) -> ProjectResult:
     target_version = target_version.strip(); version_tuple(target_version)
     metadata = values(path); name = metadata.get("name", path.parent.name); identifier = project_id(path)
     if target_version not in official_versions: return ProjectResult(identifier, name, str(path), f"validation failed: {target_version} is not a recognized NVDA API version")
@@ -780,16 +784,22 @@ def downgrade(path: Path, target_version: str, backup_root: Path, official_versi
     original = raw[len(codecs.BOM_UTF8):].decode("utf-8") if raw.startswith(codecs.BOM_UTF8) else raw.decode("utf-8")
     match = LAST_TESTED.search(original)
     if not match: return ProjectResult(identifier, name, str(path), "validation failed: compatibility key not found")
+    if cancelled(): return ProjectResult(identifier, name, str(path), "cancelled")
     safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" .")[:80] or "add-on"; safe_target = re.sub(r"[^A-Za-z0-9._-]+", "_", target_version).strip(".")[:80] or "target"
     backup_folder = backup_root / f"compatibility-{safe_target}" / f"{safe_name}-{identifier}"; backup_folder.mkdir(parents=True, exist_ok=True)
     backup = _next_backup_path(backup_folder); shutil.copy2(path, backup)
     changed = original[:match.start()] + f"{match.group(1)}{match.group('quote')}{target_version}{match.group('quote')}{match.group('suffix')}{match.group('cr')}" + original[match.end():]
+    if cancelled(): return ProjectResult(identifier, name, str(path), "cancelled")
     _write_manifest_preserving_format(path, changed)
-    errors = validate(path, check_python=False)
+    try:
+        errors = validate(path, check_python=False)
+        target_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        _atomic_replace_bytes(path, raw)
+        raise
     if errors:
         _atomic_replace_bytes(path, raw)
         return ProjectResult(identifier, name, str(path), "validation failed after the change; the original manifest was restored: " + "; ".join(errors))
-    target_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     return ProjectResult(identifier, name, str(path), f"set last tested NVDA from {current} to {target_version}", str(backup), current, target_version, target_hash)
 
 def undo_compatibility_target(path: Path, backup_path: Path, expected_target: str, expected_hash: str, backup_root: Path) -> ProjectResult:
