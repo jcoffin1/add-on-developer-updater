@@ -6,7 +6,8 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $prunedNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-@('$recycle.bin', 'system volume information', 'windows', 'program files', 'program files (x86)', 'programdata', 'appdata', 'node_modules', '.venv', 'venv', '__pycache__', '.tox', '.mypy_cache', '.pytest_cache', 'build', 'dist', 'outputs', 'backups', '.nvdaaddonupdaterbackups', 'runtime tests') | ForEach-Object { [void]$prunedNames.Add($_) }
+# Keep this list identical to PRUNE_NAMES in engine.py.
+@('.git', '.hg', '.svn', '.vs', '.vscode', '.idea', '.ruff_cache', '.nox', '.eggs', 'site-packages', '$recycle.bin', 'system volume information', 'windows', 'program files', 'program files (x86)', 'programdata', 'appdata', 'node_modules', '.venv', 'venv', '__pycache__', '.tox', '.mypy_cache', '.pytest_cache', 'build', 'dist', 'outputs', 'backups', '.nvdaaddonupdaterbackups', 'runtime tests') | ForEach-Object { [void]$prunedNames.Add($_) }
 
 function Write-WorkerResult([hashtable]$Result) {
 	$json = $Result | ConvertTo-Json -Depth 8
@@ -41,11 +42,13 @@ function Test-DeveloperManifest([string]$ManifestPath) {
 
 function Find-Manifests($Roots, [int]$MaxDirectories, [int]$MaxSeconds) {
 	$found = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-	$stack = [System.Collections.Generic.Stack[string]]::new()
-	foreach ($root in $Roots) { if ($root) { $stack.Push([string]$root) } }
+	# Breadth-first order: add-on manifests sit near the top of their projects, so one
+	# enormous test or dependency tree cannot use the whole budget before other projects are reached.
+	$pending = [System.Collections.Generic.Queue[string]]::new(); $pendingDepths = [System.Collections.Generic.Queue[int]]::new()
+	foreach ($root in $Roots) { if ($root) { $pending.Enqueue([string]$root); $pendingDepths.Enqueue(0) } }
 	$started = [System.Diagnostics.Stopwatch]::StartNew(); $visited = 0
-	while ($stack.Count -gt 0 -and $visited -lt $MaxDirectories -and $started.Elapsed.TotalSeconds -lt $MaxSeconds) {
-		$directory = $stack.Pop(); $visited++
+	while ($pending.Count -gt 0 -and $visited -lt $MaxDirectories -and $started.Elapsed.TotalSeconds -lt $MaxSeconds) {
+		$directory = $pending.Dequeue(); $depth = $pendingDepths.Dequeue(); $visited++
 		if (($visited % 25) -eq 0) { Start-Sleep -Milliseconds 10 }
 		if (-not [System.IO.Directory]::Exists($directory) -or (Test-Offline $directory)) { continue }
 		try {
@@ -54,11 +57,13 @@ function Find-Manifests($Roots, [int]$MaxDirectories, [int]$MaxSeconds) {
 			}
 			foreach ($child in [System.IO.Directory]::EnumerateDirectories($directory)) {
 				$name = [System.IO.Path]::GetFileName($child)
-				if (-not $prunedNames.Contains($name) -and -not $name.StartsWith('nvda-addon-test-', [System.StringComparison]::OrdinalIgnoreCase) -and -not (Test-Offline $child)) { $stack.Push($child) }
+				if (-not $prunedNames.Contains($name) -and -not $name.StartsWith('nvda-addon-test-', [System.StringComparison]::OrdinalIgnoreCase) -and -not (Test-Offline $child)) { $pending.Enqueue($child); $pendingDepths.Enqueue($depth + 1) }
 			}
 		} catch { continue }
 	}
-	return [pscustomobject]@{ manifests = @($found); directoriesVisited = $visited; truncated = ($stack.Count -gt 0); elapsedSeconds = [Math]::Round($started.Elapsed.TotalSeconds, 2) }
+	# The queue stays ordered by depth, so every level above the next pending folder was searched completely.
+	$completeDepth = if ($pending.Count -gt 0) { $pendingDepths.Peek() - 1 } else { $null }
+	return [pscustomobject]@{ manifests = @($found); directoriesVisited = $visited; truncated = ($pending.Count -gt 0); completeDepth = $completeDepth; elapsedSeconds = [Math]::Round($started.Elapsed.TotalSeconds, 2) }
 }
 
 try {
@@ -68,7 +73,7 @@ try {
 		$request.manifestPaths | Where-Object { $_ -and [System.IO.File]::Exists([string]$_) -and -not (Test-Offline ([string]$_)) } | ForEach-Object { [void]$manifestSet.Add([System.IO.Path]::GetFullPath([string]$_)) }
 		$manifests = @($manifestSet)
 		$unavailableManifestPaths = @($request.manifestPaths | Where-Object { $_ -and (-not [System.IO.File]::Exists([string]$_) -or (Test-Offline ([string]$_))) })
-		$directoriesVisited = 0; $truncated = $false; $elapsedSeconds = 0
+		$directoriesVisited = 0; $truncated = $false; $completeDepth = $null; $elapsedSeconds = 0
 	} else {
 		$roots = @($request.roots)
 		if ([bool]$request.fullSystem) {
@@ -85,9 +90,9 @@ try {
 			if ([System.IO.File]::Exists([string]$savedPath) -and -not (Test-Offline ([string]$savedPath))) { [void]$manifestSet.Add([System.IO.Path]::GetFullPath([string]$savedPath)) }
 			else { $unavailableManifestPaths += [string]$savedPath }
 		}
-		$manifests = @($manifestSet); $directoriesVisited = $scan.directoriesVisited; $truncated = $scan.truncated; $elapsedSeconds = $scan.elapsedSeconds
+		$manifests = @($manifestSet); $directoriesVisited = $scan.directoriesVisited; $truncated = $scan.truncated; $completeDepth = $scan.completeDepth; $elapsedSeconds = $scan.elapsedSeconds
 	}
-	Write-WorkerResult @{ ok = $true; manifests = @($manifests); unavailableManifestPaths = @($unavailableManifestPaths); directoriesVisited = $directoriesVisited; truncated = $truncated; elapsedSeconds = $elapsedSeconds; completedAt = [DateTime]::UtcNow.ToString('o') }
+	Write-WorkerResult @{ ok = $true; manifests = @($manifests); unavailableManifestPaths = @($unavailableManifestPaths); directoriesVisited = $directoriesVisited; truncated = $truncated; completeDepth = $completeDepth; elapsedSeconds = $elapsedSeconds; completedAt = [DateTime]::UtcNow.ToString('o') }
 } catch {
 	Write-WorkerResult @{ ok = $false; error = $_.Exception.Message; manifests = @(); completedAt = [DateTime]::UtcNow.ToString('o') }
 	exit 1

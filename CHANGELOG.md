@@ -1,5 +1,62 @@
 # Changelog
 
+## 2026.2.54
+
+- Show each add-on's public name in the tracking window instead of its internal ID. ChatGPT Desktop Access and Codex Status Announcer share the internal ID codexStatusAnnouncer, so they previously appeared under the same name.
+- Describe every found copy so copies of the same add-on can be told apart: version, newest or older copy, whether you already track another copy, whether its code is on GitHub with everything pushed, uncommitted files or unpushed commits, or only on this computer, a branch other than main, the date it last changed, and a shorter folder path.
+- List copies of the same add-on together, newest first.
+- Use public names in scan summaries, the tracking confirmation, and its results.
+
+## 2026.2.53
+
+- Rename the window that opens after a scan to "Choose add-ons to track" and explain in plain words what checking an add-on does: tracked add-ons are checked for new NVDA versions and can be published to GitHub and submitted to the Add-on Store.
+- Replace "forks you do not maintain" and similar wording with everyday examples of what to leave unchecked: someone else's add-on you downloaded, a backup, or a test copy.
+- Use the same "track" wording in the confirmation, results, scan summaries, status report, settings, command list, and user guide instead of "approve" and "awaiting approval".
+
+## 2026.2.52
+
+- Show every question and result in a focused, read-only text field. NVDA speaks the first line, and the rest can be read with the arrow keys or on a braille display one line at a time. Questions were previously plain text that could only be re-read with the review cursor.
+- Put the question or outcome on the first line of every message, followed by one fact per line, with lists split into one item per line.
+- Rewrite the publishing, release, default-branch, pull-request, version-increase, Store, scan-result, and status messages in plainer language, with Yes and No explained at the end.
+- Make Escape answer No in every question window and close every result window, and let Enter in a message choose the highlighted button.
+- Stop speaking results before showing them, and stop speaking long announcements just before a window opens, where they were cut off.
+- Hide the progress bar until real step counts exist. It previously cycled through percentages every two seconds, which NVDA could beep or speak.
+- Add an optional tone before background announcements of new results.
+- Shorten the Store setting labels, which NVDA reads in full each time a field gains focus.
+
+## 2026.2.51
+
+- Search development folders level by level. One large test or dependency folder previously used the whole 20,000-folder budget before other projects were reached. Git and editor metadata folders are now skipped.
+- When discovery reaches its limit, report how many folder levels were searched completely instead of only saying it stopped.
+- Allow the cancel command to stop GitHub safety checks, builds, pushes, default-branch updates, and releases between projects. A push or upload in progress always finishes, and the result names what was completed.
+- Give project builders 30 minutes and pushes, fetches, and uploads 15 minutes before stopping them; quick Git and GitHub queries keep the 3-minute limit.
+- Begin compatibility update results with "Compatibility update complete" instead of "Scan complete".
+- Keep an earlier result visible below a newer one when a results window is already open.
+- Remove the unused Python copy of project discovery and test discovery rules against the real worker.
+
+## 2026.2.50
+
+- Parse every Python file in a release package before pushing and before upload. Packages with syntax errors were previously accepted, because the syntax check was disabled for all projects inside NVDA.
+- Check that syntax against the Python bundled with the add-on's `minimumNVDAVersion` (3.7 for NVDA 2019.3 to 2023.3, 3.11 for 2024.1 to 2025.3, 3.13 for 2026.1 and later), including Python 3.12 f-string forms that the standard version check misses.
+- Warn in the publishing confirmation when a new release has no usable changelog notes and would use the one-line description.
+
+## 2026.2.49
+
+- Offer to increment the patch version when the current version already has a GitHub Release without the local changes. The manifest, a matching `buildVars.py` `addon_version`, and readme version lines are changed together, then publishing is checked again before anything is pushed.
+- Use the matching `CHANGELOG.md` section, or the manifest changelog for projects without a changelog file, as GitHub Release notes. Commit messages are still never published, and notes with automated-authorship wording fall back to the fixed description.
+- Fill the Store form publisher from the manifest author and the license from a recognized project license file. New settings provide a publisher override and fallback license details; unrecognized licenses are left blank with a warning instead of being prefilled incorrectly.
+- Pass `-Version` only to project `build.ps1` scripts that declare it, so other builders run instead of failing with a PowerShell parameter error.
+- Show compatibility update results in a reviewable window as well as speech.
+- Read NVDA release tags from release-feed entry IDs, so the offline fallback keeps working if release titles change.
+- Move dialogs into their own module and scan scheduling, publishing plans, and release-channel decisions into tested modules.
+
+## 2026.2.48
+
+- Keep the reviewed-source check stable when publishing commits the deletion of a tracked file, so release creation no longer stops with a false "source files changed" error.
+- Match the bare automated-authorship acronym only in capital letters, so ordinary lowercase words such as Italian "ai" in shipped translations no longer block release validation.
+- Keep the release channel detected during the publishing preflight instead of replacing it with "stable" for projects that were never updated through the compatibility review.
+- Treat GitHub repository URLs with a trailing slash as the same repository as their Git remote.
+
 ## 2026.2.47
 
 - Stop release creation if source files or Git HEAD change after the reviewed commit is pushed.

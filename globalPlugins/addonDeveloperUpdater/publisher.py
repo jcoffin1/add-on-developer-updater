@@ -5,6 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
+    from . import python_compatibility
+except ImportError:
+    # Unit tests and the build tool import these modules directly from their folder.
+    import python_compatibility
+
+try:
     from ._vendor import yaml
 except ImportError:
     # Unit tests also import this module directly from its folder.
@@ -20,7 +26,20 @@ _GitHubYamlLoader.yaml_implicit_resolvers = {
 _GitHubYamlLoader.add_implicit_resolver("tag:yaml.org,2002:bool", re.compile(r"^(?:true|false)$", re.I), list("tTfF"))
 
 STORE_FORM = "https://github.com/nvaccess/addon-datastore/issues/new?template=registerAddon.yml"
-STORE_PUBLISHER = "Justin Coffin"
+LICENSE_FILE_NAMES = ("copying.txt", "copying", "copying.md", "license", "license.txt", "license.md")
+# Each signature matches the heading of a standard license text.  The earliest
+# match wins, so a GPL text that mentions another license later is unaffected.
+_LICENSE_SIGNATURES = (
+    (re.compile(r"GNU LESSER GENERAL PUBLIC LICENSE\s+Version 3", re.I), "LGPL v3", "https://www.gnu.org/licenses/lgpl-3.0.html"),
+    (re.compile(r"GNU LESSER GENERAL PUBLIC LICENSE\s+Version 2\.1", re.I), "LGPL v2.1", "https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html"),
+    (re.compile(r"GNU GENERAL PUBLIC LICENSE\s+Version 3", re.I), "GPL v3", "https://www.gnu.org/licenses/gpl-3.0.html"),
+    (re.compile(r"GNU GENERAL PUBLIC LICENSE\s+Version 2", re.I), "GPL v2", "https://www.gnu.org/licenses/gpl-2.0.html"),
+    (re.compile(r"Apache License\s+Version 2\.0", re.I), "Apache 2.0", "https://www.apache.org/licenses/LICENSE-2.0"),
+    (re.compile(r"Mozilla Public License,?\s+(?:Version|v\.)\s*2\.0", re.I), "MPL 2.0", "https://www.mozilla.org/MPL/2.0/"),
+    (re.compile(r"\bMIT License\b|Permission is hereby granted, free of charge", re.I), "MIT", "https://opensource.org/license/mit"),
+)
+CHANGELOG_FILE_NAMES = ("changelog.md", "changes.md", "history.md")
+MAX_RELEASE_NOTES_CHARACTERS = 20000
 GITHUB_DEVICE_URL = "https://github.com/login/device"
 GITHUB_CLI_URL = "https://cli.github.com/"
 NVDA_API_VERSIONS_URL = "https://raw.githubusercontent.com/nvaccess/addon-datastore/master/transform/nvdaAPIVersions.json"
@@ -32,7 +51,9 @@ GENERATED_SUFFIXES = {".pyc", ".pyo"}
 MAX_PACKAGE_BYTES = 100 * 1024 * 1024
 MAX_EXPANDED_PACKAGE_BYTES = 512 * 1024 * 1024
 _AI_DISCLOSURE_PATTERNS = (
-    re.compile(r"\b" + "A" + "I" + r"\b", re.I),
+    # The bare acronym is case-sensitive: lowercase "ai" is an ordinary word in
+    # Italian, Portuguese, and other translations shipped in locale files.
+    re.compile(r"\b" + "A" + "I" + r"\b"),
     re.compile(r"\bAI(?:[- ]generated|[- ]written|[- ]authored)\b", re.I),
     re.compile(r"\b(?:generated|written|authored|created)\s+(?:by|with|using)\s+(?:an?\s+)?(?:" + "A" + "I" + r"|ChatGPT|OpenAI|Codex|Copilot)\b", re.I),
     re.compile(r"\b(?:" + "A" + "I" + r" agent|artificial " + "intelligence" + r"|large language " + "model" + r"|LLM-" + "generated" + r")\b", re.I),
@@ -44,6 +65,17 @@ class AuthenticationRequired(RuntimeError):
 
 class GitHubCliRequired(RuntimeError):
     pass
+
+class OperationCancelled(RuntimeError):
+    """Raised between projects when the user cancels; completed lists finished items."""
+    def __init__(self, completed=()):
+        super().__init__("the operation was cancelled")
+        self.completed = list(completed)
+
+def _stop_if_cancelled(cancelled, completed=()) -> None:
+    # Cancellation is honored only between projects, never during a push or upload.
+    if cancelled is not None and cancelled():
+        raise OperationCancelled(completed)
 
 
 _PROCESS_LOCK = threading.Lock()
@@ -111,6 +143,9 @@ class ProjectPublishInfo:
     matching_release_targets_head: bool = True
     unpushed_check_error: str = ""
     source_fingerprint: str = ""
+    license_name: str = ""
+    license_url: str = ""
+    release_notes: str = ""
 
 @dataclass(frozen=True)
 class GitHubAddonRepository:
@@ -406,6 +441,158 @@ def public_name(item) -> str:
     value = item.get if isinstance(item, dict) else lambda key, default=None: getattr(item, key, default)
     return str(value("summary", "") or value("name", "") or "add-on").strip()
 
+def store_publisher_name(author: str) -> str:
+    """Return a manifest author without e-mail addresses for the Store form."""
+    without_addresses = re.sub(r"\s*<[^>]*>", "", str(author or ""))
+    return " ".join(without_addresses.split()).strip(" ,")
+
+def _project_folders(root: Path, manifest_folder: Path) -> list[Path]:
+    folders = []
+    for folder in (manifest_folder, root):
+        if all(os.path.normcase(str(folder)) != os.path.normcase(str(existing)) for existing in folders):
+            folders.append(folder)
+    return folders
+
+def _named_files(folder: Path, names: tuple[str, ...]) -> list[Path]:
+    try:
+        children = {child.name.casefold(): child for child in folder.iterdir() if child.is_file()}
+    except OSError:
+        return []
+    return [children[name] for name in names if name in children]
+
+def detect_license(root: Path, manifest_folder: Path) -> tuple[str, str]:
+    """Identify a standard license from the project's license file, or return blanks."""
+    for folder in _project_folders(root, manifest_folder):
+        for path in _named_files(folder, LICENSE_FILE_NAMES):
+            try:
+                if path.stat().st_size > 1024 * 1024: continue
+                text = path.read_text(encoding="utf-8-sig", errors="replace")[:20000]
+            except OSError:
+                continue
+            matches = [(match.start(), name, url) for pattern, name, url in _LICENSE_SIGNATURES if (match := pattern.search(text))]
+            if matches:
+                _start, name, url = min(matches)
+                return name, url
+    return "", ""
+
+def _version_pattern(version: str) -> str:
+    return r"(?<![\w.])v?" + re.escape(normalized_version(version)) + r"(?![\w]|\.\d)"
+
+def _changelog_section(text: str, version: str) -> str:
+    headings = list(re.finditer(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", text, re.M))
+    for index, heading in enumerate(headings):
+        if not re.search(_version_pattern(version), heading.group(2), re.I):
+            continue
+        level = len(heading.group(1)); end = len(text)
+        for later in headings[index + 1:]:
+            if len(later.group(1)) <= level:
+                end = later.start(); break
+        return text[heading.end():end].strip()
+    return ""
+
+def release_notes(root: Path, manifest_folder: Path, version: str, manifest_changelog: str = "") -> str:
+    """Return reviewed local notes for a version, or an empty string for the fixed notes.
+
+    A project's changelog file is preferred.  The manifest changelog is used only
+    when no changelog file exists, because a changelog file without this version
+    means the manifest text probably describes an earlier release.
+    """
+    changelog_files = [path for folder in _project_folders(root, manifest_folder) for path in _named_files(folder, CHANGELOG_FILE_NAMES)]
+    notes = ""
+    for path in changelog_files:
+        try: notes = _changelog_section(path.read_text(encoding="utf-8-sig", errors="replace"), version)
+        except OSError: continue
+        if notes: break
+    if not changelog_files:
+        notes = str(manifest_changelog or "").strip()
+    if not notes or _public_text_disclosure_issues(notes, "release notes"):
+        return ""
+    if len(notes) > MAX_RELEASE_NOTES_CHARACTERS:
+        notes = notes[:MAX_RELEASE_NOTES_CHARACTERS].rsplit("\n", 1)[0] + "\n\n(Notes shortened; see the project changelog for the complete list.)"
+    return notes
+
+def next_patch_version(version: str) -> str:
+    """Return the next patch version for a numeric version, or an empty string."""
+    match = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?", str(version or "").strip())
+    if not match: return ""
+    major, minor, patch = match.groups()
+    return f"{major}.{minor}.{int(patch) + 1}" if patch is not None else f"{major}.{minor}.1"
+
+def _read_text_preserving_format(path: Path) -> tuple[bytes, str, bool]:
+    raw = path.read_bytes(); has_bom = raw.startswith(b"\xef\xbb\xbf")
+    return raw, raw[3:].decode("utf-8") if has_bom else raw.decode("utf-8"), has_bom
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream: stream.write(data)
+        os.chmod(temporary, mode); os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+
+def increment_project_version(manifest: Path, root: Path, current: str, new: str) -> list[str]:
+    """Change an add-on version in its manifest, buildVars.py, and readme version lines.
+
+    Every file is checked before anything is written, and written files are
+    restored if a later write fails.  Returns the changed paths.
+    """
+    if not next_patch_version(current) or not re.fullmatch(r"\d+\.\d+\.\d+", new or ""):
+        raise RuntimeError(f"version {current} cannot be incremented automatically")
+    planned = {}
+    raw, text, has_bom = _read_text_preserving_format(manifest)
+    manifest_line = re.compile(r"^([ \t]*version[ \t]*=[ \t]*)([\"']?)" + re.escape(current) + r"\2([ \t]*(?:[#;].*)?)(\r?)$", re.I | re.M)
+    if len(manifest_line.findall(text)) != 1:
+        raise RuntimeError(f"{manifest} does not contain exactly one version = {current} line")
+    planned[manifest] = (raw, manifest_line.sub(lambda match: f"{match.group(1)}{match.group(2)}{new}{match.group(2)}{match.group(3)}{match.group(4)}", text), has_bom)
+    for folder in _project_folders(root, manifest.parent):
+        build_variables = folder / "buildVars.py"
+        if not build_variables.is_file(): continue
+        raw, text, has_bom = _read_text_preserving_format(build_variables)
+        if not re.search(r"[\"']addon_version[\"']", text): continue
+        entry = re.compile(r"([\"']addon_version[\"']\s*:\s*)([\"'])" + re.escape(current) + r"\2")
+        if len(entry.findall(text)) != 1:
+            raise RuntimeError(f"{build_variables} defines addon_version in a form that cannot be changed safely; update the version manually")
+        planned[build_variables] = (raw, entry.sub(lambda match: f"{match.group(1)}{match.group(2)}{new}{match.group(2)}", text), has_bom)
+    documentation = manifest.parent / "doc"
+    for path in sorted(documentation.glob("*/readme.*")) if documentation.is_dir() else []:
+        if path.suffix.casefold() not in {".html", ".htm", ".md", ".txt"}: continue
+        raw, text, has_bom = _read_text_preserving_format(path)
+        if f"Version {current}." in text:
+            planned[path] = (raw, text.replace(f"Version {current}.", f"Version {new}."), has_bom)
+    written = []
+    try:
+        for path, (_raw, changed, has_bom) in planned.items():
+            _atomic_write_bytes(path, (b"\xef\xbb\xbf" if has_bom else b"") + changed.encode("utf-8")); written.append(path)
+    except Exception:
+        for path in written:
+            try: _atomic_write_bytes(path, planned[path][0])
+            except OSError: pass
+        raise
+    return [str(path) for path in written]
+
+def publish_plan(reports: list) -> tuple[list, list, list]:
+    """Split preflight reports into publishable, not-owned, and version-conflict groups."""
+    owned = [report for report in reports if getattr(report, "repository_owned_by_user", True)]
+    not_owned = [report for report in reports if not getattr(report, "repository_owned_by_user", True)]
+    conflicts = [report for report in owned if release_publish_action(report) == "version-conflict"]
+    eligible = [report for report in owned if release_publish_action(report) != "version-conflict" and (report.changed_files or report.unpushed_commits or not report.remote or release_publish_action(report))]
+    return eligible, not_owned, conflicts
+
+def reports_with_current_releases(reports: list) -> list:
+    """Return owned reports whose newest GitHub Release already matches the local version."""
+    return [report for report in reports if getattr(report, "repository_owned_by_user", True) and not release_needed(getattr(report, "version", ""), getattr(report, "github_release_version", "")) and getattr(report, "github_release_download_url", "") and getattr(report, "remote", "")]
+
+def reports_without_release_notes(reports: list) -> list:
+    """Return reports whose new release would fall back to the one-line notes."""
+    return [report for report in reports if release_publish_action(report) == "create" and not getattr(report, "release_notes", "")]
+
+def resolve_release_channels(items: list[dict], saved_channels: dict) -> None:
+    """Keep each preflight channel, using saved update channels only when one is missing."""
+    saved = saved_channels if isinstance(saved_channels, dict) else {}
+    for item in items:
+        item["channel"] = item.get("channel") or saved.get(item.get("project_id"), "stable")
+
 def _repository_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or "nvda-addon"
 
@@ -437,15 +624,24 @@ def _command_failure_detail(stdout: str | None, stderr: str | None, limit: int =
     return "\n".join(excerpts)
 
 
-def _run(arguments: list[str], cwd: Path | None = None, input_text: str | None = None) -> str:
+# Quick Git and GitHub queries keep a short limit; transfers and project builders
+# (which may run complete test suites) get longer limits so they are not killed midway.
+COMMAND_TIMEOUT_SECONDS = 180
+TRANSFER_TIMEOUT_SECONDS = 15 * 60
+BUILDER_TIMEOUT_SECONDS = 30 * 60
+
+def _timeout_text(seconds: int) -> str:
+    return f"{seconds // 60}-minute" if seconds % 60 == 0 and seconds >= 600 else f"{seconds}-second"
+
+def _run(arguments: list[str], cwd: Path | None = None, input_text: str | None = None, timeout: int = COMMAND_TIMEOUT_SECONDS) -> str:
     process = subprocess.Popen(arguments, cwd=cwd, stdin=subprocess.PIPE if input_text is not None else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     _track_process(process)
     try:
         try:
-            stdout, stderr = process.communicate(input_text, timeout=180)
+            stdout, stderr = process.communicate(input_text, timeout=timeout)
         except subprocess.TimeoutExpired as error:
             _terminate_process(process)
-            raise RuntimeError(f"{Path(arguments[0]).name} exceeded the 180-second safety limit") from error
+            raise RuntimeError(f"{Path(arguments[0]).name} exceeded the {_timeout_text(timeout)} safety limit") from error
     finally:
         _untrack_process(process)
     if process.returncode:
@@ -496,6 +692,26 @@ def _archive_integrity_error(archive: zipfile.ZipFile) -> str:
     return ""
 
 
+def _package_python_error(payload: bytes, minimum_nvda: str) -> str:
+    """Return why packaged Python cannot load in the oldest supported NVDA, or an empty string."""
+    # Without a minimum version, still reject outright syntax errors.
+    try: target = python_compatibility.python_version_for_nvda(minimum_nvda or "2026.1")
+    except ValueError: return f"release package minimumNVDAVersion {minimum_nvda} is not a valid NVDA version"
+    errors = []
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        for info in archive.infolist():
+            if info.is_dir() or Path(info.filename).suffix.casefold() != ".py": continue
+            if info.file_size > 5 * 1024 * 1024:
+                errors.append(f"{info.filename}: Python file exceeds the 5 MB validation limit"); continue
+            try: source = archive.read(info).decode("utf-8-sig")
+            except UnicodeError as error:
+                errors.append(f"{info.filename}: {error}"); continue
+            errors.extend(python_compatibility.compatibility_errors(source, info.filename, target))
+            if len(errors) >= 5: break
+    if not errors: return ""
+    supported = f"NVDA {minimum_nvda}, the oldest supported version" if minimum_nvda else "NVDA"
+    return f"release package Python cannot load in {supported}: " + "; ".join(errors[:5])
+
 def _verify_release_payload(payload: bytes, expected_name: str, expected_version: str, api_versions=None, submission_channel="") -> tuple[bool, str, tuple[str, ...]]:
     """Verify the archive that will be, or already was, published."""
     try:
@@ -513,6 +729,8 @@ def _verify_release_payload(payload: bytes, expected_name: str, expected_version
         fields = {match.group(1).lower(): match.group(2).strip().strip('"\'') for match in re.finditer(r"^\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.*?)\s*$", manifest, re.M)}
         if fields.get("name", "").casefold() != expected_name.casefold(): return False, f"release package contains add-on {fields.get('name') or 'unknown'}, expected {expected_name}", ()
         if normalized_version(fields.get("version", "")).casefold() != normalized_version(expected_version).casefold(): return False, f"release package version {fields.get('version') or 'unknown'} does not match local version {expected_version}", ()
+        python_error = _package_python_error(payload, fields.get("minimumnvdaversion", ""))
+        if python_error: return False, python_error, ()
         guideline_issues = _manifest_guideline_issues(fields, api_versions, submission_channel) if api_versions is not None else []
         return True, "", tuple(guideline_issues + ai_issues)
     except (OSError, ValueError, UnicodeError, zipfile.BadZipFile, KeyError) as error:
@@ -740,8 +958,8 @@ def project_root(manifest: Path) -> Path:
         if (candidate / ".git").exists(): return candidate
     return manifest.parent
 
-def _git(root: Path, *arguments: str) -> str:
-    return _run(["git", "-C", str(root), *arguments])
+def _git(root: Path, *arguments: str, timeout: int = COMMAND_TIMEOUT_SECONDS) -> str:
+    return _run(["git", "-C", str(root), *arguments], timeout=timeout)
 
 def _repository_remotes(root: Path) -> dict[str, str]:
     remotes = {}
@@ -854,6 +1072,10 @@ def _source_fingerprint(root: Path, has_git: bool | None = None) -> str:
             paths.append((relative, path))
     digest = hashlib.sha256()
     for relative, path in sorted(paths, key=lambda item: item[0].casefold()):
+        # A tracked file deleted from the working tree disappears from Git's
+        # list once publishing commits the deletion; omit it in both states.
+        if not os.path.lexists(path):
+            continue
         digest.update(relative.replace("\\", "/").encode("utf-8", "surrogatepass")); digest.update(b"\0")
         try:
             if path.is_symlink():
@@ -889,7 +1111,7 @@ def _unpushed_status(root: Path, remote_name: str, default_branch: str) -> tuple
         if not remote_name or not default_branch:
             raise RuntimeError("the selected GitHub remote or its default branch is unknown")
         comparison = f"refs/remotes/{remote_name}/{default_branch}"
-        _git(root, "fetch", "--no-tags", remote_name, f"+refs/heads/{default_branch}:{comparison}")
+        _git(root, "fetch", "--no-tags", remote_name, f"+refs/heads/{default_branch}:{comparison}", timeout=TRANSFER_TIMEOUT_SECONDS)
         return int(_git(root, "rev-list", "--count", f"{comparison}..HEAD") or "0"), ""
     except (RuntimeError, ValueError) as error:
         return 0, f"local commit publication could not be verified: {error}"
@@ -908,7 +1130,7 @@ def _verify_first_release_asset(urls: list[str], metadata: dict, api_versions: d
             all_issues = issues
     return urls[0], False, first_error or "release package could not be verified", all_issues
 
-def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo]:
+def preflight(projects, values_reader, progress=None, cancelled=None) -> list[ProjectPublishInfo]:
     gh = gh_path()
     if progress: progress("Checking GitHub sign-in status")
     try: _run([gh, "auth", "status", "--active", "--hostname", "github.com"])
@@ -920,6 +1142,7 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
     except Exception as error: raise RuntimeError(f"current NVDA Add-on Store API versions could not be loaded: {error}") from error
     reports = []
     for index, project in enumerate(projects, 1):
+        _stop_if_cancelled(cancelled)
         manifest = Path(project.path).resolve(); root = project_root(manifest)
         metadata = values_reader(manifest); display_name = str(metadata.get("summary") or project.name)
         if progress: progress(f"Inspecting {display_name}, project {index} of {len(projects)}")
@@ -978,7 +1201,9 @@ def preflight(projects, values_reader, progress=None) -> list[ProjectPublishInfo
                 matching_download, matching_verified, matching_error = release_download, package_verified, package_error
             else:
                 matching_download, matching_verified, matching_error, _matching_issues = _verify_first_release_asset(matching_urls, metadata, api_versions, channel)
-        reports.append(ProjectPublishInfo(project.project_id, project.name, str(manifest), str(root), metadata.get("version", ""), metadata.get("summary", project.name), metadata.get("author", ""), remote, changed, has_git, unpushed, normalized_version(github_release), release_download, owned, package_verified, package_error, guideline_issues, channel, default_branch, current_branch, matching_tag, matching_download, matching_verified, matching_error, matching_targets_head, unpushed_error, _source_fingerprint(root, has_git)))
+        license_name, license_url = detect_license(root, manifest.parent)
+        notes = release_notes(root, manifest.parent, metadata.get("version", ""), metadata.get("changelog", ""))
+        reports.append(ProjectPublishInfo(project.project_id, project.name, str(manifest), str(root), metadata.get("version", ""), metadata.get("summary", project.name), metadata.get("author", ""), remote, changed, has_git, unpushed, normalized_version(github_release), release_download, owned, package_verified, package_error, guideline_issues, channel, default_branch, current_branch, matching_tag, matching_download, matching_verified, matching_error, matching_targets_head, unpushed_error, _source_fingerprint(root, has_git), license_name, license_url, notes))
     return reports
 
 def login() -> None:
@@ -1009,7 +1234,7 @@ def login() -> None:
     _run([gh, "auth", "status", "--active", "--hostname", "github.com"])
 
 def _remote_web_url(remote: str) -> str:
-    value = remote.strip()
+    value = remote.strip().rstrip("/")
     if value.startswith("git@github.com:"): value = "https://github.com/" + value.split(":", 1)[1]
     if value.endswith(".git"): value = value[:-4]
     if not value.startswith("https://github.com/"): raise RuntimeError(f"Unsupported GitHub remote: {remote}")
@@ -1045,7 +1270,7 @@ def release_target_status(root: Path, remote_name: str, default_branch: str, tar
         return "the repository's default branch could not be determined", False
     remote_reference = f"refs/remotes/{remote_name}/{default_branch}"
     try:
-        _git(root, "fetch", "--no-tags", remote_name, f"+refs/heads/{default_branch}:{remote_reference}")
+        _git(root, "fetch", "--no-tags", remote_name, f"+refs/heads/{default_branch}:{remote_reference}", timeout=TRANSFER_TIMEOUT_SECONDS)
         contained = _ancestor_result(root, target_commit, remote_reference)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         return f"the default-branch safety check failed: {error}", False
@@ -1069,9 +1294,10 @@ def release_target_blocker(root: Path, remote_name: str, default_branch: str, ta
     """Return why a pushed commit cannot safely be released, or an empty string."""
     return release_target_status(root, remote_name, default_branch, target_commit)[0]
 
-def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
+def push(reports: list[ProjectPublishInfo], progress=None, cancelled=None) -> list[dict]:
     gh = gh_path(); published = []
     for index, report in enumerate(reports, 1):
+        _stop_if_cancelled(cancelled, published)
         display_name = public_name(report)
         if release_publish_action(report) == "version-conflict":
             raise RuntimeError(f"{display_name} version {report.version} already has a GitHub Release that does not include the current local changes. Increment the manifest version before publishing the current code")
@@ -1129,7 +1355,7 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
             remote = _git(root, "remote", "get-url", push_remote)
         if progress: progress(f"Pushing {display_name} to GitHub")
         _require_reviewed_push_url(root, push_remote, remote, display_name)
-        _git(root, "push", "--set-upstream", push_remote, branch)
+        _git(root, "push", "--set-upstream", push_remote, branch, timeout=TRANSFER_TIMEOUT_SECONDS)
         # Releases must target the commit we actually pushed.  GitHub otherwise
         # defaults to the repository's default branch, which may be unrelated.
         target_commit = _git(root, "rev-parse", "HEAD")
@@ -1149,10 +1375,11 @@ def push(reports: list[ProjectPublishInfo], progress=None) -> list[dict]:
         if progress: progress(f"GitHub push finished for {display_name}, project {index} of {len(reports)}")
     return published
 
-def promote_default_branches(items: list[dict], progress=None) -> list[dict]:
+def promote_default_branches(items: list[dict], progress=None, cancelled=None) -> list[dict]:
     """Fast-forward confirmed repository default branches without checking out or merging locally."""
     promoted = []
     for index, item in enumerate(items, 1):
+        _stop_if_cancelled(cancelled, promoted)
         updated = dict(item); name = public_name(item); root = Path(item["root"])
         remote_name = str(item.get("pushRemote", "")); default_branch = str(item.get("defaultBranch", "")); target_commit = str(item.get("targetCommitish", ""))
         if progress: progress(f"Rechecking the default branch for {name}, project {index} of {len(items)}")
@@ -1164,7 +1391,7 @@ def promote_default_branches(items: list[dict], progress=None) -> list[dict]:
         try:
             if progress: progress(f"Fast-forwarding {default_branch} for {name}, project {index} of {len(items)}")
             _require_reviewed_push_url(root, remote_name, str(item.get("sourceUrl", "")), name)
-            _git(root, "push", remote_name, f"{target_commit}:refs/heads/{default_branch}")
+            _git(root, "push", remote_name, f"{target_commit}:refs/heads/{default_branch}", timeout=TRANSFER_TIMEOUT_SECONDS)
             blocker, can_fast_forward = release_target_status(root, remote_name, default_branch, target_commit)
             if blocker:
                 blocker = f"the default branch was pushed but could not be verified afterward: {blocker}"
@@ -1217,6 +1444,21 @@ def build_package(item: dict, output_folder: Path) -> Path:
         if "manifest.ini" not in archive.namelist(): raise RuntimeError(f"Package for {item['name']} has no root manifest.ini")
     return output
 
+def builder_accepts_version(script: Path) -> bool:
+    """Return whether a PowerShell builder declares a script-level Version parameter."""
+    try: text = script.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError): return False
+    text = re.sub(r"(?s)<#.*?#>", "", text); text = re.sub(r"(?m)#.*$", "", text)
+    match = re.search(r"(?i)\bparam\s*\(", text)
+    # A script parameter block may follow only attributes such as [CmdletBinding()].
+    if not match or not re.fullmatch(r"(?s)\s*(?:\[[^\]]*\]\s*)*", text[:match.start()]): return False
+    depth = 0
+    for index in range(match.end() - 1, len(text)):
+        depth += {"(": 1, ")": -1}.get(text[index], 0)
+        if depth == 0:
+            return bool(re.search(r"(?i)\$Version\b", text[match.end():index]))
+    return False
+
 def build_release_package(item: dict, output_folder: Path) -> Path:
     """Use a project's audited builder when it supplies one; otherwise use the safe generic builder."""
     source = _package_source(Path(item["manifest"]))
@@ -1233,7 +1475,11 @@ def build_release_package(item: dict, output_folder: Path) -> Path:
         for path in outputs.glob("*.nvda-addon")
     } if outputs.is_dir() else {}
     before_build = _source_fingerprint(project)
-    _run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(build_script), "-Version", str(item["version"])], cwd=project)
+    arguments = [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(build_script)]
+    # Builders without a Version parameter still run; the package filename and
+    # its root manifest are checked against the expected version afterward.
+    if builder_accepts_version(build_script): arguments += ["-Version", str(item["version"])]
+    _run(arguments, cwd=project, timeout=BUILDER_TIMEOUT_SECONDS)
     if _source_fingerprint(project) != before_build:
         raise RuntimeError(f"The project builder for {item['name']} changed source files; review those changes and run publishing again")
     candidates = [
@@ -1250,10 +1496,11 @@ def build_release_package(item: dict, output_folder: Path) -> Path:
         shutil.copy2(package, destination)
     return destination
 
-def validate_publish_builds(reports: list[ProjectPublishInfo], progress=None) -> None:
+def validate_publish_builds(reports: list[ProjectPublishInfo], progress=None, cancelled=None) -> None:
     """Prove releasable projects build successfully before changing GitHub."""
     pending = [report for report in reports if release_publish_action(report) in {"create", "repair"}]
     for index, report in enumerate(pending, 1):
+        _stop_if_cancelled(cancelled)
         display_name = public_name(report)
         if progress:
             progress(f"Validating release build for {display_name}, project {index} of {len(pending)}")
@@ -1264,14 +1511,17 @@ def validate_publish_builds(reports: list[ProjectPublishInfo], progress=None) ->
             detail = error or "; ".join(issues)
             raise RuntimeError(f"The release package for {display_name} did not pass validation: {detail}")
 
-def release_create_arguments(gh: str, tag: str, package: Path, repository: str, target: str, release_name: str, prerelease: bool = False) -> list[str]:
+def release_create_arguments(gh: str, tag: str, package: Path, repository: str, target: str, release_name: str, prerelease: bool = False, notes: str = "") -> list[str]:
     # Preflight compares the local version with the latest GitHub release, and
     # GitHub rejects duplicate tags.  Do not use --fail-on-no-commits here: gh
     # can falsely report no commits when --target is a SHA from a non-default
     # branch, and a version-only/package-only release is valid in any event.
-    # Use fixed factual text. GitHub-generated notes can import unreviewed commit
+    # Never use GitHub-generated notes: they can import unreviewed commit
     # messages into a public release after the submission audit has completed.
-    arguments = [gh, "release", "create", tag, str(package), "--repo", repository, "--target", target, "--title", f"{release_name} {tag.removeprefix('v')}", "--notes", f"Release package for {release_name} {tag.removeprefix('v')}." ]
+    # Reviewed local changelog notes are read from standard input; otherwise
+    # fixed factual text is used.
+    notes_arguments = ["--notes-file", "-"] if notes else ["--notes", f"Release package for {release_name} {tag.removeprefix('v')}."]
+    arguments = [gh, "release", "create", tag, str(package), "--repo", repository, "--target", target, "--title", f"{release_name} {tag.removeprefix('v')}", *notes_arguments]
     if prerelease:
         arguments.append("--prerelease")
     return arguments
@@ -1312,9 +1562,10 @@ def _require_release_source(item: dict, display_name: str) -> None:
             raise RuntimeError(f"{display_name} is no longer at the commit that was pushed and reviewed; run the GitHub command again")
 
 
-def release(items: list[dict], output_folder: Path, progress=None, on_released=None) -> list[dict]:
+def release(items: list[dict], output_folder: Path, progress=None, on_released=None, cancelled=None) -> list[dict]:
     gh = gh_path(); released = []
     for index, item in enumerate(items, 1):
+        _stop_if_cancelled(cancelled, released)
         display_name = public_name(item)
         if item.get("releaseBlocker"):
             raise RuntimeError(f"Release creation was stopped for {display_name}: {item['releaseBlocker']}")
@@ -1340,11 +1591,12 @@ def release(items: list[dict], output_folder: Path, progress=None, on_released=N
         prerelease = item.get("channel") in {"beta", "dev"} or any(stage in version for stage in ("alpha", "beta", "dev", "rc"))
         if action == "repair":
             if progress: progress(f"Repairing GitHub Release {tag} for {display_name}")
-            _run([gh, "release", "upload", tag, str(package), "--repo", repository, "--clobber"])
+            _run([gh, "release", "upload", tag, str(package), "--repo", repository, "--clobber"], timeout=TRANSFER_TIMEOUT_SECONDS)
         elif action == "create":
-            arguments = release_create_arguments(gh, tag, package, repository, target, item.get("summary") or item["name"], prerelease)
+            notes = str(item.get("release_notes") or "")
+            arguments = release_create_arguments(gh, tag, package, repository, target, item.get("summary") or item["name"], prerelease, notes)
             if progress: progress(f"Uploading GitHub Release {tag} for {display_name}")
-            _run(arguments)
+            _run(arguments, input_text=notes or None, timeout=TRANSFER_TIMEOUT_SECONDS)
         else:
             raise RuntimeError(f"GitHub Release {tag} for {display_name} is already complete; no release change is needed")
         download = _uploaded_asset_url(gh, repository, tag, package.name)
@@ -1358,13 +1610,16 @@ def release(items: list[dict], output_folder: Path, progress=None, on_released=N
         if progress: progress(f"GitHub Release published for {display_name}, release {index} of {len(items)}")
     return released
 
-def store_url(item: dict) -> str:
+def store_url(item: dict, publisher_override: str = "", fallback_license_name: str = "", fallback_license_url: str = "") -> str:
+    """Build a prefilled Store form; unknown publisher or license fields stay blank for manual entry."""
     version = item["version"].lower(); channel = item.get("channel") or ("dev" if "dev" in version or "alpha" in version else "beta" if "beta" in version or "rc" in version else "stable")
     submission_name = repository_name(item["sourceUrl"])
+    license_name = str(item.get("license_name") or "") or fallback_license_name.strip()
+    license_url = str(item.get("license_url") or "") if item.get("license_name") else fallback_license_url.strip()
     fields = {
         "title": f"[Submit add-on]: {submission_name} {item['version']}", "download-url": item["downloadUrl"],
-        "source-url": item["sourceUrl"], "publisher": STORE_PUBLISHER, "channel": channel,
-        "license-name": "GPL v2", "license-url": "https://www.gnu.org/licenses/gpl-2.0.html",
+        "source-url": item["sourceUrl"], "publisher": publisher_override.strip() or store_publisher_name(item.get("publisher", "")), "channel": channel,
+        "license-name": license_name, "license-url": license_url,
     }
     return STORE_FORM + "&" + urllib.parse.urlencode(fields)
 

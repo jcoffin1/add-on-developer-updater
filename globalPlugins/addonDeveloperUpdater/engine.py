@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-import ast, codecs, ctypes, hashlib, json, os, re, shutil, stat, subprocess, tempfile, time
+import codecs, ctypes, hashlib, json, os, re, shutil, stat, subprocess, tempfile, time
 import urllib.error, urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    from . import python_compatibility
+except ImportError:
+    # Unit tests and the build tool import these modules directly from their folder.
+    import python_compatibility
 
 RELEASES_URL = "https://api.github.com/repos/nvaccess/nvda/releases?per_page=30"
 RELEASES_FEED_URL = "https://github.com/nvaccess/nvda/releases.atom"
@@ -16,7 +22,8 @@ TAG_PATTERN = re.compile(r"^(?:release-)?(20\d{2})\.(\d+)(?:\.(\d+))?(?:(alpha|b
 LAST_TESTED = re.compile(r"^([ \t]*lastTestedNVDAVersion[ \t]*=[ \t]*)(?P<quote>[\"']?)(20\d{2}\.\d+(?:\.\d+)?)(?P=quote)(?P<suffix>[ \t]*(?:[#;].*)?)(?P<cr>\r?)$", re.I | re.M)
 VALUE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.*)$", re.M)
 TRIPLE_VALUE = re.compile(r"^[ \t]*([A-Za-z][A-Za-z0-9]*)[ \t]*=[ \t]*(?P<quote>\"\"\"|''')(?P<value>.*?)(?P=quote)[ \t]*(?:[#;].*)?$", re.M | re.S)
-PRUNE_NAMES = {"$recycle.bin", "system volume information", "windows", "program files", "program files (x86)", "programdata", "appdata", "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache", ".pytest_cache", "build", "dist", "outputs", "backups", ".nvdaaddonupdaterbackups", "runtime tests"}
+# Keep this list identical to worker.ps1, which performs discovery inside NVDA.
+PRUNE_NAMES = {".git", ".hg", ".svn", ".vs", ".vscode", ".idea", ".ruff_cache", ".nox", ".eggs", "site-packages", "$recycle.bin", "system volume information", "windows", "program files", "program files (x86)", "programdata", "appdata", "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache", ".pytest_cache", "build", "dist", "outputs", "backups", ".nvdaaddonupdaterbackups", "runtime tests"}
 MAX_PYTHON_FILE_BYTES = 5 * 1024 * 1024
 MAX_VALIDATION_ERRORS = 100
 WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
@@ -45,6 +52,12 @@ class ProjectResult:
     branch: str = ""
     manifest_changed: bool = False
     addon_version: str = ""
+    # Details that tell copies of the same add-on apart in the tracking window.
+    summary: str = ""
+    remote: str = ""
+    uncommitted_changes: int = -1
+    unpushed_commits: int = -1
+    last_change: str = ""
 
 @dataclass(frozen=True)
 class CompatibilityTargetProject:
@@ -71,6 +84,69 @@ def automatic_check_delay(state: dict, interval_minutes: int, now: datetime | No
         return max(30, interval - max(0, elapsed))
     except (KeyError, TypeError, ValueError):
         return 30
+
+def rescan_due(state: dict, hours: int, now: datetime | None = None) -> bool:
+    """Return whether periodic discovery should run, treating clock jumps as due."""
+    try:
+        elapsed = ((now or datetime.now(timezone.utc)) - datetime.fromisoformat(state.get("lastDiscoveryAt") or state["lastScanAt"])).total_seconds()
+        return elapsed < -300 or elapsed >= hours * 3600
+    except (AttributeError, KeyError, TypeError, ValueError): return True
+
+def worker_mode(manual: bool, state: dict, hours: int, now: datetime | None = None) -> str:
+    """Choose manual discovery, periodic discovery, or a check of saved manifests only."""
+    if manual: return "manual"
+    return "periodic" if rescan_due(state, hours, now) else "background"
+
+def submission_channel(release: Release) -> str:
+    """Return the Store channel implied by updating to an NVDA build."""
+    return "dev" if release_channel(release) == "alpha" else ("beta" if release.prerelease else "stable")
+
+_SENTENCE_BREAK = re.compile(r"(?<=[.?!])\s+(?=[\"'(\[]?[A-Z0-9])")
+
+def readable_text(text: str) -> str:
+    """Lay out a message for speech and braille: one sentence per line, one list item per line.
+
+    NVDA speaks the first line when a message field gains focus, and a braille
+    display shows one line at a time, so the outcome must stand alone on line one.
+    Text that already contains line breaks is treated as deliberately formatted.
+    """
+    text = str(text or "").strip()
+    if not text or "\n" in text:
+        return text
+    lines = []
+    for sentence in _SENTENCE_BREAK.split(text):
+        head, separator, rest = sentence.partition(": ")
+        items = [item.strip() for item in rest.split("; ")] if separator else []
+        if len(items) >= 2 and "; " not in head:
+            lines.append(head + ":"); lines.extend(items)
+        else:
+            lines.append(sentence.strip())
+    return "\n".join(lines)
+
+def first_line(text: str) -> str:
+    """Return the line NVDA speaks first, for announcing an updated message."""
+    return next((line.strip() for line in str(text or "").splitlines() if line.strip()), "")
+
+def readable_message(summary: str, details=(), next_step: str = "") -> str:
+    """Build a message whose first line is the outcome, followed by one fact per line."""
+    # An empty detail separates groups with one blank line; repeated or edge blanks are dropped.
+    lines = [summary.strip(), ""]
+    for detail in [*details, "", next_step]:
+        text = str(detail or "").strip()
+        if text or lines[-1]: lines.append(text)
+    while lines and not lines[-1]: lines.pop()
+    return "\n".join(lines)
+
+def information_window_text(message: str, previous_title: str, previous_text: str, earlier_label: str = "Earlier result", limit: int = 20000) -> str:
+    """Put a new result first while keeping an unread earlier result below it."""
+    separator = "\n\n"
+    if not previous_text or previous_text == message:
+        return message
+    if previous_text.startswith(message + separator):
+        # A repeated result is already shown first; keep what follows it.
+        return previous_text
+    combined = f"{message}{separator}{earlier_label}, {previous_title}:\n{previous_text}"
+    return combined if len(combined) <= limit else combined[:limit].rsplit("\n", 1)[0]
 
 def atomic_json_write(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,11 +272,21 @@ def _latest_alpha_release() -> Release | None:
 def _release_feed_items() -> list[dict]:
     request = urllib.request.Request(RELEASES_FEED_URL, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=15) as response:
-        root = ET.parse(response).getroot()
+        return parse_release_feed(ET.parse(response).getroot())
+
+def parse_release_feed(root) -> list[dict]:
+    """Read release tags from Atom entry IDs, falling back to titles.
+
+    Entry IDs end with the Git tag, such as .../release-2026.3beta4, so they stay
+    reliable even if NV Access gives a release a descriptive title.
+    """
     namespace = {"atom": "http://www.w3.org/2005/Atom"}; items = []
     for entry in root.findall("atom:entry", namespace):
         title = entry.findtext("atom:title", default="", namespaces=namespace).strip(); link = entry.find("atom:link", namespace)
-        items.append({"tag_name": title, "prerelease": bool(re.search(r"(?:alpha|beta|rc)\d*", title, re.I)), "html_url": link.get("href", "") if link is not None else ""})
+        identifier = entry.findtext("atom:id", default="", namespaces=namespace).strip()
+        id_tag = identifier.rsplit("/", 1)[-1] if "/" in identifier else ""
+        tag = next((candidate for candidate in (id_tag, title) if TAG_PATTERN.fullmatch(candidate)), title)
+        items.append({"tag_name": tag, "prerelease": bool(re.search(r"(?:alpha|beta|rc)\d*", tag, re.I)), "html_url": link.get("href", "") if link is not None else ""})
     return items
 
 def _release_with_status(release: Release, source: str, checked_at: str) -> Release:
@@ -426,24 +512,15 @@ def latest_release(include_prereleases: bool = True, cache_path: Path | None = N
         if cached := _cached_release(cache, include_prereleases): return cached
         raise RuntimeError(f"GitHub API and releases feed failed: {last_error}; {feed_error}") from feed_error
 
-def drive_roots() -> list[Path]:
-    mask = ctypes.windll.kernel32.GetLogicalDrives(); roots = []
-    for index in range(26):
-        if mask & (1 << index):
-            root = Path(f"{chr(65 + index)}:\\")
-            if ctypes.windll.kernel32.GetDriveTypeW(str(root)) in (2, 3): roots.append(root)
-    return roots
-
-def cloud_roots() -> list[Path]:
-    candidates = []
+def development_roots(extra_roots: str = "", home: Path | None = None, environment: dict | None = None) -> list[str]:
+    """Return normalized discovery roots: development folders, cloud storage, and configured extras."""
+    home = home or Path.home(); environment = os.environ if environment is None else environment
+    roots = [str(home / "Documents" / "NVDA Add-on Development" / "Add-ons"), str(home / "Documents" / "Codex")]
     for variable in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial", "Dropbox", "GoogleDrive", "iCloudDrive"):
-        if value := os.environ.get(variable): candidates.append(Path(value))
-    for name in ("OneDrive", "Dropbox", "Google Drive", "iCloudDrive"):
-        if (path := Path.home() / name).exists(): candidates.append(path)
-    return candidates
-
-def default_development_roots() -> list[Path]:
-    return [p for p in [Path.home() / "Documents" / "NVDA Add-on Development" / "Add-ons", Path.home() / "Documents" / "Codex", *cloud_roots()] if p.exists()]
+        if value := environment.get(variable): roots.append(value)
+    roots.extend(str(home / name) for name in ("OneDrive", "Dropbox", "Google Drive", "iCloudDrive"))
+    roots.extend(value.strip() for value in str(extra_roots or "").split(";") if value.strip())
+    return list(dict.fromkeys(os.path.normcase(os.path.expandvars(os.path.expanduser(root))) for root in roots))
 
 def is_offline(path: Path) -> bool:
     try:
@@ -466,29 +543,6 @@ def project_id(path: Path) -> str:
     # Use the manifest path, not just the repository root: monorepos can contain several add-ons.
     manifest = path.resolve()
     return hashlib.sha256(os.path.normcase(str(manifest)).encode("utf-8")).hexdigest()[:16]
-
-def discover_manifests(roots: list[Path], cancelled=lambda: False, max_directories: int = 20000, max_seconds: int = 60) -> list[Path]:
-    found: dict[tuple[str, str], Path] = {}
-    started = time.monotonic(); visited = 0
-    for root in roots:
-        if cancelled(): break
-        if not root.exists() or is_offline(root): continue
-        try:
-            for directory, dirnames, filenames in os.walk(root, topdown=True, onerror=lambda _error: None):
-                visited += 1
-                if cancelled() or visited > max_directories or time.monotonic() - started > max_seconds: return sorted(found.values())
-                if visited % 25 == 0: time.sleep(0.005)
-                base = Path(directory); dirnames[:] = [n for n in dirnames if not should_prune(n) and not is_offline(base / n)]
-                manifest_name = next((name for name in filenames if name.lower() == "manifest.ini"), None)
-                if manifest_name is None: continue
-                manifest = base / manifest_name
-                if is_offline(manifest) or manifest.parent.name.lower() == "locale": continue
-                try:
-                    metadata = values(manifest); root_path = project_root(manifest)
-                    if metadata.get("name") and metadata.get("lasttestednvdaversion") and root_path: found[(str(root_path).lower(), metadata["name"].lower())] = manifest.resolve()
-                except (OSError, RuntimeError, UnicodeError): pass
-        except OSError: continue
-    return sorted(found.values())
 
 def approved_manifest_paths(state: dict) -> list[Path]:
     if not isinstance(state, dict): return []
@@ -646,6 +700,9 @@ def validate(path: Path, cancelled=lambda: False, check_python: bool = True) -> 
         except ValueError: pass
     if len(re.findall(r"^[ \t]*lastTestedNVDAVersion[ \t]*=", text, re.I | re.M)) != 1: errors.append("lastTestedNVDAVersion must occur exactly once")
     if not check_python: return errors
+    # Check syntax against the Python bundled with the oldest NVDA the manifest supports.
+    try: target = python_compatibility.python_version_for_nvda(metadata.get("minimumnvdaversion", ""))
+    except ValueError: target = python_compatibility.python_version_for_nvda("2026.1")
     checked = 0
     for directory, dirnames, filenames in os.walk(path.parent, topdown=True, onerror=lambda _error: None):
         if cancelled(): return ["cancelled"]
@@ -660,8 +717,8 @@ def validate(path: Path, cancelled=lambda: False, check_python: bool = True) -> 
             try:
                 if source.stat().st_size > MAX_PYTHON_FILE_BYTES:
                     errors.append(f"{source}: Python file exceeds the {MAX_PYTHON_FILE_BYTES // (1024 * 1024)} MB validation limit"); continue
-                ast.parse(source.read_text(encoding="utf-8-sig"), filename=str(source))
-            except (SyntaxError, UnicodeError, OSError) as error: errors.append(f"{source}: {error}"[:1000])
+                errors.extend(message[:1000] for message in python_compatibility.compatibility_errors(source.read_text(encoding="utf-8-sig"), str(source), target))
+            except (UnicodeError, OSError, ValueError) as error: errors.append(f"{source}: {error}"[:1000])
             if len(errors) >= MAX_VALIDATION_ERRORS: return errors + [f"validation stopped after {MAX_VALIDATION_ERRORS} errors"]
     return errors
 
@@ -710,6 +767,101 @@ def git_manifest_state(path: Path) -> tuple[str, bool]:
         return branch, bool(status_result.stdout.strip())
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
         return "Git status unavailable", False
+
+def _git_output(root: Path, *arguments: str) -> tuple[int, str]:
+    try:
+        completed = subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return completed.returncode, completed.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return -1, ""
+
+def add_copy_details(result: ProjectResult, path: Path) -> ProjectResult:
+    """Record what tells this copy apart from other copies: public name, version, Git, and GitHub state.
+
+    Runs Git, so call it only on a worker thread.  Every lookup is local; nothing
+    contacts GitHub, so unpushed counts compare against the last fetched state.
+    """
+    try:
+        metadata = values(path); result.summary = metadata.get("summary", ""); result.addon_version = metadata.get("version", result.addon_version)
+        result.last_change = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).date().isoformat()
+    except (OSError, UnicodeError, ValueError):
+        pass
+    root = project_root(path)
+    if root is None or not (root / ".git").exists():
+        return result
+    code, branch = _git_output(root, "branch", "--show-current")
+    if code == 0: result.branch = branch or "detached"
+    code, remotes = _git_output(root, "remote")
+    names = [name for name in remotes.splitlines() if name.strip()] if code == 0 else []
+    remote_name = "origin" if "origin" in names else (names[0] if names else "")
+    if remote_name:
+        code, url = _git_output(root, "remote", "get-url", remote_name)
+        if code == 0: result.remote = url
+    code, status = _git_output(root, "status", "--porcelain=v1")
+    if code == 0: result.uncommitted_changes = len([line for line in status.splitlines() if line.strip()])
+    code, ahead = _git_output(root, "rev-list", "--count", "@{upstream}..HEAD")
+    if code == 0 and ahead.isdigit(): result.unpushed_commits = int(ahead)
+    code, last = _git_output(root, "log", "-1", "--format=%cs")
+    if code == 0 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", last): result.last_change = last
+    return result
+
+def github_repository_label(remote: str) -> str:
+    """Return owner/repository for a GitHub remote, or an empty string for any other remote."""
+    match = re.match(r"^(?:https://github\.com/|git@github\.com:)([^/\s]+/[^/\s]+?)(?:\.git)?/?$", str(remote or "").strip(), re.I)
+    return match.group(1) if match else ""
+
+def _spoken_date(value: str) -> str:
+    # Month names read naturally; 2026-09-14 is read as numbers separated by minus.
+    try:
+        day = datetime.strptime(value, "%Y-%m-%d"); return f"{day:%B} {day.day}, {day.year}"
+    except (TypeError, ValueError):
+        return ""
+
+def describe_copy(result: ProjectResult, same_addon_versions: list[str], tracked_versions: list[str], home: Path | None = None, translate=lambda text: text) -> str:
+    """Describe one found copy so that copies of the same add-on can be told apart by ear and in braille.
+
+    The most distinguishing facts come first: name and version, whether this is the
+    newest copy, whether another copy is already tracked, and where its code lives.
+    """
+    _ = translate; parts = []
+    version = result.addon_version or _("unknown version")
+    parts.append(f"{result.summary or result.name} {version}")
+    # Tracked copies count when deciding which copy is newest.
+    known = [item for item in [*same_addon_versions, *tracked_versions] if item and item != "unknown"]
+    tracked = sorted(set(tracked_versions), key=addon_version_key)
+    if version in tracked:
+        parts.append(_("you already track another copy of this same version"))
+    else:
+        if len(same_addon_versions) + len(tracked_versions) > 1 and known:
+            newest = max(known, key=addon_version_key)
+            parts.append(_("newest copy") if version == newest else _("older copy; the newest is %s") % newest)
+        if tracked:
+            parts.append(_("you already track version %s") % tracked[0] if len(tracked) == 1 else _("you already track versions %s and %s") % (", ".join(tracked[:-1]), tracked[-1]))
+    repository = github_repository_label(result.remote)
+    if result.remote and repository:
+        state = [_("on GitHub as %s") % repository]
+        if result.uncommitted_changes > 0: state.append(_("%d files changed but not committed") % result.uncommitted_changes)
+        if result.unpushed_commits > 0: state.append(_("%d commits not pushed") % result.unpushed_commits)
+        if result.uncommitted_changes == 0 and result.unpushed_commits == 0: state.append(_("everything pushed"))
+        elif result.uncommitted_changes == 0 and result.unpushed_commits < 0 and result.branch != "detached":
+            # Without a linked GitHub branch, Git cannot tell whether this branch's commits were pushed.
+            state.append(_("this branch is not linked to a GitHub branch"))
+        parts.append(", ".join(state))
+    elif result.remote:
+        parts.append(_("not on GitHub; its Git remote is %s") % result.remote)
+    elif result.branch and result.branch != "not a Git repository":
+        parts.append(_("only on this computer; no GitHub repository") + (_(", %d files changed but not committed") % result.uncommitted_changes if result.uncommitted_changes > 0 else ""))
+    else:
+        parts.append(_("only on this computer; not in Git"))
+    if result.branch and result.branch.casefold() not in {"main", "master", "not a git repository"}:
+        parts.append(_("branch %s") % result.branch)
+    if spoken := _spoken_date(result.last_change):
+        parts.append(_("last changed %s") % spoken)
+    folder = Path(result.path).parent
+    try: folder = folder.relative_to(home or Path.home())
+    except ValueError: pass
+    parts.append(_("folder %s") % folder)
+    return "; ".join(parts)
 
 def _atomic_replace_bytes(path: Path, data: bytes) -> None:
     mode = stat.S_IMODE(path.stat().st_mode)

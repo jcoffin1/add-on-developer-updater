@@ -1,4 +1,4 @@
-import codecs, io, json, os, shutil, stat, subprocess, tempfile, unittest, urllib.error, zipfile
+import codecs, io, json, os, shutil, stat, subprocess, tempfile, unittest, urllib.error, urllib.parse, zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
@@ -10,6 +10,22 @@ import publisher
 
 MANIFEST = "name = demo\nsummary = Demo\nversion = 1.0\nminimumNVDAVersion = 2025.1\nlastTestedNVDAVersion = 2025.4\n"
 CURRENT_RELEASE_FAMILY = "2026.2"
+PLUGIN_FOLDER = Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater"
+
+def plugin_source():
+    """Return the NVDA-dependent plugin code, including its separate dialog module."""
+    return "\n".join((PLUGIN_FOLDER / name).read_text(encoding="utf-8") for name in ("__init__.py", "dialogs.py"))
+
+WORKER = PLUGIN_FOLDER / "worker.ps1"
+
+def run_scan_worker(request: dict) -> dict:
+    """Run NVDA's real discovery worker on a request and return its result."""
+    with tempfile.TemporaryDirectory() as folder:
+        request_path = Path(folder) / "request.json"; output_path = Path(folder) / "result.json"
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        completed = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(WORKER), "-RequestPath", str(request_path), "-OutputPath", str(output_path)], capture_output=True, text=True, timeout=60)
+        if completed.returncode: raise AssertionError(completed.stderr or completed.stdout)
+        return engine.read_json(output_path)
 
 class EngineTests(unittest.TestCase):
     def make_project(self, root, name="project", manifest=MANIFEST):
@@ -153,24 +169,25 @@ class EngineTests(unittest.TestCase):
         self.assertEqual("cached", release.source)
     def test_developer_project_discovery_and_preview_default(self):
         with tempfile.TemporaryDirectory() as folder:
-            manifest = self.make_project(folder); self.assertEqual([manifest.resolve()], engine.discover_manifests([Path(folder)]))
+            manifest = self.make_project(folder)
             result = engine.update(manifest, engine.Release("2026.2beta1", "2026.2", True, ""), Path(folder) / "backups")
             self.assertTrue(result.status.startswith("update available")); self.assertIn("2025.4", manifest.read_text())
-    def test_default_development_roots_include_the_codex_workspace(self):
-        with tempfile.TemporaryDirectory() as folder:
-            home = Path(folder); codex = home / "Documents" / "Codex"; codex.mkdir(parents=True)
-            with mock.patch.object(engine.Path, "home", return_value=home), mock.patch.object(engine, "cloud_roots", return_value=[]):
-                roots = engine.default_development_roots()
-        self.assertIn(codex, roots)
+    def test_development_roots_include_codex_cloud_storage_and_configured_folders(self):
+        home = Path("C:/Users/Example")
+        roots = engine.development_roots(" D:/Extra ; ;E:/More", home, {"OneDrive": "C:/Users/Example/OneDrive"})
+        self.assertIn(os.path.normcase(str(home / "Documents" / "Codex")), roots)
+        self.assertIn(os.path.normcase("C:/Users/Example/OneDrive"), roots)
+        self.assertIn(os.path.normcase("D:/Extra"), roots); self.assertIn(os.path.normcase("E:/More"), roots)
+        self.assertEqual(len(roots), len(set(roots)))
+    @unittest.skipUnless(shutil.which("powershell.exe"), "NVDA's scan worker requires Windows PowerShell")
     def test_non_project_and_runtime_test_are_ignored(self):
         with tempfile.TemporaryDirectory() as folder:
             plain = Path(folder) / "plain"; plain.mkdir(); (plain / "manifest.ini").write_text(MANIFEST)
             runtime = Path(folder) / "Runtime Tests"; runtime.mkdir(); self.make_project(runtime)
-            self.assertEqual([], engine.discover_manifests([Path(folder)]))
+            self.assertEqual([], run_scan_worker({"mode": "manual", "fullSystem": False, "roots": [folder], "manifestPaths": []})["manifests"])
     def test_cancellation_stops_discovery_and_update(self):
         with tempfile.TemporaryDirectory() as folder:
             manifest = self.make_project(folder)
-            self.assertEqual([], engine.discover_manifests([Path(folder)], cancelled=lambda: True))
             result = engine.update(manifest, engine.Release("2026.2", "2026.2", False, ""), Path(folder), True, lambda: True)
             self.assertEqual("cancelled", result.status); self.assertIn("2025.4", manifest.read_text())
     def test_background_paths_use_only_existing_approved_projects(self):
@@ -460,6 +477,17 @@ class EngineTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(payload.getvalue())) as archive:
             self.assertEqual([], publisher._ai_disclosure_issues(archive))
 
+    def test_lowercase_translation_words_are_not_mistaken_for_ai_disclosures(self):
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("locale/it/LC_MESSAGES/nvda.po", 'msgstr "Aggiungi ai preferiti"\nmsgstr "Ai sensi della licenza"\n')
+        with zipfile.ZipFile(io.BytesIO(payload.getvalue())) as archive:
+            self.assertEqual([], publisher._ai_disclosure_issues(archive))
+
+    def test_github_urls_with_trailing_slash_identify_the_same_repository(self):
+        self.assertEqual("https://github.com/owner/demo", publisher._remote_web_url("https://github.com/owner/demo/"))
+        self.assertEqual("origin", publisher._matching_remote_name({"origin": "https://github.com/owner/demo.git"}, "https://github.com/owner/demo/"))
+
     def test_source_disclosure_audit_checks_repository_only_text(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -525,7 +553,7 @@ class EngineTests(unittest.TestCase):
         root = Path(__file__).parent
         worker = root / "globalPlugins" / "addonDeveloperUpdater" / "worker.ps1"
         self.assertTrue(worker.is_file())
-        plugin = (worker.parent / "__init__.py").read_text(encoding="utf-8")
+        plugin = plugin_source()
         self.assertIn('if not workerPath.is_file()', plugin)
         item = {"name": "addonDeveloperUpdater", "version": "2026.2.24", "manifest": str(root / "manifest.ini")}
         with tempfile.TemporaryDirectory() as folder:
@@ -584,7 +612,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual([str(missing)], result["unavailableManifestPaths"])
 
     def test_runtime_bounds_external_worker_and_safely_handles_progress_close(self):
-        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        plugin = plugin_source()
         self.assertIn("engine.wait_for_worker(self._workerProcess)", plugin)
         self.assertIn("self._progressDialog = None\n            dialog.Destroy()", plugin)
         self.assertIn("Progress window closed. The operation is still running in the background.", plugin)
@@ -596,7 +624,7 @@ class EngineTests(unittest.TestCase):
         )
         self.assertEqual("Public Add-on Name", publisher.public_name(report))
         self.assertEqual("Public Add-on Name", publisher.public_name({"name": "internalModuleName", "summary": "Public Add-on Name"}))
-        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        plugin = plugin_source()
         self.assertIn("_projectDisplayName(result)", plugin)
         self.assertIn("publisher.public_name(report)", plugin)
         self.assertIn("publisher.public_name(item)", plugin)
@@ -833,7 +861,7 @@ class EngineTests(unittest.TestCase):
         gh.assert_called_once()
 
     def test_runtime_defers_ineligible_github_releases(self):
-        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        plugin = plugin_source()
         self.assertIn('item.get("releaseBlocker")', plugin)
         self.assertIn("GitHub release deferred", plugin)
         self.assertIn("Update repository default branches", plugin)
@@ -951,13 +979,13 @@ class EngineTests(unittest.TestCase):
         self.assertEqual("Demo", build.call_args.args[0]["name"])
 
     def test_runtime_validates_release_builds_before_push(self):
-        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        plugin = plugin_source()
         validate_index = plugin.index("publisher.validate_publish_builds(reports")
         push_index = plugin.index("publisher.push(reports", validate_index)
         self.assertLess(validate_index, push_index)
 
     def test_cancel_command_tracks_a_scan_instead_of_the_shared_operation_lock(self):
-        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        plugin = plugin_source()
         start = plugin.index("def script_cancelAddonProjectScan")
         end = plugin.index("def script_submitUpdatedAddons", start)
         command = plugin[start:end]
@@ -965,7 +993,7 @@ class EngineTests(unittest.TestCase):
         self.assertNotIn("self._scanLock.locked()", command)
 
     def test_compatibility_ui_uses_official_versions_confirmation_and_persistent_undo(self):
-        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        plugin = plugin_source()
         self.assertIn("publisher.nvda_api_versions(self._apiVersionCachePath)", plugin)
         self.assertIn("Official older NVDA target shared by every selected add-on", plugin)
         self.assertIn("Confirm older compatibility target", plugin)
@@ -974,14 +1002,14 @@ class EngineTests(unittest.TestCase):
         self.assertIn("if changed:\n                state[\"compatibilityUndo\"]", plugin)
 
     def test_update_check_ui_requires_approval_and_reports_status(self):
-        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        plugin = plugin_source()
         self.assertIn("class ProjectApprovalDialog", plugin)
         self.assertIn("class ScanTargetDialog", plugin)
         self.assertIn("engine.available_releases", plugin)
         self.assertIn("engine.matching_release", plugin)
         self.assertIn("Selected NVDA build:", plugin)
         self.assertIn('state["manualReleaseTargetTag"]', plugin)
-        self.assertIn("Confirm approved add-on projects", plugin)
+        self.assertIn("Choose add-ons to track", plugin)
         self.assertIn("Report add-on update-check status", plugin)
         self.assertIn("engine.latest_release", plugin)
         self.assertIn("engine.notification_state", plugin)
@@ -992,9 +1020,8 @@ class EngineTests(unittest.TestCase):
         self.assertNotIn("if manual: approved.update", plugin)
 
     def test_store_submission_remains_a_manual_browser_action(self):
-        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
-        self.assertIn("Review every field and submit each form manually", plugin)
-        self.assertIn("the updater never submits a store issue or pull request", plugin)
+        plugin = plugin_source()
+        self.assertIn("Nothing is submitted until you review the form and submit it yourself.", plugin)
         self.assertNotIn('gh", "issue", "create', plugin)
         self.assertNotIn('gh", "pr", "create', plugin)
 
@@ -1050,12 +1077,14 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(any("could not be verified" in reason for reason in publisher.store_readiness_reasons(report)))
 
     def test_unpushed_status_fetches_and_compares_the_selected_remote_branch(self):
-        commands = []
-        def git(_root, *arguments):
-            commands.append(arguments)
+        commands = []; timeouts = {}
+        def git(_root, *arguments, timeout=publisher.COMMAND_TIMEOUT_SECONDS):
+            commands.append(arguments); timeouts[arguments[0]] = timeout
             return "2" if arguments[:2] == ("rev-list", "--count") else ""
         with mock.patch.object(publisher, "_git", side_effect=git):
             count, error = publisher._unpushed_status(Path("C:/project"), "fork", "main")
+        self.assertEqual(publisher.TRANSFER_TIMEOUT_SECONDS, timeouts["fetch"])
+        self.assertEqual(publisher.COMMAND_TIMEOUT_SECONDS, timeouts["rev-list"])
         self.assertEqual((2, ""), (count, error))
         self.assertIn(("fetch", "--no-tags", "fork", "+refs/heads/main:refs/remotes/fork/main"), commands)
         self.assertIn(("rev-list", "--count", "refs/remotes/fork/main..HEAD"), commands)
@@ -1088,6 +1117,25 @@ class EngineTests(unittest.TestCase):
             subprocess.run(["git", "commit", "--allow-empty", "-m", "later"], cwd=root, check=True, capture_output=True)
             with self.assertRaisesRegex(RuntimeError, "no longer at the commit"):
                 publisher._require_release_source(item, "Demo")
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required for release source-integrity tests")
+    def test_committing_a_reviewed_deletion_keeps_the_source_fingerprint(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            (root / "manifest.ini").write_text(MANIFEST, encoding="utf-8"); obsolete = root / "obsolete.py"; obsolete.write_text("value = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--all"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
+            obsolete.unlink()
+            reviewed = publisher._source_fingerprint(root, True)
+            subprocess.run(["git", "add", "--all", "--", "obsolete.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "Remove obsolete module"], cwd=root, check=True, capture_output=True)
+            publisher._require_source_fingerprint(root, reviewed, True, "Demo")
+            obsolete.write_text("value = 2\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "changed after the publishing review"):
+                publisher._require_source_fingerprint(root, reviewed, True, "Demo")
 
     def test_generated_build_and_python_cache_paths_are_not_published(self):
         self.assertTrue(publisher._is_generated_path("build-local/package/file.dll"))
@@ -1157,7 +1205,7 @@ class EngineTests(unittest.TestCase):
                 publisher.gh_path()
 
     def test_every_github_entry_point_offers_missing_cli_guidance(self):
-        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        plugin = plugin_source()
         self.assertGreaterEqual(plugin.count("except publisher.GitHubCliRequired"), 7)
         self.assertIn("self._offerStoreGitHubLogin", plugin)
         self.assertIn("self._retryStorePreflight", plugin)
@@ -1165,7 +1213,7 @@ class EngineTests(unittest.TestCase):
         self.assertIn("Installation is not automatic", plugin)
 
     def test_download_url_gesture_and_clipboard_action_are_present(self):
-        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        plugin = plugin_source()
         self.assertIn('gesture="kb:NVDA+alt+shift+f"', plugin)
         self.assertIn("api.copyToClip(repository.download_url)", plugin)
         self.assertIn('label=_("&Copy download link")', plugin)
@@ -1307,7 +1355,7 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(process.terminated)
 
     def test_runtime_keeps_state_and_cancellation_work_off_the_main_thread(self):
-        source = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        source = plugin_source()
         status_start = source.index("def script_reportAddonUpdateCheckStatus")
         status = source[status_start:source.index("@staticmethod", status_start)]
         self.assertIn("engine.saved_approved_project_ids", status)
@@ -1322,7 +1370,7 @@ class EngineTests(unittest.TestCase):
         self.assertIn("publisher.cancel_running_commands()", source)
 
     def test_keyboard_project_selection_is_async_and_dialogs_are_independent(self):
-        source = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        source = plugin_source()
         display_helper = source[source.index("def _projectDisplayName"):source.index("class UpdaterSettingsPanel")]
         self.assertNotIn("engine.values", display_helper)
         self.assertIn('self._beginApprovedProjectSelection("github")', source)
@@ -1340,7 +1388,7 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(rendered.endswith("## Steps\nTell us what happened.\n"))
 
     def test_issue_and_template_gestures_are_registered(self):
-        plugin = (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "__init__.py").read_text(encoding="utf-8")
+        plugin = plugin_source()
         self.assertIn('gesture="kb:NVDA+alt+shift+i"', plugin)
         self.assertIn('gesture="kb:NVDA+alt+shift+t"', plugin)
         self.assertIn("Save issue template to GitHub", plugin)
@@ -1355,5 +1403,386 @@ class EngineTests(unittest.TestCase):
         self.assertIn("Markdown means ordinary text with optional formatting symbols", plugin)
         self.assertIn("# for headings", plugin)
         self.assertIn("template.sha", (Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater" / "publisher.py").read_text(encoding="utf-8"))
+
+GPL2_HEADER = "                    GNU GENERAL PUBLIC LICENSE\n                       Version 2, June 1991\n"
+
+def publish_report(**changes):
+    report = publisher.ProjectPublishInfo(
+        "id", "demo", "manifest.ini", ".", "2026.2.1", "Demo", "Jane Developer <jane@example.invalid>",
+        "https://github.com/example/demo", 0, True, 0, "2026.2.1",
+        "https://github.com/example/demo/releases/download/v2026.2.1/demo-2026.2.1.nvda-addon",
+    )
+    for key, value in changes.items(): setattr(report, key, value)
+    return report
+
+class StoreSubmissionDetailTests(unittest.TestCase):
+    def test_publisher_comes_from_manifest_author_without_email(self):
+        self.assertEqual("Jane Developer", publisher.store_publisher_name("Jane Developer <jane@example.invalid>"))
+        self.assertEqual("Jane Developer, Sam Helper", publisher.store_publisher_name("Jane Developer <a@b.c>, Sam Helper <d@e.f>"))
+
+    def test_standard_license_files_are_recognized(self):
+        cases = (
+            ("COPYING.txt", GPL2_HEADER, "GPL v2"),
+            ("LICENSE", "GNU GENERAL PUBLIC LICENSE\n   Version 3, 29 June 2007\n", "GPL v3"),
+            ("LICENSE.md", "MIT License\n\nCopyright (c) 2026\n", "MIT"),
+            ("license.txt", "Apache License\n                           Version 2.0, January 2004\n", "Apache 2.0"),
+        )
+        for filename, text, expected in cases:
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder); (root / filename).write_text(text, encoding="utf-8")
+                self.assertEqual(expected, publisher.detect_license(root, root)[0])
+
+    def test_unrecognized_license_is_left_blank(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); (root / "LICENSE").write_text("All rights reserved.\n", encoding="utf-8")
+            self.assertEqual(("", ""), publisher.detect_license(root, root))
+
+    def test_store_form_uses_detected_details_settings_and_blank_fallbacks(self):
+        detected = publisher.store_release_item(publish_report(license_name="GPL v2", license_url="https://www.gnu.org/licenses/gpl-2.0.html"))
+        fields = urllib.parse.parse_qs(urllib.parse.urlsplit(publisher.store_url(detected)).query)
+        self.assertEqual(["Jane Developer"], fields["publisher"]); self.assertEqual(["GPL v2"], fields["license-name"])
+        unknown = publisher.store_release_item(publish_report())
+        fields = urllib.parse.parse_qs(urllib.parse.urlsplit(publisher.store_url(unknown)).query, keep_blank_values=True)
+        self.assertEqual([""], fields["license-name"]); self.assertEqual([""], fields["license-url"])
+        fields = urllib.parse.parse_qs(urllib.parse.urlsplit(publisher.store_url(unknown, "Example Team", "MIT", "https://opensource.org/license/mit")).query)
+        self.assertEqual(["Example Team"], fields["publisher"]); self.assertEqual(["MIT"], fields["license-name"])
+        self.assertEqual(["https://opensource.org/license/mit"], fields["license-url"])
+
+class VersionIncrementTests(unittest.TestCase):
+    def test_next_patch_version(self):
+        self.assertEqual("2026.2.48", publisher.next_patch_version("2026.2.47"))
+        self.assertEqual("2026.2.1", publisher.next_patch_version("2026.2"))
+        self.assertEqual("", publisher.next_patch_version("1.0-beta2"))
+
+    def test_increment_changes_manifest_build_variables_and_readme_preserving_format(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); manifest = root / "manifest.ini"
+            manifest.write_bytes(codecs.BOM_UTF8 + b'name = demo\r\nversion = "2026.2.47"\r\nminimumNVDAVersion = 2025.1\r\n')
+            (root / "buildVars.py").write_text('addon_info = {\n    "addon_name": "demo",\n    "addon_version": "2026.2.47",\n}\n', encoding="utf-8")
+            (root / "doc" / "en").mkdir(parents=True); readme = root / "doc" / "en" / "readme.html"
+            readme.write_text("<p>Version 2026.2.47. Tested with 2026.2.47 builds.</p>\n", encoding="utf-8")
+            changed = publisher.increment_project_version(manifest, root, "2026.2.47", "2026.2.48")
+            self.assertEqual(3, len(changed))
+            self.assertEqual(codecs.BOM_UTF8 + b'name = demo\r\nversion = "2026.2.48"\r\nminimumNVDAVersion = 2025.1\r\n', manifest.read_bytes())
+            self.assertIn('"addon_version": "2026.2.48"', (root / "buildVars.py").read_text(encoding="utf-8"))
+            self.assertEqual("<p>Version 2026.2.48. Tested with 2026.2.47 builds.</p>\n", readme.read_text(encoding="utf-8"))
+
+    def test_increment_changes_nothing_when_build_variables_disagree(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); manifest = root / "manifest.ini"; manifest.write_text("name = demo\nversion = 1.0.0\n", encoding="utf-8")
+            (root / "buildVars.py").write_text('addon_info = {"addon_version": VERSION}\n', encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "addon_version"):
+                publisher.increment_project_version(manifest, root, "1.0.0", "1.0.1")
+            self.assertEqual("name = demo\nversion = 1.0.0\n", manifest.read_text(encoding="utf-8"))
+
+    def test_publish_plan_separates_version_conflicts(self):
+        conflict = publish_report(matching_release_tag="v2026.2.1", changed_files=2)
+        current = publish_report(project_id="current")
+        new = publish_report(project_id="new", version="2026.2.2", changed_files=1)
+        foreign = publish_report(project_id="foreign", repository_owned_by_user=False, changed_files=1)
+        eligible, not_owned, conflicts = publisher.publish_plan([conflict, current, new, foreign])
+        self.assertEqual(["new"], [report.project_id for report in eligible])
+        self.assertEqual(["foreign"], [report.project_id for report in not_owned])
+        self.assertEqual(["id"], [report.project_id for report in conflicts])
+        self.assertEqual(["id", "current"], [report.project_id for report in publisher.reports_with_current_releases([conflict, current, new, foreign])])
+
+class ReleaseNotesTests(unittest.TestCase):
+    CHANGELOG = "# Changelog\n\n## 2026.2.48\n\n- Fixed the thing.\n\n### Details\n\nMore.\n\n## 2026.2.4\n\n- Older.\n"
+
+    def test_changelog_section_for_exact_version_is_used(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); (root / "CHANGELOG.md").write_text(self.CHANGELOG, encoding="utf-8")
+            self.assertEqual("- Fixed the thing.\n\n### Details\n\nMore.", publisher.release_notes(root, root, "2026.2.48", "manifest text"))
+            self.assertEqual("- Older.", publisher.release_notes(root, root, "v2026.2.4"))
+            self.assertEqual("", publisher.release_notes(root, root, "2026.2.49", "stale manifest text"))
+
+    def test_manifest_changelog_is_used_only_without_a_changelog_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.assertEqual("Adds a feature.", publisher.release_notes(root, root, "1.0", "Adds a feature."))
+
+    def test_notes_with_disclosure_wording_fall_back_to_fixed_text(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.assertEqual("", publisher.release_notes(root, root, "1.0", "Written by " + "ChatGPT."))
+
+    def test_reviewed_notes_are_sent_through_standard_input(self):
+        arguments = publisher.release_create_arguments("gh", "v1.0", Path("demo.nvda-addon"), "example/demo", "a" * 40, "Demo", notes="- Fixed.")
+        self.assertIn("--notes-file", arguments); self.assertNotIn("--notes", arguments)
+        with tempfile.TemporaryDirectory() as folder:
+            package = Path(folder) / "demo-1.0.nvda-addon"
+            with zipfile.ZipFile(package, "w") as archive: archive.writestr("manifest.ini", "name = demo\nversion = 1.0\n")
+            item = {"name": "demo", "summary": "Demo", "version": "1.0", "root": folder, "manifest": str(Path(folder) / "manifest.ini"), "sourceUrl": "https://github.com/example/demo", "pushRemote": "origin", "targetCommitish": "a" * 40, "releaseBlocker": "", "channel": "stable", "release_notes": "- Fixed."}
+            with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "build_release_package", return_value=package), mock.patch.object(publisher, "_require_release_source"), mock.patch.object(publisher, "_remote_tag_commit", return_value=""), mock.patch.object(publisher, "_uploaded_asset_url", return_value="https://github.com/example/demo/releases/download/v1.0/demo-1.0.nvda-addon"), mock.patch.object(publisher, "_run", return_value="") as run:
+                publisher.release([item], Path(folder))
+        create = next(call for call in run.call_args_list if call.args[0][1:3] == ["release", "create"])
+        self.assertEqual("- Fixed.", create.kwargs["input_text"])
+
+class ProjectBuilderVersionTests(unittest.TestCase):
+    def test_version_parameter_detection(self):
+        cases = (
+            ('param(\n\t[string]$Version = ""\n)\n& python build.py\n', True),
+            ('<# Builds the add-on #>\n[CmdletBinding()]\nparam([Parameter(Mandatory = $true)][string]$Version)\n', True),
+            ('param([switch]$Clean)\nWrite-Output $Version\n', False),
+            ('function Build { param($Version) }\nBuild\n', False),
+            ('# param($Version)\nscons\n', False),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as folder:
+                script = Path(folder) / "build.ps1"; script.write_text(text, encoding="utf-8")
+                self.assertEqual(expected, publisher.builder_accepts_version(script))
+
+    def test_builder_without_version_parameter_runs_without_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "project"; root.mkdir(); manifest = root / "manifest.ini"; manifest.write_text(MANIFEST, encoding="utf-8")
+            (root / "build.ps1").write_text("scons\n", encoding="utf-8")
+            def run_builder(_arguments, **_kwargs):
+                (root / "outputs").mkdir(exist_ok=True); (root / "outputs" / "demo-1.0.nvda-addon").write_bytes(b"package"); return ""
+            with mock.patch.object(publisher.shutil, "which", return_value="pwsh"), mock.patch.object(publisher, "_run", side_effect=run_builder) as run:
+                publisher.build_release_package({"name": "demo", "version": "1.0", "manifest": str(manifest)}, Path(folder) / "packages")
+            self.assertNotIn("-Version", run.call_args.args[0])
+
+class MovedDecisionLogicTests(unittest.TestCase):
+    def test_release_feed_tags_come_from_entry_ids(self):
+        import xml.etree.ElementTree as ET
+        feed = ET.fromstring(
+            '<feed xmlns="http://www.w3.org/2005/Atom">'
+            '<entry><id>tag:github.com,2008:Repository/45885732/release-2026.3beta4</id><title>NVDA 2026.3 Beta 4</title><link href="https://github.com/nvaccess/nvda/releases/tag/release-2026.3beta4"/></entry>'
+            '<entry><id>urn:unrelated</id><title>2026.2</title></entry>'
+            '</feed>'
+        )
+        items = engine.parse_release_feed(feed)
+        self.assertEqual(["release-2026.3beta4", "2026.2"], [item["tag_name"] for item in items])
+        self.assertEqual([True, False], [item["prerelease"] for item in items])
+
+    def test_scan_scheduling(self):
+        now = datetime(2026, 10, 14, 12, tzinfo=timezone.utc)
+        recent = {"lastDiscoveryAt": (now - timedelta(hours=1)).isoformat()}
+        old = {"lastDiscoveryAt": (now - timedelta(hours=30)).isoformat()}
+        future = {"lastDiscoveryAt": (now + timedelta(hours=1)).isoformat()}
+        self.assertEqual("manual", engine.worker_mode(True, recent, 24, now))
+        self.assertEqual("background", engine.worker_mode(False, recent, 24, now))
+        self.assertEqual("periodic", engine.worker_mode(False, old, 24, now))
+        self.assertTrue(engine.rescan_due(future, 24, now)); self.assertTrue(engine.rescan_due({}, 24, now))
+
+    def test_submission_channel_follows_selected_build(self):
+        self.assertEqual("dev", engine.submission_channel(engine.Release("alpha-57626,71bae80b", "2026.3", True, "")))
+        self.assertEqual("beta", engine.submission_channel(engine.Release("2026.3beta4", "2026.3", True, "")))
+        self.assertEqual("stable", engine.submission_channel(engine.Release("2026.2", "2026.2", False, "")))
+
+    def test_preflight_release_channel_is_not_replaced_by_saved_channel(self):
+        items = [{"project_id": "beta", "channel": "beta"}, {"project_id": "old", "channel": ""}, {"project_id": "new"}]
+        publisher.resolve_release_channels(items, {"beta": "stable", "old": "dev"})
+        self.assertEqual(["beta", "dev", "stable"], [item["channel"] for item in items])
+
+class PythonCompatibilityTests(unittest.TestCase):
+    def test_nvda_releases_map_to_their_bundled_python(self):
+        import python_compatibility
+        self.assertEqual((3, 7), python_compatibility.python_version_for_nvda("2023.3.4"))
+        self.assertEqual((3, 11), python_compatibility.python_version_for_nvda("2024.1"))
+        self.assertEqual((3, 11), python_compatibility.python_version_for_nvda("2025.3.3"))
+        self.assertEqual((3, 13), python_compatibility.python_version_for_nvda("2026.1"))
+        with self.assertRaises(ValueError): python_compatibility.python_version_for_nvda("future")
+
+    def test_newer_syntax_is_rejected_for_older_nvda(self):
+        import python_compatibility
+        cases = (
+            ("if (count := 1): pass\n", (3, 7), True),
+            ("if (count := 1): pass\n", (3, 11), False),
+            ("type Alias = int\n", (3, 11), True),
+            ("type Alias = int\n", (3, 13), False),
+            ('label = f"{item["name"]}"\n', (3, 11), True),
+            ('label = f"{item["name"]}"\n', (3, 13), False),
+            (r"""label = f"{'\n'.join(lines)}"
+""", (3, 11), True),
+            ("""label = f"{item['name']}" + f'''{"nested"}''' + f"{value:{width}}" + f"{{literal}}"\n""", (3, 11), False),
+            ("def broken(:\n", (3, 13), True),
+        )
+        for source, target, rejected in cases:
+            with self.subTest(source=source, target=target):
+                self.assertEqual(rejected, bool(python_compatibility.compatibility_errors(source, "plugin.py", target)))
+
+    def test_release_package_rejects_python_too_new_for_minimum_nvda(self):
+        def package(minimum, code):
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
+                archive.writestr("manifest.ini", f"name = demo\nversion = 1.0\nminimumNVDAVersion = {minimum}\nlastTestedNVDAVersion = 2026.2\n")
+                archive.writestr("globalPlugins/demo.py", code)
+            return payload.getvalue()
+        code = 'label = f"{item["name"]}"\n'
+        verified, error, _issues = publisher._verify_release_payload(package("2025.3.3", code), "demo", "1.0")
+        self.assertFalse(verified); self.assertIn("NVDA 2025.3.3", error); self.assertIn("globalPlugins/demo.py", error)
+        self.assertTrue(publisher._verify_release_payload(package("2026.1", code), "demo", "1.0")[0])
+        self.assertFalse(publisher._verify_release_payload(package("2026.1", "def broken(:\n"), "demo", "1.0")[0])
+
+    def test_manifest_validation_uses_minimum_nvda_python(self):
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = Path(folder) / "manifest.ini"
+            manifest.write_text(MANIFEST.replace("2025.1", "2023.3"), encoding="utf-8")
+            (Path(folder) / "plugin.py").write_text("if (count := 1): pass\n", encoding="utf-8")
+            self.assertTrue(any("Python 3.7 cannot load" in error for error in engine.validate(manifest)))
+            manifest.write_text(MANIFEST, encoding="utf-8")
+            self.assertEqual([], engine.validate(manifest))
+
+    def test_this_addon_loads_in_its_oldest_supported_nvda(self):
+        self.assertEqual([], engine.validate(Path(__file__).parent / "manifest.ini"))
+
+    def test_new_releases_without_notes_are_reported(self):
+        with_notes = publish_report(project_id="notes", version="2026.2.2", release_notes="- Fixed.")
+        without_notes = publish_report(project_id="plain", version="2026.2.2")
+        repair = publish_report(project_id="repair", matching_release_tag="v2026.2.1", matching_release_download_url="")
+        self.assertEqual(["plain"], [report.project_id for report in publisher.reports_without_release_notes([with_notes, without_notes, repair])])
+
+class ExistingFeatureImprovementTests(unittest.TestCase):
+    def make_project(self, root, name):
+        project = Path(root) / name; project.mkdir(parents=True); (project / ".git").mkdir()
+        manifest = project / "manifest.ini"; manifest.write_text(MANIFEST, encoding="utf-8"); return manifest
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "NVDA's scan worker requires Windows PowerShell")
+    def test_worker_searches_shallow_folders_before_one_huge_subtree(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            # Depth-first order explored this huge tree first and exhausted the budget.
+            for index in range(40): (root / "z-huge-tests" / f"case{index}" / "data").mkdir(parents=True)
+            manifest = self.make_project(root, "a-addon")
+            result = run_scan_worker({"mode": "manual", "fullSystem": False, "roots": [folder], "manifestPaths": [], "maxDirectories": 10, "maxSeconds": 30})
+        self.assertEqual([str(manifest.resolve())], result["manifests"])
+        self.assertTrue(result["truncated"])
+        self.assertEqual(1, result["completeDepth"])
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "NVDA's scan worker requires Windows PowerShell")
+    def test_worker_skips_version_control_folders_and_reports_complete_scans(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); manifest = self.make_project(root, "addon")
+            for index in range(30): (root / "addon" / ".git" / "objects" / f"{index:02x}").mkdir(parents=True)
+            result = run_scan_worker({"mode": "manual", "fullSystem": False, "roots": [folder], "manifestPaths": []})
+        self.assertEqual([str(manifest.resolve())], result["manifests"])
+        self.assertEqual(2, result["directoriesVisited"])
+        self.assertFalse(result["truncated"]); self.assertIsNone(result["completeDepth"])
+
+    def test_worker_and_engine_skip_the_same_folders(self):
+        import re
+        worker_text = WORKER.read_text(encoding="utf-8-sig")
+        listed = re.search(r"\n@\((.*?)\) \| ForEach-Object", worker_text).group(1)
+        self.assertEqual(engine.PRUNE_NAMES, set(re.findall(r"'([^']*)'", listed)))
+
+    def test_github_operations_stop_only_between_projects(self):
+        reports = [publish_report(project_id="first", version="2026.2.2"), publish_report(project_id="second", version="2026.2.2")]
+        calls = []
+        with mock.patch.object(publisher, "gh_path", return_value="gh"):
+            with self.assertRaises(publisher.OperationCancelled) as raised:
+                publisher.push(reports, cancelled=lambda: calls.append("checked") or True)
+        self.assertEqual([], raised.exception.completed); self.assertEqual(["checked"], calls)
+        item = {"name": "demo", "summary": "Demo", "version": "1.0", "releaseBlocker": ""}
+        with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "_require_release_source") as source_check:
+            with self.assertRaises(publisher.OperationCancelled):
+                publisher.release([item], Path("."), cancelled=lambda: True)
+        source_check.assert_not_called()
+
+    def test_cancellation_reports_releases_already_completed(self):
+        items = [{"project_id": "one", "name": "one", "summary": "One", "version": "1.0", "releaseBlocker": ""}, {"project_id": "two", "name": "two", "summary": "Two", "version": "1.0", "releaseBlocker": ""}]
+        checks = iter([False, True])
+        with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "release_publish_action", return_value="create"), mock.patch.object(publisher, "_require_release_source"), mock.patch.object(publisher, "build_release_package", return_value=Path("one-1.0.nvda-addon")), mock.patch.object(publisher, "verify_release_package_file", return_value=(True, "", ())), mock.patch.object(publisher, "_remote_tag_commit", return_value=""), mock.patch.object(publisher, "_run", return_value=""), mock.patch.object(publisher, "_uploaded_asset_url", return_value="https://github.com/example/one/releases/download/v1.0/one-1.0.nvda-addon"):
+            items[0].update(root=".", sourceUrl="https://github.com/example/one", targetCommitish="a" * 40); items[1].update(root=".", sourceUrl="https://github.com/example/two", targetCommitish="b" * 40)
+            with self.assertRaises(publisher.OperationCancelled) as raised:
+                publisher.release(items, Path("."), cancelled=lambda: next(checks))
+        self.assertEqual(["one"], [item["project_id"] for item in raised.exception.completed])
+
+    def test_builders_and_transfers_get_longer_time_limits(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "project"; root.mkdir(); manifest = root / "manifest.ini"; manifest.write_text(MANIFEST, encoding="utf-8")
+            (root / "build.ps1").write_text("scons\n", encoding="utf-8")
+            def run_builder(_arguments, **_kwargs):
+                (root / "outputs").mkdir(exist_ok=True); (root / "outputs" / "demo-1.0.nvda-addon").write_bytes(b"package"); return ""
+            with mock.patch.object(publisher.shutil, "which", return_value="pwsh"), mock.patch.object(publisher, "_run", side_effect=run_builder) as run:
+                publisher.build_release_package({"name": "demo", "version": "1.0", "manifest": str(manifest)}, Path(folder) / "packages")
+        self.assertEqual(publisher.BUILDER_TIMEOUT_SECONDS, run.call_args.kwargs["timeout"])
+        self.assertEqual("30-minute", publisher._timeout_text(publisher.BUILDER_TIMEOUT_SECONDS))
+        self.assertEqual("180-second", publisher._timeout_text(publisher.COMMAND_TIMEOUT_SECONDS))
+
+    def test_information_window_keeps_an_earlier_result_below_the_newest(self):
+        self.assertEqual("New result", engine.information_window_text("New result", "Old title", ""))
+        self.assertEqual("Same", engine.information_window_text("Same", "Old title", "Same"))
+        combined = engine.information_window_text("New result", "Old title", "Old result")
+        self.assertEqual("New result\n\nEarlier result, Old title:\nOld result", combined)
+        self.assertEqual(combined, engine.information_window_text("New result", "New title", combined))
+        self.assertLessEqual(len(engine.information_window_text("New", "Old", "x\n" * 20000, limit=100)), 100)
+
+class SpeechAndBrailleLayoutTests(unittest.TestCase):
+    def test_sentences_and_lists_get_their_own_lines(self):
+        text = "Compatibility update complete. 2 manifests updated: Demo to NVDA 2026.3; Other to NVDA 2026.3. Use the review command later."
+        self.assertEqual(
+            "Compatibility update complete.\n2 manifests updated:\nDemo to NVDA 2026.3\nOther to NVDA 2026.3.\nUse the review command later.",
+            engine.readable_text(text),
+        )
+
+    def test_versions_and_formatted_text_are_not_split(self):
+        self.assertEqual("Version 2026.2.47 is current.", engine.readable_text("Version 2026.2.47 is current."))
+        formatted = "Publish 1 add-on?\n\nDemo: 1.0"
+        self.assertEqual(formatted, engine.readable_text(formatted))
+
+    def test_messages_put_the_outcome_first_with_single_blank_separators(self):
+        message = engine.readable_message("Publish 2 add-ons?", ["Commit 3 files.", "", "", "Demo 1.0", ""], "Yes publishes.")
+        self.assertEqual("Publish 2 add-ons?\n\nCommit 3 files.\n\nDemo 1.0\n\nYes publishes.", message)
+        self.assertEqual("Done.", engine.readable_message("Done."))
+        self.assertEqual("Publish 2 add-ons?", engine.first_line("\n  Publish 2 add-ons?\nDetails"))
+
+    def test_message_windows_focus_reviewable_text_and_honor_escape(self):
+        plugin = plugin_source()
+        self.assertIn("wx.CallAfter(dialog.message.SetFocus)", plugin)
+        self.assertNotIn("dialog.okButton.SetFocus", plugin)
+        self.assertIn("if key == wx.WXK_ESCAPE: no(); return", plugin)
+        self.assertNotIn("ui.message(message); self._showInformation(", plugin)
+        self.assertNotIn("_pulseProgress", plugin)
+        self.assertIn("self.gauge.Hide()", plugin)
+
+class FoundCopyDescriptionTests(unittest.TestCase):
+    def copy(self, version, **details):
+        result = engine.ProjectResult("id", "codexStatusAnnouncer", "C:/Users/Example/Documents/Codex/demo/manifest.ini", "awaiting manual approval", addon_version=version, summary="ChatGPT Desktop Access")
+        for key, value in details.items(): setattr(result, key, value)
+        return result
+
+    def test_public_name_version_and_newest_copy_come_first(self):
+        home = Path("C:/Users/Example")
+        newest = engine.describe_copy(self.copy("2026.2.2", remote="https://github.com/me/demo.git", uncommitted_changes=0, unpushed_commits=0, branch="main", last_change="2026-09-04"), ["2026.2.2", "2026.2.1"], [], home)
+        self.assertEqual("ChatGPT Desktop Access 2026.2.2; newest copy; on GitHub as me/demo, everything pushed; last changed September 4, 2026; folder " + str(Path("Documents/Codex/demo")), newest)
+        older = engine.describe_copy(self.copy("2026.2.1"), ["2026.2.2", "2026.2.1"], [], home)
+        self.assertIn("older copy; the newest is 2026.2.2", older)
+        self.assertNotIn("codexStatusAnnouncer", older)
+
+    def test_tracked_copies_count_as_newer_and_same_versions_are_named(self):
+        older = engine.describe_copy(self.copy("2026.2.9"), ["2026.2.9"], ["2026.2.13"])
+        self.assertIn("older copy; the newest is 2026.2.13; you already track version 2026.2.13", older)
+        same = engine.describe_copy(self.copy("2026.2.13"), ["2026.2.13"], ["2026.2.13"])
+        self.assertIn("you already track another copy of this same version", same); self.assertNotIn("newest", same)
+        self.assertIn("you already track versions 1.0 and 2.0", engine.describe_copy(self.copy("1.5"), ["1.5"], ["2.0", "1.0"]))
+
+    def test_github_and_local_states_are_described_plainly(self):
+        changed = engine.describe_copy(self.copy("1.0", remote="git@github.com:me/demo.git", uncommitted_changes=14, unpushed_commits=2, branch="improve/speed"), ["1.0"], [])
+        self.assertIn("on GitHub as me/demo, 14 files changed but not committed, 2 commits not pushed; branch improve/speed", changed)
+        self.assertIn("this branch is not linked to a GitHub branch", engine.describe_copy(self.copy("1.0", remote="https://github.com/me/demo", uncommitted_changes=0, branch="audit"), ["1.0"], []))
+        self.assertIn("only on this computer; no GitHub repository", engine.describe_copy(self.copy("1.0", branch="main"), ["1.0"], []))
+        self.assertIn("only on this computer; not in Git", engine.describe_copy(self.copy("1.0", branch="not a Git repository"), ["1.0"], []))
+        self.assertIn("not on GitHub; its Git remote is D:/backup.git", engine.describe_copy(self.copy("1.0", remote="D:/backup.git", branch="main"), ["1.0"], []))
+        self.assertEqual("", engine.github_repository_label("https://gitlab.com/me/demo"))
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required for copy-detail tests")
+    def test_copy_details_are_read_from_git_without_network_access(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True); subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            manifest = root / "manifest.ini"; manifest.write_text(MANIFEST.replace("summary = Demo", "summary = Demo Add-on"), encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True); subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", "https://github.com/me/demo.git"], cwd=root, check=True)
+            (root / "new.py").write_text("x = 1\n", encoding="utf-8")
+            result = engine.add_copy_details(engine.ProjectResult("id", "demo", str(manifest), "awaiting manual approval"), manifest)
+        self.assertEqual(("Demo Add-on", "1.0", "main", "https://github.com/me/demo.git", 1, -1), (result.summary, result.addon_version, result.branch, result.remote, result.uncommitted_changes, result.unpushed_commits))
+        self.assertRegex(result.last_change, r"^\d{4}-\d{2}-\d{2}$")
+
+    def test_tracking_window_describes_each_copy(self):
+        dialogs = (PLUGIN_FOLDER / "dialogs.py").read_text(encoding="utf-8")
+        self.assertIn("engine.describe_copy(", dialogs)
+        self.assertNotIn("% (result.name, labels[", dialogs)
 
 if __name__ == "__main__": unittest.main()

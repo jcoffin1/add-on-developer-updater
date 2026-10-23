@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import ctypes, os, subprocess, threading, uuid
-from datetime import datetime, timezone
+import os, subprocess, threading, uuid
+from datetime import datetime
 from pathlib import Path
 
-import addonHandler, api, config, globalPluginHandler, globalVars, gui, scriptHandler, ui, wx
-from gui.nvdaControls import CustomCheckListBox
+import addonHandler, api, config, globalPluginHandler, globalVars, gui, scriptHandler, tones, ui, wx
 from gui.settingsDialogs import SettingsPanel
 from logHandler import log
 from . import engine, publisher
+from .dialogs import (
+    _projectDisplayName, UpdateReviewDialog, ProjectApprovalDialog, GitHubPublishDialog, StoreSubmissionDialog, GitHubRepositoryUrlDialog, GitHubSingleSelectionDialog, IssueTemplateEditorDialog, CompatibilityTargetDialog, ScanTargetDialog, ConfirmationDialog, InformationDialog, OperationProgressDialog,
+)
 
 addonHandler.initTranslation()
 SCRIPT_CATEGORY = _("Add-on Developer Updater")
@@ -20,11 +22,12 @@ config.conf.spec["addonDeveloperUpdater"] = {
     "scanFixedDrives": "boolean(default=False)",
     "scanRoots": "string(default='')",
     "periodicRescanHours": "integer(default=24,min=1,max=720)",
+    # Blank values use each manifest's author and the project's license file.
+    "storePublisher": "string(default='')",
+    "storeFallbackLicenseName": "string(default='')",
+    "storeFallbackLicenseUrl": "string(default='')",
+    "notificationSound": "boolean(default=True)",
 }
-
-def _projectDisplayName(result):
-    """Return public metadata prepared by a worker without touching the filesystem."""
-    return str(getattr(result, "public_name", "") or getattr(result, "summary", "") or result.name)
 
 class UpdaterSettingsPanel(SettingsPanel):
     title = SCRIPT_CATEGORY
@@ -34,412 +37,20 @@ class UpdaterSettingsPanel(SettingsPanel):
         self.prereleases = helper.addItem(wx.CheckBox(self, label=_("Include alpha, beta, and release candidate builds"))); self.prereleases.SetValue(settings["includePrereleases"])
         self.fixed = helper.addItem(wx.CheckBox(self, label=_("Include all accessible drives during manual scans"))); self.fixed.SetValue(settings["scanFixedDrives"])
         self.interval = helper.addLabeledControl(_("Release check interval in minutes:"), wx.SpinCtrl, min=15, max=1440, initial=max(15, settings["intervalMinutes"]))
-        self.rescan = helper.addLabeledControl(_("Recheck approved projects every number of hours:"), wx.SpinCtrl, min=1, max=720, initial=settings["periodicRescanHours"])
+        self.rescan = helper.addLabeledControl(_("Recheck tracked add-ons every number of hours:"), wx.SpinCtrl, min=1, max=720, initial=settings["periodicRescanHours"])
         self.roots = helper.addLabeledControl(_("Additional development folders, separated by semicolons:"), wx.TextCtrl, value=settings["scanRoots"])
+        # Labels are short because NVDA reads the whole label each time a field gains focus.
+        self.storePublisher = helper.addLabeledControl(_("Store publisher name (blank uses the manifest author):"), wx.TextCtrl, value=settings["storePublisher"])
+        self.storeLicenseName = helper.addLabeledControl(_("Store license name if no license file is found:"), wx.TextCtrl, value=settings["storeFallbackLicenseName"])
+        self.storeLicenseUrl = helper.addLabeledControl(_("Store license web address if no license file is found:"), wx.TextCtrl, value=settings["storeFallbackLicenseUrl"])
+        self.notificationSound = helper.addItem(wx.CheckBox(self, label=_("Play a sound when an automatic check finds something new"))); self.notificationSound.SetValue(settings["notificationSound"])
     def onSave(self):
         settings = config.conf["addonDeveloperUpdater"]
         settings["automaticChecks"] = self.automatic.IsChecked(); settings["includePrereleases"] = self.prereleases.IsChecked()
         settings["scanFixedDrives"] = self.fixed.IsChecked()
         settings["intervalMinutes"] = self.interval.GetValue(); settings["periodicRescanHours"] = self.rescan.GetValue(); settings["scanRoots"] = self.roots.GetValue()
+        settings["storePublisher"] = self.storePublisher.GetValue().strip(); settings["storeFallbackLicenseName"] = self.storeLicenseName.GetValue().strip(); settings["storeFallbackLicenseUrl"] = self.storeLicenseUrl.GetValue().strip(); settings["notificationSound"] = self.notificationSound.IsChecked()
         if GlobalPlugin.activeInstance is not None: GlobalPlugin.activeInstance._settingsChanged()
-
-class UpdateReviewDialog(wx.Dialog):
-    def __init__(self, parent, results, release=None):
-        super().__init__(parent, title=_("Review NVDA add-on compatibility updates"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.results = results; mainSizer = wx.BoxSizer(wx.VERTICAL)
-        self.onUpdate = None; self.allSelectedMessage = _("All add-on updates selected")
-        instruction = _("Check the add-ons whose manifests should be updated. Nothing is selected by default. Press Space to check an item, Control+A to select all, Enter to update the checked items, or Escape to close.")
-        if release is not None:
-            build = release.tag + (f" ({release.build_version})" if release.build_version and release.build_version != release.tag else "")
-            instruction = _("Selected NVDA build: %s. Manifest compatibility target: %s. ") % (build, release.manifest_version) + instruction
-        self.instructions = wx.StaticText(self, label=instruction); self.instructions.Wrap(900); mainSizer.Add(self.instructions, 0, wx.ALL, 10)
-        choices = []
-        for result in results:
-            if result.branch == "not a Git repository": gitState = _("manifest is not tracked by Git")
-            elif not result.branch or result.branch == "Git status unavailable": gitState = _("manifest change state is unavailable")
-            elif result.manifest_changed: gitState = _("manifest has uncommitted changes")
-            else: gitState = _("manifest is clean")
-            choices.append(_("%s: NVDA %s; minimum NVDA %s; branch %s; %s; %s") % (result.name, result.status.removeprefix("update available: "), result.minimum_version or _("unknown"), result.branch or _("unknown"), gitState, result.path))
-        self.checkList = CustomCheckListBox(self, choices=choices)
-        mainSizer.Add(self.checkList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
-        selectionSizer = wx.BoxSizer(wx.HORIZONTAL)
-        selectAll = wx.Button(self, label=_("Select &all")); selectNone = wx.Button(self, label=_("Select &none"))
-        selectAll.Bind(wx.EVT_BUTTON, lambda _event: self._setAll(True)); selectNone.Bind(wx.EVT_BUTTON, lambda _event: self._setAll(False))
-        selectionSizer.Add(selectAll, 0, wx.RIGHT, 8); selectionSizer.Add(selectNone, 0)
-        mainSizer.Add(selectionSizer, 0, wx.ALL, 10)
-        buttons = wx.BoxSizer(wx.HORIZONTAL)
-        self.updateButton = wx.Button(self, label=_("&Update selected")); self.closeButton = wx.Button(self, label=_("&Close"))
-        self.updateButton.SetDefault()
-        buttons.Add(self.updateButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0)
-        mainSizer.Add(buttons, 0, wx.ALL, 10)
-        self.SetSizer(mainSizer); self.SetMinSize((600, 320)); self.SetSize((800, 450)); self.CentreOnScreen()
-        self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
-    def _setAll(self, checked):
-        for index in range(len(self.results)): self.checkList.Check(index, checked)
-    def selectedResults(self):
-        return [result for index, result in enumerate(self.results) if self.checkList.IsChecked(index)]
-    def _onKey(self, event):
-        key = event.GetKeyCode()
-        listFocused = event.GetEventObject() is self.checkList or self.checkList.HasFocus()
-        if event.ControlDown() and key in (ord("A"), ord("a")):
-            self._setAll(True); ui.message(self.allSelectedMessage); return
-        if key == wx.WXK_ESCAPE:
-            self.Close(); return
-        if listFocused and key == wx.WXK_SPACE:
-            index = self.checkList.GetSelection()
-            if index != wx.NOT_FOUND:
-                checked = not self.checkList.IsChecked(index)
-                self.checkList.Check(index, checked)
-                ui.message(_("Selected") if checked else _("Not selected"))
-            return
-        if listFocused and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            if self.onUpdate is not None: self.onUpdate(None)
-            return
-        event.Skip()
-
-class ProjectApprovalDialog(UpdateReviewDialog):
-    def __init__(self, parent, results):
-        super().__init__(parent, results)
-        self.SetTitle(_("Approve discovered NVDA add-on projects")); self.allSelectedMessage = _("All discovered add-on projects selected")
-        self.instructions.SetLabel(_("Select only development projects this add-on may monitor and offer to publishing or store workflows. Test copies, installed add-ons, forks you do not maintain, and archived copies should remain unselected. Nothing is selected by default.")); self.instructions.Wrap(850)
-        labels = {"primary": _("primary development copy"), "codex": _("Codex work copy"), "other": _("other development copy")}
-        self.checkList.Set([_("%s; %s; %s") % (result.name, labels[engine.path_kind(result.path)], result.path) for result in results]); self.checkList.SetName(_("Discovered add-on development projects awaiting approval")); self.updateButton.SetLabel(_("&Approve and check selected"))
-
-class GitHubPublishDialog(UpdateReviewDialog):
-    def __init__(self, parent, results):
-        wx.Dialog.__init__(self, parent, title=_("Select add-ons to publish to GitHub"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.results = results; self.onUpdate = None; self.allSelectedMessage = _("All GitHub projects selected"); mainSizer = wx.BoxSizer(wx.VERTICAL)
-        mainSizer.Add(wx.StaticText(self, label=_("Check the add-on projects to inspect and publish. Nothing is selected by default. Press Space to check an item, Control+A to select all, Enter to continue, or Escape to close.")), 0, wx.ALL, 10)
-        labels = {"primary": _("primary development copy"), "codex": _("Codex work copy"), "other": _("development copy")}
-        self.checkList = CustomCheckListBox(self, choices=[_("%s; %s; %s") % (_projectDisplayName(result), labels[engine.path_kind(result.path)], result.path) for result in results])
-        mainSizer.Add(self.checkList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
-        selectionSizer = wx.BoxSizer(wx.HORIZONTAL); selectAll = wx.Button(self, label=_("Select &all")); selectNone = wx.Button(self, label=_("Select &none"))
-        selectAll.Bind(wx.EVT_BUTTON, lambda _event: self._setAll(True)); selectNone.Bind(wx.EVT_BUTTON, lambda _event: self._setAll(False)); selectionSizer.Add(selectAll, 0, wx.RIGHT, 8); selectionSizer.Add(selectNone, 0)
-        mainSizer.Add(selectionSizer, 0, wx.ALL, 10)
-        buttons = wx.BoxSizer(wx.HORIZONTAL); self.publishButton = wx.Button(self, label=_("&Continue")); self.closeButton = wx.Button(self, label=_("&Close")); self.publishButton.SetDefault()
-        buttons.Add(self.publishButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
-        self.SetSizer(mainSizer); self.SetMinSize((600, 320)); self.SetSize((800, 450)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
-
-class StoreSubmissionDialog(GitHubPublishDialog):
-    def __init__(self, parent, results):
-        super().__init__(parent, results)
-        self.SetTitle(_("Select add-ons to check for store submission"))
-        self.allSelectedMessage = _("All store-submission projects selected")
-        self.publishButton.SetLabel(_("&Check selected"))
-
-class GitHubRepositoryUrlDialog(wx.Dialog):
-    def __init__(self, parent, owner, repositories):
-        super().__init__(parent, title=_("Copy an NVDA add-on link"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.repositories = repositories; self.onCopy = None; self.onCopyRepository = None; mainSizer = wx.BoxSizer(wx.VERTICAL)
-        mainSizer.Add(wx.StaticText(self, label=_("Select a released NVDA add-on owned by %s, then choose Copy download link or Copy repository link. Press Enter to copy the download link, or Escape to close.") % owner), 0, wx.ALL, 10)
-        choices = []
-        for repository in repositories:
-            status = _("private") if repository.private else _("public")
-            if repository.archived: status += _(", archived")
-            if repository.prerelease: status += _(", prerelease")
-            choices.append(_("%s; release %s; file %s; %s") % (repository.full_name, repository.release_tag, repository.asset_name, status))
-        self.repositoryList = wx.ListBox(self, choices=choices, style=wx.LB_SINGLE)
-        if choices: self.repositoryList.SetSelection(0)
-        mainSizer.Add(self.repositoryList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
-        buttons = wx.BoxSizer(wx.VERTICAL); self.copyButton = wx.Button(self, label=_("&Copy download link")); self.copyRepositoryButton = wx.Button(self, label=_("Copy &repository link")); self.closeButton = wx.Button(self, label=_("C&lose")); self.copyButton.SetDefault()
-        buttons.Add(self.copyButton, 0, wx.BOTTOM, 8); buttons.Add(self.copyRepositoryButton, 0, wx.BOTTOM, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
-        self.SetSizer(mainSizer); self.SetMinSize((650, 320)); self.SetSize((850, 480)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
-    def selectedRepository(self):
-        index = self.repositoryList.GetSelection()
-        return self.repositories[index] if index != wx.NOT_FOUND else None
-    def _onKey(self, event):
-        key = event.GetKeyCode()
-        if key == wx.WXK_ESCAPE: self.Close(); return
-        if self.repositoryList.HasFocus() and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            if self.onCopy is not None: self.onCopy()
-            return
-        event.Skip()
-
-class GitHubSingleSelectionDialog(wx.Dialog):
-    def __init__(self, parent, title, instruction, items, choices, actionLabel):
-        super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.items = items; self.onAction = None; mainSizer = wx.BoxSizer(wx.VERTICAL)
-        mainSizer.Add(wx.StaticText(self, label=instruction), 0, wx.ALL, 10)
-        self.itemList = wx.ListBox(self, choices=choices, style=wx.LB_SINGLE)
-        if choices: self.itemList.SetSelection(0)
-        mainSizer.Add(self.itemList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
-        buttons = wx.BoxSizer(wx.HORIZONTAL); self.actionButton = wx.Button(self, label=actionLabel); self.closeButton = wx.Button(self, label=_("&Close")); self.actionButton.SetDefault()
-        buttons.Add(self.actionButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
-        self.SetSizer(mainSizer); self.SetMinSize((650, 320)); self.SetSize((850, 480)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
-    def selectedItem(self):
-        index = self.itemList.GetSelection()
-        return self.items[index] if index != wx.NOT_FOUND else None
-    def _onKey(self, event):
-        key = event.GetKeyCode()
-        if key == wx.WXK_ESCAPE: self.Close(); return
-        if self.itemList.HasFocus() and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            if self.onAction is not None: self.onAction()
-            return
-        event.Skip()
-
-class IssueTemplateEditorDialog(wx.Dialog):
-    def __init__(self, parent, repository, template, document):
-        super().__init__(parent, title=_("Edit GitHub issue template"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.template = template; self.onSave = None; self.onDelete = None; self._questionIndex = -1
-        self.document = document
-        self.formSupported = publisher.issue_template_form_supported(template, self.document)
-        mainSizer = wx.BoxSizer(wx.VERTICAL)
-        mainSizer.Add(wx.StaticText(self, label=_("Editing %s in %s on branch %s. Use the Form tab for common fields or Raw text for advanced changes. Control+S saves after confirmation; Escape closes without saving.") % (template.name, repository.full_name, repository.default_branch)), 0, wx.ALL, 10)
-        self.notebook = wx.Notebook(self)
-        if self.formSupported: self._createFormPage()
-        rawPage = wx.Panel(self.notebook); rawSizer = wx.BoxSizer(wx.VERTICAL)
-        rawSizer.Add(wx.StaticText(rawPage, label=_("Complete template text. Changes are checked before the Form tab can be reopened.")), 0, wx.ALL, 8)
-        self.editor = wx.TextCtrl(rawPage, value=template.content, style=wx.TE_MULTILINE | wx.TE_RICH2 | wx.TE_DONTWRAP)
-        self.editor.SetName(_("Complete issue template text"))
-        rawSizer.Add(self.editor, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8); rawPage.SetSizer(rawSizer)
-        self.rawPageIndex = self.notebook.GetPageCount(); self.notebook.AddPage(rawPage, _("Raw &text"), select=not self.formSupported)
-        if self.formSupported: self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGING, self._onPageChanging)
-        mainSizer.Add(self.notebook, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
-        buttons = wx.BoxSizer(wx.HORIZONTAL); self.saveButton = wx.Button(self, label=_("&Save to GitHub")); self.deleteButton = wx.Button(self, label=_("&Delete template")); self.closeButton = wx.Button(self, label=_("&Close without saving")); self.saveButton.SetDefault()
-        buttons.Add(self.saveButton, 0, wx.RIGHT, 8); buttons.Add(self.deleteButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
-        self.SetSizer(mainSizer); self.SetMinSize((760, 540)); self.SetSize((1050, 760)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
-    def _addLabeled(self, panel, sizer, label, control):
-        labelControl = wx.StaticText(panel, label=label); labelControl.Wrap(380); control.SetName(label.replace("&", "").rstrip(":")); sizer.Add(labelControl, 0, wx.ALIGN_CENTER_VERTICAL); sizer.Add(control, 1, wx.EXPAND)
-    def _createFormPage(self):
-        panel = wx.Panel(self.notebook); outer = wx.BoxSizer(wx.VERTICAL)
-        formHelp = wx.StaticText(panel, label=_("The form preserves unrecognized properties, but it may normalize YAML formatting and comments. Markdown means ordinary text with optional formatting symbols: start a heading with #, a bullet with -, or write a link as [link text](address). You can use normal text without any formatting. Use Raw text when exact template formatting matters.")); formHelp.Wrap(950); outer.Add(formHelp, 0, wx.EXPAND | wx.ALL, 8)
-        metadata = wx.FlexGridSizer(cols=2, hgap=8, vgap=6); metadata.AddGrowableCol(1, 1)
-        self.formName = wx.TextCtrl(panel); self.formDescription = wx.TextCtrl(panel); self.formTitle = wx.TextCtrl(panel); self.formLabels = wx.TextCtrl(panel); self.formAssignees = wx.TextCtrl(panel)
-        self._addLabeled(panel, metadata, _("Issue template display &name, shown in GitHub's New Issue menu:"), self.formName); self._addLabeled(panel, metadata, _("Menu &description, explaining when to use this template:"), self.formDescription); self._addLabeled(panel, metadata, _("Text automatically added to the beginning of the new issue &title:"), self.formTitle); self._addLabeled(panel, metadata, _("GitHub &labels automatically applied, separated by commas:"), self.formLabels); self._addLabeled(panel, metadata, _("GitHub usernames automatically &assigned, separated by commas:"), self.formAssignees)
-        outer.Add(metadata, 0, wx.EXPAND | wx.ALL, 8)
-        if self.document.kind == "markdown":
-            bodyLabel = wx.StaticText(panel, label=_("Instructions and questions shown to the person opening the issue. This accepts ordinary text; optional Markdown symbols can add headings, bullets, or links:")); bodyLabel.Wrap(950); outer.Add(bodyLabel, 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
-            self.markdownBody = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_RICH2)
-            self.markdownBody.SetName(_("Instructions and questions shown to the person opening the issue; enter ordinary text or optional Markdown formatting using # for headings, - for bullets, and [link text](address) for links"))
-            outer.Add(self.markdownBody, 1, wx.EXPAND | wx.ALL, 8)
-        else:
-            questionSizer = wx.BoxSizer(wx.HORIZONTAL); left = wx.BoxSizer(wx.VERTICAL)
-            left.Add(wx.StaticText(panel, label=_("Questions and information blocks, in the order shown on GitHub:")), 0, wx.BOTTOM, 4); self.questionList = wx.ListBox(panel, style=wx.LB_SINGLE); self.questionList.SetName(_("Questions and information blocks, in the order shown on GitHub")); left.Add(self.questionList, 1, wx.EXPAND)
-            questionButtons = wx.BoxSizer(wx.HORIZONTAL); self.addQuestionButton = wx.Button(panel, label=_("&Add question")); self.removeQuestionButton = wx.Button(panel, label=_("&Remove selected question")); self.moveUpButton = wx.Button(panel, label=_("Move selected question &up")); self.moveDownButton = wx.Button(panel, label=_("Move selected question &down"))
-            for button in (self.addQuestionButton, self.removeQuestionButton, self.moveUpButton, self.moveDownButton): questionButtons.Add(button, 0, wx.RIGHT, 5)
-            left.Add(questionButtons, 0, wx.TOP, 6); questionSizer.Add(left, 1, wx.EXPAND | wx.RIGHT, 10)
-            details = wx.FlexGridSizer(cols=2, hgap=8, vgap=6); details.AddGrowableCol(1, 1)
-            self.questionTypeValues = ("input", "textarea", "dropdown", "checkboxes", "markdown"); self.questionTypeNames = (_("Short answer, one line"), _("Long answer, multiple lines"), _("Drop-down choice list"), _("Checkbox list"), _("Information text, no answer; ordinary text with optional formatting symbols"))
-            self.questionType = wx.Choice(panel, choices=list(self.questionTypeNames)); self.questionId = wx.TextCtrl(panel); self.questionLabel = wx.TextCtrl(panel); self.questionDescription = wx.TextCtrl(panel); self.questionPlaceholder = wx.TextCtrl(panel); self.questionRendered = wx.TextCtrl(panel); self.questionValue = wx.TextCtrl(panel, style=wx.TE_MULTILINE); self.questionOptions = wx.TextCtrl(panel, style=wx.TE_MULTILINE); self.questionMultiple = wx.CheckBox(panel, label=_("Allow the person opening the issue to select more than one answer")); self.questionRequired = wx.CheckBox(panel, label=_("Require an answer before the issue can be submitted"))
-            self._addLabeled(panel, details, _("Selected item &type, such as short answer, long answer, choices, checkboxes, or information text:"), self.questionType); self._addLabeled(panel, details, _("Internal question &ID used in the submitted issue, without spaces:"), self.questionId); self._addLabeled(panel, details, _("Question shown to the person opening the issue:"), self.questionLabel); self._addLabeled(panel, details, _("Additional instructions shown below the question:"), self.questionDescription); self._addLabeled(panel, details, _("Example or placeholder text shown before an answer is entered:"), self.questionPlaceholder); self._addLabeled(panel, details, _("Programming language used to format a long answer as a code block:"), self.questionRendered); self.questionValueLabel = wx.StaticText(panel, label=_("Answer filled in before the person starts typing:")); self.questionValueLabel.Wrap(380); self.questionValue.SetName(_("Answer filled in before the person starts typing")); details.Add(self.questionValueLabel, 0, wx.ALIGN_CENTER_VERTICAL); details.Add(self.questionValue, 1, wx.EXPAND); self._addLabeled(panel, details, _("Available answers, one choice per line:"), self.questionOptions); details.AddSpacer(1); details.Add(self.questionMultiple, 0); details.AddSpacer(1); details.Add(self.questionRequired, 0)
-            questionSizer.Add(details, 2, wx.EXPAND); outer.Add(questionSizer, 1, wx.EXPAND | wx.ALL, 8)
-            self.questionList.Bind(wx.EVT_LISTBOX, self._onQuestionSelected); self.questionType.Bind(wx.EVT_CHOICE, lambda _event: self._enableQuestionFields()); self.addQuestionButton.Bind(wx.EVT_BUTTON, self._addQuestion); self.removeQuestionButton.Bind(wx.EVT_BUTTON, self._removeQuestion); self.moveUpButton.Bind(wx.EVT_BUTTON, lambda _event: self._moveQuestion(-1)); self.moveDownButton.Bind(wx.EVT_BUTTON, lambda _event: self._moveQuestion(1))
-        panel.SetSizer(outer); self.formPage = panel; self.notebook.AddPage(panel, _("&Form"), select=True); self._populateForm()
-    @staticmethod
-    def _listText(value):
-        if isinstance(value, list): return ", ".join(str(item) for item in value)
-        return str(value or "")
-    @staticmethod
-    def _splitList(value): return [item.strip() for item in value.split(",") if item.strip()]
-    def _populateForm(self):
-        data = self.document.data
-        self.formName.SetValue(str(data.get("name") or "")); self.formDescription.SetValue(str(data.get("description", data.get("about", "")) or "")); self.formTitle.SetValue(str(data.get("title") or "")); self.formLabels.SetValue(self._listText(data.get("labels"))); self.formAssignees.SetValue(self._listText(data.get("assignees")))
-        if self.document.kind == "markdown": self.markdownBody.SetValue(self.document.markdown_body); return
-        self._questionIndex = -1; self._refreshQuestionList(0)
-    def _setValue(self, data, key, value):
-        if value or key in data: data[key] = value
-    def _storeMetadata(self):
-        data = self.document.data; self._setValue(data, "name", self.formName.GetValue().strip()); descriptionKey = "about" if self.document.kind == "markdown" else "description"; self._setValue(data, descriptionKey, self.formDescription.GetValue().strip()); self._setValue(data, "title", self.formTitle.GetValue())
-        labels = self._splitList(self.formLabels.GetValue()); assignees = self._splitList(self.formAssignees.GetValue())
-        self._setValue(data, "labels", ", ".join(labels) if self.document.kind == "markdown" else labels); self._setValue(data, "assignees", ", ".join(assignees) if self.document.kind == "markdown" else assignees)
-        if self.document.kind == "markdown": self.document.markdown_body = self.markdownBody.GetValue()
-    def _questions(self): return self.document.data.setdefault("body", [])
-    def _selectedQuestionType(self):
-        selection = self.questionType.GetSelection()
-        return self.questionTypeValues[selection] if selection != wx.NOT_FOUND else ""
-    def _questionSummary(self, item, index):
-        kind = str(item.get("type") or "unknown"); typeName = self.questionTypeNames[self.questionTypeValues.index(kind)] if kind in self.questionTypeValues else kind; attributes = item.get("attributes") if isinstance(item.get("attributes"), dict) else {}; label = str(attributes.get("label") or attributes.get("value") or item.get("id") or "").replace("\n", " ").strip(); return _("%d. %s; %s") % (index + 1, typeName, label[:80] or _("unnamed"))
-    def _refreshQuestionList(self, selection=0):
-        questions = self._questions(); self.questionList.Set([self._questionSummary(item, index) for index, item in enumerate(questions)])
-        if questions:
-            selection = min(max(selection, 0), len(questions) - 1); self.questionList.SetSelection(selection); self._questionIndex = selection; self._loadQuestion(questions[selection])
-        else: self._questionIndex = -1; self._clearQuestion()
-    def _clearQuestion(self):
-        self.questionType.SetSelection(wx.NOT_FOUND)
-        for control in (self.questionId, self.questionLabel, self.questionDescription, self.questionPlaceholder, self.questionRendered, self.questionValue, self.questionOptions): control.SetValue(""); control.Disable()
-        self.questionType.Disable(); self.questionMultiple.SetValue(False); self.questionMultiple.Disable(); self.questionRequired.SetValue(False); self.questionRequired.Disable()
-    def _loadQuestion(self, item):
-        self.questionType.Enable(); kind = str(item.get("type") or "input"); self.questionType.SetSelection(self.questionTypeValues.index(kind) if kind in self.questionTypeValues else 0)
-        attributes = item.get("attributes") if isinstance(item.get("attributes"), dict) else {}; validations = item.get("validations") if isinstance(item.get("validations"), dict) else {}; options = attributes.get("options") if isinstance(attributes.get("options"), list) else []
-        optionLabels = [str(option.get("label") or "") if isinstance(option, dict) else str(option) for option in options]
-        self.questionId.SetValue(str(item.get("id") or "")); self.questionLabel.SetValue(str(attributes.get("label") or "")); self.questionDescription.SetValue(str(attributes.get("description") or "")); self.questionPlaceholder.SetValue(str(attributes.get("placeholder") or "")); self.questionRendered.SetValue(str(attributes.get("render") or "")); self.questionValue.SetValue(str(attributes.get("value") or "")); self.questionOptions.SetValue("\n".join(optionLabels)); self.questionMultiple.SetValue(bool(attributes.get("multiple"))); self.questionRequired.SetValue(bool(validations.get("required"))); self._enableQuestionFields()
-    def _enableQuestionFields(self):
-        kind = self._selectedQuestionType(); markdown = kind == "markdown"; options = kind in {"dropdown", "checkboxes"}
-        valueLabel = _("Information shown in the issue form. Enter ordinary text, or use optional Markdown symbols: # for headings, - for bullets, and [link text](address) for links:") if markdown else _("Answer filled in before the person starts typing:"); self.questionValueLabel.SetLabel(valueLabel); self.questionValueLabel.Wrap(380); self.questionValue.SetName(valueLabel.rstrip(":"))
-        self.questionId.Enable(bool(kind) and not markdown); self.questionLabel.Enable(bool(kind) and not markdown); self.questionDescription.Enable(bool(kind) and not markdown); self.questionPlaceholder.Enable(kind in {"input", "textarea"}); self.questionRendered.Enable(kind == "textarea"); self.questionValue.Enable(kind in {"input", "textarea", "markdown"}); self.questionOptions.Enable(options); self.questionMultiple.Enable(kind == "dropdown"); self.questionRequired.Enable(bool(kind) and not markdown)
-    def _storeQuestion(self):
-        if self._questionIndex < 0: return
-        item = self._questions()[self._questionIndex]; kind = self._selectedQuestionType() or str(item.get("type") or "input"); item["type"] = kind
-        if kind != "markdown": item["id"] = self.questionId.GetValue().strip()
-        attributes = item.setdefault("attributes", {}); validations = item.setdefault("validations", {})
-        if not isinstance(attributes, dict): attributes = {}; item["attributes"] = attributes
-        if not isinstance(validations, dict): validations = {}; item["validations"] = validations
-        knownAttributes = {"label", "description", "placeholder", "render", "value", "options", "multiple"}
-        allowedAttributes = {
-            "input": {"label", "description", "placeholder", "value"}, "textarea": {"label", "description", "placeholder", "render", "value"},
-            "dropdown": {"label", "description", "options", "multiple"}, "checkboxes": {"label", "description", "options"}, "markdown": {"value"},
-        }[kind]
-        for key in knownAttributes - allowedAttributes: attributes.pop(key, None)
-        if kind == "markdown":
-            item.pop("id", None); item.pop("validations", None); attributes["value"] = self.questionValue.GetValue()
-        else:
-            self._setValue(attributes, "label", self.questionLabel.GetValue()); self._setValue(attributes, "description", self.questionDescription.GetValue()); self._setValue(attributes, "placeholder", self.questionPlaceholder.GetValue()); self._setValue(attributes, "render", self.questionRendered.GetValue()); self._setValue(attributes, "value", self.questionValue.GetValue()); validations["required"] = self.questionRequired.IsChecked()
-            if kind in {"dropdown", "checkboxes"}:
-                values = [line.strip() for line in self.questionOptions.GetValue().splitlines() if line.strip()]; old = attributes.get("options") if isinstance(attributes.get("options"), list) else []; updated = []
-                for index, value in enumerate(values):
-                    if kind == "checkboxes":
-                        option = dict(old[index]) if index < len(old) and isinstance(old[index], dict) else {}; option["label"] = value; updated.append(option)
-                    else: updated.append(value)
-                attributes["options"] = updated
-            if kind == "dropdown" and (self.questionMultiple.IsChecked() or "multiple" in attributes): attributes["multiple"] = self.questionMultiple.IsChecked()
-    def _onQuestionSelected(self, event):
-        newIndex = event.GetSelection()
-        if self._questionIndex >= 0: self._storeQuestion()
-        self._questionIndex = newIndex; self._loadQuestion(self._questions()[newIndex]); self.questionList.Set([self._questionSummary(item, index) for index, item in enumerate(self._questions())]); self.questionList.SetSelection(newIndex)
-    def _addQuestion(self, _event):
-        self._storeQuestion(); questions = self._questions(); identifier = "question_%d" % (len(questions) + 1); questions.append({"type": "textarea", "id": identifier, "attributes": {"label": _("New question"), "description": ""}, "validations": {"required": False}}); self._refreshQuestionList(len(questions) - 1); self.questionLabel.SetFocus()
-    def _removeQuestion(self, _event):
-        if self._questionIndex < 0: ui.message(_("No form question is selected")); return
-        index = self._questionIndex; del self._questions()[index]; self._refreshQuestionList(max(0, index - 1)); ui.message(_("Question removed from the unsaved template"))
-    def _moveQuestion(self, offset):
-        if self._questionIndex < 0: ui.message(_("No form question is selected")); return
-        self._storeQuestion(); questions = self._questions(); target = self._questionIndex + offset
-        if target < 0 or target >= len(questions): ui.message(_("The question cannot be moved farther")); return
-        questions[self._questionIndex], questions[target] = questions[target], questions[self._questionIndex]; self._refreshQuestionList(target); self.questionList.SetFocus()
-    def _renderForm(self):
-        self._storeMetadata()
-        if self.document.kind == "yaml": self._storeQuestion()
-        return publisher.render_issue_template_document(self.document)
-    def _onPageChanging(self, event):
-        if event.GetOldSelection() == 0 and event.GetSelection() == self.rawPageIndex:
-            self.editor.SetValue(self._renderForm())
-        elif event.GetOldSelection() == self.rawPageIndex and event.GetSelection() == 0:
-            if len(self.editor.GetValue().encode("utf-8")) > 256 * 1024:
-                ui.message(_("This template is too large for the form editor. Continue editing it as raw text.")); event.Veto(); return
-            try: document = publisher.parse_issue_template_document(self.template, self.editor.GetValue())
-            except (TypeError, ValueError) as error:
-                ui.message(_("The raw template cannot be shown as a form: %s") % error); event.Veto(); return
-            if not publisher.issue_template_form_supported(self.template, document, self.editor.GetValue()):
-                ui.message(_("This template contains a question type that the accessible form cannot safely edit. Continue editing it as raw text.")); event.Veto(); return
-            self.document = document; self._populateForm()
-        event.Skip()
-    def getContent(self):
-        return self.editor.GetValue() if not self.formSupported or self.notebook.GetSelection() == self.rawPageIndex else self._renderForm()
-    def initialFocus(self): return self.formName if self.formSupported else self.editor
-    def _onKey(self, event):
-        key = event.GetKeyCode()
-        if key == wx.WXK_ESCAPE: self.Close(); return
-        if event.ControlDown() and key in (ord("S"), ord("s")):
-            if self.onSave is not None: self.onSave()
-            return
-        event.Skip()
-
-class CompatibilityTargetDialog(GitHubPublishDialog):
-    def __init__(self, parent, projects, officialChoices):
-        wx.Dialog.__init__(self, parent, title=_("Set an older NVDA compatibility target"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.results = projects; self.officialChoices = officialChoices; self.onUpdate = None; self.allSelectedMessage = _("All compatibility-target projects selected"); self._targetValues = []; mainSizer = wx.BoxSizer(wx.VERTICAL)
-        explanation = wx.StaticText(self, label=_("Select add-ons first, then choose an official older NVDA version. This changes only lastTestedNVDAVersion. It does not downgrade NVDA, the add-on version, or source code, and it does not prove the code works with that NVDA release. If the source already uses newer NVDA APIs, check out the correct older source branch instead. Nothing is selected by default.")); explanation.Wrap(900); mainSizer.Add(explanation, 0, wx.ALL, 10)
-        targetSizer = wx.BoxSizer(wx.HORIZONTAL); targetSizer.Add(wx.StaticText(self, label=_("Official older NVDA &target:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8); self.target = wx.Choice(self); self.target.SetName(_("Official older NVDA target shared by every selected add-on")); targetSizer.Add(self.target, 1, wx.EXPAND); mainSizer.Add(targetSizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
-        choices = []
-        for project in projects:
-            if project.branch == "Git status unavailable": gitState = _("Git state unavailable")
-            elif project.manifest_changed: gitState = _("manifest has uncommitted changes")
-            elif project.branch == "not a Git repository": gitState = _("manifest is not tracked by Git")
-            else: gitState = _("manifest is clean")
-            choices.append(_("%s; current last tested NVDA %s; minimum NVDA %s; branch %s; %s; %s") % (project.name, project.current_version, project.minimum_version, project.branch, gitState, project.path))
-        self.checkList = CustomCheckListBox(self, choices=choices); self.checkList.SetName(_("Add-ons whose last tested NVDA version will be changed")); mainSizer.Add(self.checkList, 1, wx.EXPAND | wx.ALL, 10)
-        selectionSizer = wx.BoxSizer(wx.HORIZONTAL); selectAll = wx.Button(self, label=_("Select &all")); selectNone = wx.Button(self, label=_("Select &none")); selectAll.Bind(wx.EVT_BUTTON, lambda _event: self._setAll(True)); selectNone.Bind(wx.EVT_BUTTON, lambda _event: self._setAll(False)); selectionSizer.Add(selectAll, 0, wx.RIGHT, 8); selectionSizer.Add(selectNone, 0); mainSizer.Add(selectionSizer, 0, wx.LEFT | wx.RIGHT, 10)
-        buttons = wx.BoxSizer(wx.HORIZONTAL); self.applyButton = wx.Button(self, label=_("&Review compatibility changes")); self.closeButton = wx.Button(self, label=_("&Close")); self.applyButton.SetDefault(); buttons.Add(self.applyButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
-        self.checkList.Bind(wx.EVT_CHECKLISTBOX, self._onChecked); self.SetSizer(mainSizer); self.SetMinSize((720, 400)); self.SetSize((980, 580)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey); self._refreshTargets()
-    def _setAll(self, checked):
-        super()._setAll(checked); self._refreshTargets()
-    def _refreshTargets(self):
-        previous = self.selectedTarget(); allowed = engine.allowed_compatibility_targets(self.selectedResults(), self.officialChoices); self._targetValues = [version for version, _experimental in allowed]
-        labels = [_("%s, experimental") % version if experimental else version for version, experimental in allowed]
-        self.target.Set(labels)
-        if labels:
-            selection = self._targetValues.index(previous) if previous in self._targetValues else 0; self.target.SetSelection(selection); self.target.Enable(); self.applyButton.Enable()
-        else:
-            self.target.Disable(); self.applyButton.Disable()
-    def selectedTarget(self):
-        selection = self.target.GetSelection()
-        return self._targetValues[selection] if selection != wx.NOT_FOUND and selection < len(self._targetValues) else ""
-    def _onChecked(self, event):
-        self._refreshTargets(); event.Skip()
-    def _onKey(self, event):
-        key = event.GetKeyCode(); listFocused = event.GetEventObject() is self.checkList or self.checkList.HasFocus()
-        if event.ControlDown() and key in (ord("A"), ord("a")):
-            self._setAll(True); ui.message(self.allSelectedMessage); return
-        if key == wx.WXK_ESCAPE: self.Close(); return
-        if listFocused and key == wx.WXK_SPACE:
-            index = self.checkList.GetSelection()
-            if index != wx.NOT_FOUND:
-                checked = not self.checkList.IsChecked(index); self.checkList.Check(index, checked); self._refreshTargets(); ui.message(_("Selected") if checked else _("Not selected"))
-            return
-        if listFocused and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            if self.onUpdate is not None: self.onUpdate(None)
-            return
-        event.Skip()
-
-class ScanTargetDialog(wx.Dialog):
-    def __init__(self, parent, releases, preferredTag=""):
-        super().__init__(parent, title=_("Choose the NVDA compatibility scan target"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.releases = releases; self.onStart = None; mainSizer = wx.BoxSizer(wx.VERTICAL)
-        explanation = wx.StaticText(self, label=_("Choose the exact NVDA build to check. Stable, beta, release candidate, and alpha are separate choices. The full build identifies what will be tested; the manifest compatibility target is the value proposed for lastTestedNVDAVersion. Scans propose only newer targets and make no manifest changes. Use the compatibility downgrade command when an existing manifest must be set to an older target.")); explanation.Wrap(850); mainSizer.Add(explanation, 0, wx.ALL, 10)
-        channelNames = {"stable": _("stable"), "beta": _("beta"), "rc": _("release candidate"), "alpha": _("alpha"), "prerelease": _("prerelease")}
-        labels = []
-        for release in releases:
-            build = release.tag + (f" ({release.build_version})" if release.build_version and release.build_version != release.tag else "")
-            labels.append(_("%s; NVDA build %s; manifest compatibility target %s; information source %s") % (channelNames.get(engine.release_channel(release), engine.release_channel(release)), build, release.manifest_version, release.source))
-        self.targetList = wx.ListBox(self, choices=labels, style=wx.LB_SINGLE); self.targetList.SetName(_("Available NVDA builds and manifest compatibility targets"))
-        selection = next((index for index, release in enumerate(releases) if release.tag.casefold() == preferredTag.casefold()), wx.NOT_FOUND)
-        if selection == wx.NOT_FOUND: selection = next((index for index, release in enumerate(releases) if engine.release_channel(release) == "stable"), 0)
-        if labels: self.targetList.SetSelection(selection)
-        mainSizer.Add(self.targetList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
-        buttons = wx.BoxSizer(wx.HORIZONTAL); self.startButton = wx.Button(self, label=_("&Start scan with selected build")); self.closeButton = wx.Button(self, label=_("&Close")); self.startButton.SetDefault(); buttons.Add(self.startButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
-        self.SetSizer(mainSizer); self.SetMinSize((700, 340)); self.SetSize((900, 480)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
-    def selectedRelease(self):
-        index = self.targetList.GetSelection()
-        return self.releases[index] if index != wx.NOT_FOUND else None
-    def _onKey(self, event):
-        key = event.GetKeyCode()
-        if key == wx.WXK_ESCAPE: self.Close(); return
-        if self.targetList.HasFocus() and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-            if self.onStart is not None: self.onStart()
-            return
-        event.Skip()
-
-class ConfirmationDialog(wx.Dialog):
-    def __init__(self, parent, title, message, defaultYes=False):
-        super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        sizer = wx.BoxSizer(wx.VERTICAL); sizer.Add(wx.StaticText(self, label=message), 1, wx.EXPAND | wx.ALL, 15)
-        buttons = wx.BoxSizer(wx.HORIZONTAL); self.yesButton = wx.Button(self, label=_("&Yes")); self.noButton = wx.Button(self, label=_("&No"))
-        (self.yesButton if defaultYes else self.noButton).SetDefault(); self.defaultButton = self.yesButton if defaultYes else self.noButton
-        buttons.Add(self.yesButton, 0, wx.RIGHT, 8); buttons.Add(self.noButton, 0); sizer.Add(buttons, 0, wx.ALL, 15)
-        self.SetSizer(sizer); self.SetMinSize((600, 280)); self.SetSize((720, 360)); self.CentreOnScreen()
-
-class InformationDialog(wx.Dialog):
-    def __init__(self, parent, title, message):
-        super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        sizer = wx.BoxSizer(wx.VERTICAL); self.message = wx.TextCtrl(self, value=message, style=wx.TE_READONLY | wx.TE_MULTILINE)
-        sizer.Add(self.message, 1, wx.EXPAND | wx.ALL, 15); self.okButton = wx.Button(self, label=_("&OK")); self.okButton.SetDefault(); sizer.Add(self.okButton, 0, wx.ALL, 15)
-        self.SetSizer(sizer); self.SetMinSize((550, 240)); self.SetSize((680, 300)); self.CentreOnScreen()
-
-class OperationProgressDialog(wx.Dialog):
-    def __init__(self, parent):
-        super().__init__(parent, title=_("Add-on Developer Updater progress"), style=wx.DEFAULT_DIALOG_STYLE)
-        sizer = wx.BoxSizer(wx.VERTICAL)
-        initialStatus = _("An add-on developer operation is running. The repeating percentage indicates activity, not estimated completion.")
-        self.status = wx.TextCtrl(self, value=initialStatus, style=wx.TE_READONLY); self.status.SetName(initialStatus)
-        sizer.Add(self.status, 0, wx.EXPAND | wx.ALL, 10)
-        self.gauge = wx.Gauge(self, range=100); self.gauge.SetValue(0); sizer.Add(self.gauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10); self.SetSizerAndFit(sizer)
-    def setStatus(self, message):
-        """Keep the focused control's value and accessibility name synchronized."""
-        message = _(message); self.status.SetName(message); self.status.ChangeValue(message); self.status.SetInsertionPoint(0); self.status.Refresh(); self.status.Update()
-        # A focused read-only edit can retain NVDA's old cached value even after
-        # WM_SETTEXT. Send the native value-change event so braille follows speech.
-        try: ctypes.windll.user32.NotifyWinEvent(0x800E, int(self.status.GetHandle()), -4, 0)
-        except (AttributeError, OSError, TypeError, ValueError): pass
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     activeInstance = None
@@ -458,10 +69,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if config.conf["addonDeveloperUpdater"]["automaticChecks"]: self._startMonitor()
         self._wakeMonitor.set()
     def _startProgress(self, keepFocus=False):
+        # No activity pulse: an animated percentage made NVDA beep or speak numbers
+        # that did not measure progress.  Real step counts show the bar instead.
         self._stopProgress(); stopEvent = threading.Event(); self._progressStop = stopEvent; self._progressValue = 0; self._progressDeterminate = False; wx.CallAfter(self._showProgress, stopEvent, keepFocus)
-        def pulse():
-            while not stopEvent.wait(2) and not self._shutdown.is_set(): wx.CallAfter(self._pulseProgress, stopEvent)
-        self._progressThread = threading.Thread(target=pulse, name="addonDeveloperProgress", daemon=True); self._progressThread.start()
     def _showProgress(self, stopEvent, keepFocus=False):
         if stopEvent.is_set() or self._shutdown.is_set(): return
         if self._progressDialog is not None: self._progressDialog.Destroy()
@@ -488,11 +98,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if stopEvent is not self._progressStop or stopEvent.is_set(): return
         self._progressDeterminate = True
         if self._progressDialog is not None:
-            self._progressValue = min(100, max(0, round(current * 100 / max(1, total)))); self._progressDialog.setStatus(message); self._progressDialog.gauge.SetValue(self._progressValue); self._progressDialog.Layout()
-    def _pulseProgress(self, stopEvent):
-        if stopEvent is self._progressStop and not stopEvent.is_set() and not self._progressDeterminate and self._progressDialog is not None:
-            self._progressValue = self._progressValue + 10 if self._progressValue < 90 else 10
-            self._progressDialog.gauge.SetValue(self._progressValue)
+            self._progressValue = min(100, max(0, round(current * 100 / max(1, total)))); self._progressDialog.setStatus(message); self._progressDialog.setProgress(self._progressValue); self._progressDialog.Layout()
     def _stopProgress(self):
         self._progressStop.set(); self._progressThread = None; wx.CallAfter(self._closeProgress)
     def _finishProgressThen(self, callback, *args):
@@ -511,9 +117,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if self._progressDialog is not None:
             dialog = self._progressDialog; self._progressDialog = None; dialog.Destroy()
         if self._confirmDialog is not None:
-            self._confirmDialog.Raise(); self._confirmDialog.defaultButton.SetFocus()
+            self._confirmDialog.Raise(); self._confirmDialog.message.SetFocus()
         elif self._informationDialog is not None:
-            self._informationDialog.Raise(); self._informationDialog.okButton.SetFocus()
+            self._informationDialog.Raise(); self._informationDialog.message.SetFocus()
     def terminate(self):
         self._shutdown.set(); self._scanCancel.set(); self._wakeMonitor.set(); self._stopProgress()
         publisher.cancel_running_commands()
@@ -560,30 +166,42 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         available = sum(str(item.get("status", "")).startswith("update available: ") for item in records if isinstance(item, dict)); awaiting = sum("awaiting" in str(item.get("status", "")) for item in records if isinstance(item, dict)); failed = sum("failed" in str(item.get("status", "")) for item in records if isinstance(item, dict)); approvedCount = sum(item.get("project_id") in approved for item in records if isinstance(item, dict))
         source = str(state.get("releaseSource", "unknown")); release = str(state.get("releaseTag", "unknown")); buildVersion = str(state.get("releaseBuildVersion", "")); compatibility = str(state.get("manifestVersion", "unknown"))
         build = release + (f" ({buildVersion})" if buildVersion and buildVersion != release else "")
-        message = _("Last checked NVDA build %s, manifest compatibility target %s, information source %s. Last successful check %s. Last complete project check %s. Last development-folder discovery %s. %d approved projects, %d updates available, %d awaiting approval, and %d validation failures.") % (build, compatibility, source, self._formatCheckTime(state.get("lastSuccessfulCheckAt")), self._formatCheckTime(state.get("lastScanAt")), self._formatCheckTime(state.get("lastDiscoveryAt")), approvedCount, available, awaiting, failed)
-        if state.get("lastDiscoveryDirectories") is not None: message += _(" The last discovery visited %d directories in %s seconds%s.") % (int(state.get("lastDiscoveryDirectories", 0)), state.get("lastDiscoverySeconds", 0), _(", and stopped at its safety limit") if state.get("lastDiscoveryTruncated") else "")
-        if config.conf["addonDeveloperUpdater"]["automaticChecks"]: message += _(" The next automatic check is expected in about %d minutes.") % max(1, round(self._nextAutomaticCheckDelay(state, config.conf["addonDeveloperUpdater"]) / 60))
-        else: message += _(" Automatic checks are disabled.")
-        if state.get("lastCheckError"): message += _(" Most recent check error: %s.") % state["lastCheckError"]
-        ui.message(message); self._showInformation(_("Add-on update-check status"), message)
+        # One fact per line, outcome first, so speech starts with what matters and
+        # braille users can move line by line to the detail they need.
+        attention = [text for count, text in ((available, _("%d updates available") % available), (awaiting, _("%d add-ons found but not tracked yet") % awaiting), (failed, _("%d projects could not be checked") % failed)) if count]
+        if attention: summary = ", ".join(attention) + "."
+        elif not state.get("lastSuccessfulCheckAt"): summary = _("No check has completed yet. Press NVDA+Alt+Shift+U to run one.")
+        else: summary = _("No updates or problems found.")
+        details = [
+            _("Tracked add-ons: %d") % approvedCount, _("Updates available: %d") % available, _("Found but not tracked yet: %d") % awaiting, _("Could not be checked: %d") % failed,
+            _("NVDA build checked: %s") % build, _("Compatibility target: %s") % compatibility, _("Release information from: %s") % source,
+            _("Last successful check: %s") % self._formatCheckTime(state.get("lastSuccessfulCheckAt")), _("Last project check: %s") % self._formatCheckTime(state.get("lastScanAt")), _("Last folder search: %s") % self._formatCheckTime(state.get("lastDiscoveryAt")),
+        ]
+        if state.get("lastDiscoveryDirectories") is not None:
+            details.append(_("Folders searched: %d in %s seconds") % (int(state.get("lastDiscoveryDirectories", 0)), state.get("lastDiscoverySeconds", 0)))
+            if state.get("lastDiscoveryTruncated"): details.append(self._discoveryLimitText(state.get("lastDiscoveryCompleteDepth")))
+        if config.conf["addonDeveloperUpdater"]["automaticChecks"]: details.append(_("Next automatic check: in about %d minutes") % max(1, round(self._nextAutomaticCheckDelay(state, config.conf["addonDeveloperUpdater"]) / 60)))
+        else: details.append(_("Automatic checks: off"))
+        if state.get("lastCheckError"): details.append(_("Most recent error: %s") % state["lastCheckError"])
+        self._showInformation(_("Add-on update-check status"), engine.readable_message(summary, details))
     @staticmethod
     def _formatCheckTime(value):
         try: return datetime.fromisoformat(str(value)).astimezone().strftime("%B %d, %Y at %I:%M %p")
         except (TypeError, ValueError): return _("never")
-    @scriptHandler.script(description=_("Review newly discovered add-on projects awaiting approval"), category=SCRIPT_CATEGORY)
+    @scriptHandler.script(description=_("Choose which found add-on projects to track"), category=SCRIPT_CATEGORY)
     def script_reviewDiscoveredAddonProjects(self, gesture):
         state = engine.read_json(self._statePath, {}); awaiting = []
         for item in engine.visible_project_records(state)[0]:
             if isinstance(item, dict) and "awaiting" in str(item.get("status", "")):
                 try: awaiting.append(engine.ProjectResult(**item))
                 except TypeError: pass
-        if not awaiting: ui.message(_("No discovered add-on projects are awaiting approval")); return
+        if not awaiting: ui.message(_("No found add-ons are waiting to be tracked. Press NVDA+Alt+Shift+U to search again.")); return
         release = engine.Release(str(state.get("releaseTag", "")), str(state.get("manifestVersion", "")), bool(state.get("prerelease")), str(state.get("releaseUrl", "")), str(state.get("releaseSource", "saved")), str(state.get("releaseCheckedAt", "")), str(state.get("releaseBuildVersion", "")))
         self._showProjectApprovalDialog(awaiting, release)
     @scriptHandler.script(description=_("Set an older last tested NVDA version for selected add-ons"), gesture="kb:NVDA+alt+shift+d", category=SCRIPT_CATEGORY)
     def script_downgradeAddonCompatibility(self, gesture):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        ui.message(_("Loading approved projects and official NVDA compatibility versions")); self._startProgress(keepFocus=True)
+        ui.message(_("Loading tracked add-ons and official NVDA compatibility versions")); self._startProgress(keepFocus=True)
         try: threading.Thread(target=self._loadCompatibilityTargets, name="addonDeveloperCompatibilityTargets", daemon=True).start()
         except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start compatibility-target lookup"); ui.message(_("Compatibility targets could not be loaded"))
     def _loadCompatibilityTargets(self):
@@ -600,7 +218,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 except (KeyError, OSError, ValueError):
                     log.exception("Could not load compatibility details for %s", item.get("path"))
             if projects: callback, arguments = self._showDowngradeDialog, (projects, officialChoices)
-            else: callback, arguments = self._showInformation, (_("No compatibility targets available"), _("No approved add-on development projects are available to change."))
+            else: callback, arguments = self._showInformation, (_("No compatibility targets available"), _("No tracked add-ons are available to change."))
         except Exception as error:
             log.exception("Compatibility-target lookup failed"); callback, arguments = self._showInformation, (_("Compatibility targets could not be loaded"), _("Official NVDA compatibility versions could not be loaded: %s") % error)
         finally:
@@ -651,7 +269,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         message = _("Compatibility target change complete. %d manifests changed: %s. Use the Undo most recent compatibility target changes command if these changes need to be restored.") % (len(changed), self._limitedDetails(changed, lambda item: _("%s %s") % (item.name, item.status))) if changed else _("Compatibility target change complete. No manifests were changed.")
         if failed: message += _(" %d projects were not changed: %s.") % (len(failed), "; ".join(_("%s: %s") % (item.name, item.status.removeprefix("validation failed: ")) for item in failed))
         if saveError: message += _(" Warning: the manifest results or undo history could not be saved: %s. Keep the backup files and inspect the changed manifests before continuing.") % saveError
-        ui.message(message); self._showInformation(_("Compatibility target results"), message)
+        self._showInformation(_("Compatibility target results"), message)
     @scriptHandler.script(description=_("Undo the most recent compatibility target changes"), category=SCRIPT_CATEGORY)
     def script_undoCompatibilityTargetChanges(self, gesture):
         state = engine.read_json(self._statePath, {}); entries = state.get("compatibilityUndo", []) if isinstance(state.get("compatibilityUndo"), list) else []
@@ -693,7 +311,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         else: message = _("Compatibility update undo complete. No manifests were restored.") if updateOperation else _("Compatibility undo complete. No manifests were restored.")
         if failed: message += _(" %d manifests were not restored: %s.") % (len(failed), "; ".join(_("%s: %s") % (item.name, item.status) for item in failed))
         if saveError: message += _(" Warning: restored manifests were not recorded in updater state: %s. Verify the manifests and backups manually.") % saveError
-        ui.message(message); self._showInformation(_("Compatibility update undo results") if updateOperation else _("Compatibility undo results"), message)
+        self._showInformation(_("Compatibility update undo results") if updateOperation else _("Compatibility undo results"), message)
     @scriptHandler.script(description=_("Review previously discovered NVDA add-on compatibility updates"), category=SCRIPT_CATEGORY)
     def script_reviewAddonProjectUpdates(self, gesture):
         state = engine.read_json(self._statePath, {}); release, available = engine.load_manual_review(state)
@@ -713,7 +331,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if self._workerProcess is not None:
             try: self._workerProcess.terminate()
             except OSError: pass
-        ui.message(_("Add-on developer operation cancellation requested"))
+        ui.message(_("Cancellation requested. The operation stops at its next safe point; a GitHub push or upload already in progress is allowed to finish."))
     @scriptHandler.script(description=_("Submit updated add-ons to the NVDA Add-on Store"), gesture="kb:NVDA+alt+shift+s", category=SCRIPT_CATEGORY)
     def script_submitUpdatedAddons(self, gesture):
         self._beginApprovedProjectSelection("store")
@@ -732,21 +350,21 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.checkList.SetFocus)
     def _beginStorePreflight(self, ready):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        ui.message(_("Checking the selected add-ons, release packages, and current NVDA Add-on Store requirements")); self._startProgress(keepFocus=True)
+        ui.message(_("Checking the selected add-ons, release packages, and current NVDA Add-on Store requirements")); self._scanCancel.clear(); self._scanActive.set(); self._startProgress(keepFocus=True)
         try: threading.Thread(target=self._storePreflight, args=(ready,), name="addonDeveloperStorePreflight", daemon=True).start()
         except Exception:
-            self._stopProgress(); self._scanLock.release(); log.exception("Could not start store submission preflight"); ui.message(_("The store submission check could not be started"))
+            self._scanActive.clear(); self._stopProgress(); self._scanLock.release(); log.exception("Could not start store submission preflight"); ui.message(_("The store submission check could not be started"))
     def _beginApprovedProjectSelection(self, action):
         if action not in {"github", "store"}: return
         existing = self._publishDialog if action == "github" else self._storeDialog
         if existing is not None:
             existing.Raise(); existing.checkList.SetFocus(); return
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        message = _("Loading approved add-ons for GitHub publishing") if action == "github" else _("Loading approved add-ons for store-submission review")
+        message = _("Loading tracked add-ons for GitHub publishing") if action == "github" else _("Loading tracked add-ons for the Add-on Store check")
         ui.message(message); self._startProgress(keepFocus=True)
         try: threading.Thread(target=self._loadApprovedProjectSelection, args=(action,), name="addonDeveloperProjectSelection", daemon=True).start()
         except Exception:
-            self._stopProgress(); self._scanLock.release(); log.exception("Could not start approved-project loading"); ui.message(_("Approved add-on projects could not be loaded"))
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start approved-project loading"); ui.message(_("Tracked add-ons could not be loaded"))
     def _loadApprovedProjectSelection(self, action):
         ready = []; ignoredCount = 0; olderCount = 0; errorMessage = ""
         try:
@@ -770,41 +388,46 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._scanLock.release(); self._finishProgressThen(self._finishApprovedProjectSelection, action, ready, ignoredCount, olderCount, errorMessage)
     def _finishApprovedProjectSelection(self, action, ready, ignoredCount, olderCount, errorMessage=""):
         if errorMessage:
-            self._showInformation(_("Approved projects could not be loaded"), _("Approved add-on projects could not be loaded: %s") % errorMessage); return
+            self._showInformation(_("Tracked add-ons could not be loaded"), _("Tracked add-ons could not be loaded: %s") % errorMessage); return
         if not ready:
-            message = _("No approved add-on development projects are available to publish to GitHub") if action == "github" else _("No approved add-on development projects are available to check for store submission")
+            message = _("No tracked add-ons to publish. Press NVDA+Alt+Shift+U to search for add-ons, then check the ones you develop.") if action == "github" else _("No tracked add-ons to check for the Add-on Store. Press NVDA+Alt+Shift+U to search for add-ons, then check the ones you develop.")
             ui.message(message); return
         if action == "github":
-            if ignoredCount: ui.message(_("Ignored %d duplicate Codex work copies because primary development copies are available") % ignoredCount)
-            if olderCount: ui.message(_("Ignored %d older local add-on copies. Only the newest local version of each add-on is available for GitHub publishing.") % olderCount)
+            # One short sentence: the checklist opening next would cut off anything longer.
+            hidden = ignoredCount + olderCount
+            if hidden: ui.message(ngettext("%d duplicate or older copy is hidden; only the newest copy of each add-on is listed.", "%d duplicate or older copies are hidden; only the newest copy of each add-on is listed.", hidden) % hidden)
             self._showGitHubPublishDialog(ready)
         else: self._showStoreSubmissionDialog(ready)
     def _storePreflight(self, ready):
         callback = None; arguments = ()
         try:
-            reports = publisher.preflight(ready, engine.values, self._githubProgress)
+            reports = publisher.preflight(ready, engine.values, self._githubProgress, self._githubCancelled)
             callback, arguments = self._offerStoreSubmission, (reports,)
         except publisher.GitHubCliRequired:
             callback, arguments = self._offerGitHubCliInstall, ()
         except publisher.AuthenticationRequired:
             callback, arguments = self._offerStoreGitHubLogin, (ready,)
-        except Exception as error:
+        except publisher.OperationCancelled:
+            callback, arguments = self._showInformation, (_("Store-readiness check cancelled"), _("The store-readiness check was cancelled. No store pages were opened."))
+        except Exception:
             # One malformed or inaccessible project must not hide other add-ons
             # that can be verified. Retry individually and retain exact failures.
             log.exception("Combined store submission preflight failed; retrying projects individually")
             reports = []; failures = []
             for project in ready:
-                try: reports.extend(publisher.preflight([project], engine.values, self._githubProgress))
+                try: reports.extend(publisher.preflight([project], engine.values, self._githubProgress, self._githubCancelled))
                 except publisher.GitHubCliRequired:
                     callback, arguments = self._offerGitHubCliInstall, (); break
                 except publisher.AuthenticationRequired:
                     callback, arguments = self._offerStoreGitHubLogin, (ready,); break
+                except publisher.OperationCancelled:
+                    callback, arguments = self._showInformation, (_("Store-readiness check cancelled"), _("The store-readiness check was cancelled. No store pages were opened.")); break
                 except Exception as projectError:
                     log.exception("Store submission inspection failed for %s", project.name)
                     failures.append(_("%s: inspection failed: %s") % (_projectDisplayName(project), projectError))
             else: callback, arguments = self._offerStoreSubmission, (reports, failures)
         finally:
-            self._scanLock.release()
+            self._scanActive.clear(); self._scanLock.release()
             if callback is not None: self._finishProgressThen(callback, *arguments)
     def _offerStoreGitHubLogin(self, ready):
         self._showConfirmation(_("Sign in to GitHub"), _("GitHub CLI is not signed in for NVDA. Sign in now to check the selected add-ons for store submission? A one-time code will be copied to the clipboard and GitHub will open in your browser."), lambda: self._startStoreGitHubLogin(ready), defaultYes=True, onNo=lambda: self._showInformation(_("Store-readiness check canceled"), _("The selected add-ons were not checked and no store pages were opened.")))
@@ -834,17 +457,21 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             reasons = publisher.store_readiness_reasons(report)
             if reasons: blocked.append(_("%s: %s") % (publisher.public_name(report), ", ".join(reasons)))
             else: eligible.append((report, item))
-        if blocked: ui.message(_("Not ready for store submission: %s") % "; ".join(blocked))
         if not eligible:
-            self._showGitHubResult(_("No add-ons are ready for store submission. Reasons: %s. Press OK to exit.") % "; ".join(blocked)); return
-        names = self._limitedDetails([entry[1] for entry in eligible], lambda item: publisher.repository_name(item["sourceUrl"]))
-        blockedText = _(" Add-ons not ready: %s.") % "; ".join(blocked) if blocked else ""
-        message = _("Verified ready for store submission: %s.%s Select Yes to open only their prefilled submission forms. Review every field and submit each form manually; the updater never submits a store issue or pull request. Select No to exit without opening the store.") % (names, blockedText)
+            self._showGitHubResult(engine.readable_message(_("No add-ons are ready for the Add-on Store yet."), [_("What needs fixing:")] + blocked), _("Store submission not ready")); return
+        names = ", ".join(publisher.public_name(report) for report, _item in eligible)
+        settings = config.conf["addonDeveloperUpdater"]; fallbackLicense = settings["storeFallbackLicenseName"].strip()
+        unknownLicense = [publisher.public_name(report) for report, _item in eligible if not report.license_name and not fallbackLicense]
+        summary = ngettext("Open the Add-on Store submission form for %d add-on?", "Open the Add-on Store submission forms for %d add-ons?", len(eligible)) % len(eligible)
+        details = [_("Ready: %s") % names, _("Each form opens in your browser with its fields filled in. Nothing is submitted until you review the form and submit it yourself.")]
+        if unknownLicense: details += ["", _("No standard license file was found for: %s. Fill in the license fields on its form.") % ", ".join(unknownLicense)]
+        if blocked: details += ["", _("Not ready yet:")] + blocked
+        message = engine.readable_message(summary, details, _("Yes opens the forms. No opens nothing."))
         def submit():
             results = [engine.ProjectResult(report.project_id, report.name, report.manifest, "GitHub release verified") for report, _item in eligible]
-            urls = [publisher.store_url(item) for _report, item in eligible]
+            urls = [publisher.store_url(item, settings["storePublisher"], settings["storeFallbackLicenseName"], settings["storeFallbackLicenseUrl"]) for _report, item in eligible]
             ui.message(_("Opening prefilled store submission forms for: %s") % names); self._startSubmissionLauncher(results, urls)
-        self._showConfirmation(_("Submit add-ons to the NVDA Add-on Store"), message, submit, onNo=lambda: self._showGitHubResult(_("Store submission was canceled. No store pages were opened. Press OK to exit.")))
+        self._showConfirmation(_("Submit add-ons to the NVDA Add-on Store"), message, submit, onNo=lambda: self._showGitHubResult(_("Store submission was canceled. No store pages were opened.")))
     @scriptHandler.script(description=_("Publish updated add-ons to GitHub and optionally create releases"), gestures=("kb:NVDA+alt+g", "kb:NVDA+alt+shift+g"), category=SCRIPT_CATEGORY)
     def script_publishUpdatedAddonsToGitHub(self, gesture):
         self._beginApprovedProjectSelection("github")
@@ -1093,7 +720,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if self._templateEditorDialog is dialog:
             if succeeded: self._templateEditorDialog = None; dialog.Destroy()
             else: dialog.Enable(); dialog.Raise(); dialog.initialFocus().SetFocus()
-        ui.message(message); self._showInformation(_("Issue template saved") if succeeded else _("Issue-template save failed"), message)
+        self._showInformation(_("Issue template saved") if succeeded else _("Issue-template save failed"), message)
     def _startIssueTemplateDelete(self, repository, template, dialog):
         if self._templateEditorDialog is not dialog: return
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
@@ -1113,7 +740,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if self._templateEditorDialog is dialog:
             if succeeded: self._templateEditorDialog = None; dialog.Destroy()
             else: dialog.Enable(); dialog.Raise(); dialog.initialFocus().SetFocus()
-        ui.message(message); self._showInformation(_("Issue template deleted") if succeeded else _("Issue-template deletion failed"), message)
+        self._showInformation(_("Issue template deleted") if succeeded else _("Issue-template deletion failed"), message)
     def _offerGitHubProjectLogin(self, action):
         self._showConfirmation(_("Sign in to GitHub"), _("GitHub CLI is not signed in for NVDA. Sign in now to access add-on repository Issues and templates? A one-time code will be copied to the clipboard and GitHub will open in your browser."), lambda: self._startGitHubProjectLogin(action), defaultYes=True, onNo=lambda: self._showInformation(_("GitHub repository action canceled"), _("No GitHub page was opened and no issue template was changed.")))
     def _startGitHubProjectLogin(self, action):
@@ -1146,10 +773,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.checkList.SetFocus)
     def _beginGitHubPreflight(self, ready):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        ui.message(_("Checking GitHub authentication and add-on repository safety")); self._startProgress(keepFocus=True)
+        ui.message(_("Checking GitHub authentication and add-on repository safety")); self._scanCancel.clear(); self._scanActive.set(); self._startProgress(keepFocus=True)
         try: threading.Thread(target=self._githubPreflight, args=(ready,), name="addonDeveloperGitHubPreflight", daemon=True).start()
         except Exception:
-            self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub preflight"); ui.message(_("The GitHub preflight could not be started"))
+            self._scanActive.clear(); self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub preflight"); ui.message(_("The GitHub preflight could not be started"))
     def _monitorLoop(self):
         while not self._shutdown.is_set():
             try:
@@ -1210,79 +837,82 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             close(); self._startCheck(True, full_system, release)
         dialog.onStart = start; dialog.startButton.Bind(wx.EVT_BUTTON, start); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close); dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.targetList.SetFocus)
     def _rootStrings(self):
-        settings = config.conf["addonDeveloperUpdater"]
-        roots = [str(Path.home() / "Documents" / "NVDA Add-on Development" / "Add-ons"), str(Path.home() / "Documents" / "Codex")]
-        for variable in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial", "Dropbox", "GoogleDrive", "iCloudDrive"):
-            if value := os.environ.get(variable): roots.append(value)
-        roots.extend(str(Path.home() / name) for name in ("OneDrive", "Dropbox", "Google Drive", "iCloudDrive"))
-        roots.extend(value.strip() for value in settings["scanRoots"].split(";") if value.strip())
-        return list(dict.fromkeys(os.path.normcase(os.path.expandvars(os.path.expanduser(root))) for root in roots))
-    @staticmethod
-    def _rescanDue(state, hours):
-        try:
-            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(state.get("lastDiscoveryAt") or state["lastScanAt"])).total_seconds()
-            return elapsed < -300 or elapsed >= hours * 3600
-        except (KeyError, TypeError, ValueError): return True
-    @classmethod
-    def _workerMode(cls, manual, state, hours):
-        if manual: return "manual"
-        return "periodic" if cls._rescanDue(state, hours) else "background"
+        return engine.development_roots(config.conf["addonDeveloperUpdater"]["scanRoots"])
     @staticmethod
     def _limitedDetails(items, formatter, limit=5):
         details = [formatter(item) for item in items[:limit]]
         if len(items) > limit: details.append(_("and %d more") % (len(items) - limit))
         return "; ".join(details)
     @classmethod
-    def _completionMessage(cls, results):
-        if not results: return _("Scan complete. No add-on development projects were found.")
+    def _completionMessage(cls, results, heading=None):
+        if not results: return _("Scan complete. No add-on development projects were found.") if heading is None else heading
         current = [result for result in results if result.status == "current"]
         updated = [result for result in results if result.status.startswith("updated to ")]
         available = [result for result in results if result.status.startswith("update available: ")]
         awaiting = [result for result in results if "awaiting" in result.status]
         failed = [result for result in results if "failed" in result.status]
         deferred = [result for result in results if "deferred" in result.status]
-        parts = [_("Scan complete.")]
-        if current: parts.append(_("1 project is current.") if len(current) == 1 else _("%d projects are current.") % len(current))
+        # The first line carries the counts, because NVDA speaks it on its own
+        # when the window opens and a braille display shows it first.
+        counts = [text for items, text in (
+            (updated, ngettext("%d manifest updated", "%d manifests updated", len(updated)) % len(updated)),
+            (available, ngettext("%d update available", "%d updates available", len(available)) % len(available)),
+            (awaiting, ngettext("%d add-on found but not tracked yet", "%d add-ons found but not tracked yet", len(awaiting)) % len(awaiting)),
+            (failed, ngettext("%d project could not be checked", "%d projects could not be checked", len(failed)) % len(failed)),
+            (deferred, ngettext("%d update deferred", "%d updates deferred", len(deferred)) % len(deferred)),
+            (current, ngettext("%d project current", "%d projects current", len(current)) % len(current)),
+        ) if items]
+        heading = (_("Scan complete.") if heading is None else heading).rstrip(".")
+        parts = []
         if updated:
-            details = cls._limitedDetails(updated, lambda result: _("%s to NVDA %s") % (result.name, result.status.removeprefix("updated to ")))
+            details = cls._limitedDetails(updated, lambda result: _("%s to NVDA %s") % (result.summary or result.name, result.status.removeprefix("updated to ")))
             parts.append(_("1 manifest updated: %s.") % details if len(updated) == 1 else _("%d manifests updated: %s.") % (len(updated), details))
         if available:
-            details = cls._limitedDetails(available, lambda result: _("%s, NVDA %s") % (result.name, result.status.removeprefix("update available: ")))
+            details = cls._limitedDetails(available, lambda result: _("%s, NVDA %s") % (result.summary or result.name, result.status.removeprefix("update available: ")))
             parts.append(_("1 update is available: %s. The result was saved and nothing was changed. Use the review command when you are ready.") % details if len(available) == 1 else _("%d updates are available: %s. The results were saved and nothing was changed. Use the review command when you are ready.") % (len(available), details))
         if awaiting:
-            details = cls._limitedDetails(awaiting, lambda result: result.name)
-            parts.append(_("1 project is awaiting approval: %s.") % details if len(awaiting) == 1 else _("%d projects are awaiting approval: %s.") % (len(awaiting), details))
+            details = cls._limitedDetails(awaiting, lambda result: result.summary or result.name)
+            parts.append(_("Not tracked yet: %s.") % details)
         if failed:
-            details = cls._limitedDetails(failed, lambda result: result.name)
+            details = cls._limitedDetails(failed, lambda result: result.summary or result.name)
             parts.append(_("1 project could not be processed: %s. See the NVDA log for details.") % details if len(failed) == 1 else _("%d projects could not be processed: %s. See the NVDA log for details.") % (len(failed), details))
         if deferred:
-            details = cls._limitedDetails(deferred, lambda result: _("%s: %s") % (result.name, result.status))
+            details = cls._limitedDetails(deferred, lambda result: _("%s: %s") % (result.summary or result.name, result.status))
             parts.append(_("The update was deferred: %s.") % details)
-        return " ".join(parts)
+        summary = _("%s: %s.") % (heading, ", ".join(counts))
+        return summary + ("\n" + engine.readable_text(" ".join(parts)) if parts else "")
     @staticmethod
     def _addProjectContext(result, path):
         try:
-            metadata = engine.values(path); result.minimum_version = metadata.get("minimumnvdaversion", ""); result.addon_version = metadata.get("version", ""); result.branch, result.manifest_changed = engine.git_manifest_state(path)
+            metadata = engine.values(path); result.summary = metadata.get("summary", ""); result.minimum_version = metadata.get("minimumnvdaversion", ""); result.addon_version = metadata.get("version", ""); result.branch, result.manifest_changed = engine.git_manifest_state(path)
         except (OSError, UnicodeError, ValueError):
             pass
         return result
     def _showProjectApprovalDialog(self, awaiting, release):
         if self._approvalDialog is not None: self._approvalDialog.Raise(); self._approvalDialog.checkList.SetFocus(); return
-        dialog = ProjectApprovalDialog(gui.mainFrame, awaiting); self._approvalDialog = dialog
+        # Versions of each add-on that are already tracked, so the list can say so.
+        state = engine.read_json(self._statePath, {}); tracked = engine.saved_approved_project_ids(state); trackedVersions = {}
+        for item in state.get("projects", []) if isinstance(state.get("projects"), list) else []:
+            if isinstance(item, dict) and item.get("project_id") in tracked:
+                trackedVersions.setdefault(str(item.get("summary") or item.get("name") or "").casefold(), []).append(str(item.get("addon_version") or "unknown"))
+        dialog = ProjectApprovalDialog(gui.mainFrame, awaiting, trackedVersions); self._approvalDialog = dialog
         def close(_event=None):
             if self._approvalDialog is dialog: self._approvalDialog = None
             dialog.Destroy()
         def approve(_event=None):
             selected = dialog.selectedResults()
-            if not selected: ui.message(_("No discovered add-on projects were selected")); return
-            details = "; ".join(_("%s; %s") % (item.name, item.path) for item in selected)
-            self._showConfirmation(_("Confirm approved add-on projects"), _("Approve %d development projects for future monitoring, GitHub publishing, and store-readiness workflows? Confirm that these are copies you maintain. Projects: %s.") % (len(selected), details), lambda: (close(), self._startApproveProjects(selected, release)))
+            if not selected: ui.message(_("No add-ons are checked. Press Space on each add-on you develop.")); return
+            summary = ngettext("Track %d add-on?", "Track %d add-ons?", len(selected)) % len(selected)
+            details = [_("%s %s, in %s") % (item.summary or item.name, item.addon_version, item.path) for item in selected]
+            details += ["", _("Tracked add-ons are checked for new NVDA versions now and after each scan, and can be published to GitHub and submitted to the Add-on Store."), _("Nothing in their files changes until you confirm an update or publication separately.")]
+            message = engine.readable_message(summary, details, _("Yes starts tracking them. No returns to the list."))
+            self._showConfirmation(_("Track add-ons"), message, lambda: (close(), self._startApproveProjects(selected, release)))
         dialog.onUpdate = approve; dialog.updateButton.Bind(wx.EVT_BUTTON, approve); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close); dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.checkList.SetFocus)
     def _startApproveProjects(self, selected, release):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        ui.message(_("Validating %d selected projects before approval") % len(selected)); self._startProgress(keepFocus=True)
+        ui.message(ngettext("Checking %d add-on before tracking it", "Checking %d add-ons before tracking them", len(selected)) % len(selected)); self._startProgress(keepFocus=True)
         try: threading.Thread(target=self._approveProjects, args=(selected, release, self._progressStop), name="addonDeveloperProjectApproval", daemon=True).start()
-        except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start project approval"); ui.message(_("Project approval could not be started"))
+        except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start project approval"); ui.message(_("Tracking could not be started"))
     def _approveProjects(self, selected, release, progressEvent):
         results = []; operationError = ""
         try:
@@ -1306,13 +936,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._scanLock.release(); self._finishProgressThen(self._finishProjectApproval, results, release, operationError)
     def _finishProjectApproval(self, results, release, operationError=""):
         if operationError:
-            message = _("Project approval failed before its results could be saved: %s. No project should be treated as newly approved.") % operationError; ui.message(message); self._showInformation(_("Project approval failed"), message); return
+            message = engine.readable_message(_("The add-ons could not be tracked."), [_("Reason: %s") % operationError, _("No add-on was added to the tracked list.")]); self._showInformation(_("Tracking failed"), message); return
         approved = [item for item in results if "awaiting" not in item.status]; failed = [item for item in results if item not in approved]; available = [item for item in approved if item.status.startswith("update available: ")]
-        message = _("Project approval complete. %d projects approved: %s.") % (len(approved), self._limitedDetails(approved, lambda item: item.name)) if approved else _("Project approval complete. No projects were approved.")
-        if failed: message += _(" %d projects remain unapproved because validation failed: %s.") % (len(failed), self._limitedDetails(failed, lambda item: item.name))
-        ui.message(message)
-        if available: self._showReviewDialog(available, release)
-        else: self._showInformation(_("Project approval results"), message)
+        summary = ngettext("Now tracking %d add-on.", "Now tracking %d add-ons.", len(approved)) % len(approved) if approved else _("No add-ons were tracked.")
+        details = [_("Tracked: %s") % ", ".join(f"{item.summary or item.name} {item.addon_version}".strip() for item in approved)] if approved else []
+        if failed: details += ["", ngettext("%d add-on could not be tracked because its manifest.ini has a problem:", "%d add-ons could not be tracked because their manifest.ini files have problems:", len(failed)) % len(failed)] + [_("%s: %s") % (item.summary or item.name, item.status.removeprefix("awaiting manual approval; ")) for item in failed] + [_("Fix the manifest, then press NVDA+Alt+Shift+U to check again.")]
+        message = engine.readable_message(summary, details)
+        if available:
+            # Only a short summary is spoken: the review window opening next would cut off anything longer.
+            ui.message(ngettext("Now tracking %d add-ons; %d has an NVDA update to review.", "Now tracking %d add-ons; %d have NVDA updates to review.", len(available)) % (len(approved), len(available)))
+            self._showReviewDialog(available, release)
+        else: self._showInformation(_("Tracked add-ons"), message)
     def _showReviewDialog(self, available, release):
         if self._reviewDialog is not None:
             self._reviewDialog.Raise(); self._reviewDialog.checkList.SetFocus(); return
@@ -1347,7 +981,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if refreshed is None:
                 results = [engine.ProjectResult(item.project_id, item.name, item.path, _("update deferred because the selected NVDA build %s is no longer an available target; run the update check again") % release.tag) for item in selected]
                 state = engine.read_json(self._statePath, {}); state.pop("manualUpdateReview", None); engine.atomic_json_write(self._statePath, state)
-                if not self._shutdown.is_set(): wx.CallAfter(self._finishApply, results)
                 return
             release = refreshed
             for selectedResult in selected:
@@ -1362,26 +995,29 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             updated = [result for result in results if result.status.startswith("updated to ")]
             submissionProjects = engine.merge_project_records(state.get("submissionProjects", []), updated)
             channels = state.get("submissionChannels", {}) if isinstance(state.get("submissionChannels"), dict) else {}
-            releaseChannel = engine.release_channel(release)
-            for result in updated: channels[result.project_id] = "dev" if releaseChannel == "alpha" else ("beta" if release.prerelease else "stable")
+            for result in updated: channels[result.project_id] = engine.submission_channel(release)
             state["projects"] = projects; state["submissionProjects"] = submissionProjects; state["submissionChannels"] = channels; state["lastScanAt"] = engine.utc_now()
             if updated: state["updateUndo"] = [{"project_id": result.project_id, "name": result.name, "path": result.path, "backup_path": result.backup_path, "previous_last_tested": result.previous_last_tested, "target_last_tested": result.target_last_tested, "target_manifest_hash": result.target_manifest_hash} for result in updated]
             completed = {result.project_id for result in results if result.status == "current" or result.status.startswith("updated to ")}
             engine.finish_manual_review_items(state, completed)
             engine.atomic_json_write(self._statePath, state)
             for result in results: log.info("Add-on Developer Updater selected update: %s: %s", result.path, result.status)
-            if not self._shutdown.is_set(): wx.CallAfter(self._finishApply, results)
         except Exception as error:
             log.exception("Selected manifest update operation failed")
             results = [engine.ProjectResult(item.project_id, item.name, item.path, _("update operation failed while saving complete results; inspect the manifest and its backup: %s") % error) for item in selected]
-            if not self._shutdown.is_set(): wx.CallAfter(self._finishApply, results)
-        finally: self._scanActive.clear(); self._stopProgress(); self._scanLock.release()
+        finally:
+            self._scanActive.clear(); self._scanLock.release(); self._finishProgressThen(self._finishApply, results)
     def _finishApply(self, results):
-        ui.message(self._completionMessage(results))
+        message = self._completionMessage(results, _("Compatibility update complete.")); self._showInformation(_("Compatibility update results"), message)
     def _showConfirmation(self, title, message, onYes, defaultYes=False, onNo=None):
+        """Ask a question whose first line NVDA speaks; arrows and braille review the details.
+
+        Escape always means No.  Enter in the message chooses the highlighted
+        default button, which is No unless the action is harmless.
+        """
         if self._confirmDialog is not None:
-            ui.message(_("Finish the current confirmation before starting another add-on developer action")); self._confirmDialog.Raise(); self._confirmDialog.defaultButton.SetFocus(); return
-        dialog = ConfirmationDialog(gui.mainFrame, title, message, defaultYes=defaultYes); self._confirmDialog = dialog
+            ui.message(_("Finish the current confirmation before starting another add-on developer action")); self._confirmDialog.Raise(); self._confirmDialog.message.SetFocus(); return
+        dialog = ConfirmationDialog(gui.mainFrame, title, engine.readable_text(message), defaultYes=defaultYes); self._confirmDialog = dialog
         def close(_event=None):
             if self._confirmDialog is dialog: self._confirmDialog = None
             dialog.Destroy()
@@ -1389,36 +1025,59 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         def no(_event=None):
             close()
             if onNo is not None: onNo()
-        dialog.yesButton.Bind(wx.EVT_BUTTON, yes); dialog.noButton.Bind(wx.EVT_BUTTON, no); dialog.Bind(wx.EVT_CLOSE, close)
-        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.defaultButton.SetFocus)
+        def onKey(event):
+            key = event.GetKeyCode()
+            if key == wx.WXK_ESCAPE: no(); return
+            if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER) and dialog.message.HasFocus():
+                (yes if defaultYes else no)(); return
+            event.Skip()
+        dialog.yesButton.Bind(wx.EVT_BUTTON, yes); dialog.noButton.Bind(wx.EVT_BUTTON, no); dialog.Bind(wx.EVT_CLOSE, close); dialog.Bind(wx.EVT_CHAR_HOOK, onKey)
+        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.message.SetFocus)
     def _showInformation(self, title, message):
+        """Show a result once: NVDA speaks its first line, and arrows or braille review the rest.
+
+        Callers should not also speak the message; that made NVDA say it twice.
+        """
+        message = engine.readable_text(message)
         if self._informationDialog is not None:
-            self._informationDialog.SetTitle(title); self._informationDialog.message.SetValue(message); self._informationDialog.message.SetInsertionPoint(0); self._informationDialog.Raise(); self._informationDialog.okButton.SetFocus(); return
+            dialog = self._informationDialog; combined = engine.information_window_text(message, dialog.GetTitle(), dialog.message.GetValue(), _("Earlier result"))
+            hadFocus = dialog.message.HasFocus()
+            dialog.SetTitle(title); dialog.message.SetValue(combined); dialog.message.SetInsertionPoint(0); dialog.Raise()
+            # A field that already has focus is not announced again, so speak the new first line.
+            if hadFocus: ui.message(engine.first_line(message))
+            else: dialog.message.SetFocus()
+            return
         dialog = InformationDialog(gui.mainFrame, title, message); self._informationDialog = dialog
         def close(_event=None):
             if self._informationDialog is dialog: self._informationDialog = None
             dialog.Destroy()
-        dialog.okButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
-        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.okButton.SetFocus)
+        def onKey(event):
+            key = event.GetKeyCode()
+            if key == wx.WXK_ESCAPE or (key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER) and dialog.message.HasFocus()): close(); return
+            event.Skip()
+        dialog.okButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close); dialog.Bind(wx.EVT_CHAR_HOOK, onKey)
+        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.message.SetFocus)
     def _showGitHubResult(self, message, title=None):
-        ui.message(message); self._showInformation(title or _("GitHub publishing result"), message)
+        self._showInformation(title or _("GitHub publishing result"), message)
     def _githubPreflight(self, ready):
         callback = None; arguments = ()
         try:
-            reports = publisher.preflight(ready, engine.values, self._githubProgress)
+            reports = publisher.preflight(ready, engine.values, self._githubProgress, self._githubCancelled)
             self._rememberExistingReleases(reports)
-            callback, arguments = self._offerGitHubPush, (reports,)
+            callback, arguments = self._offerGitHubPush, (reports, ready)
         except publisher.GitHubCliRequired:
             callback, arguments = self._offerGitHubCliInstall, ()
         except publisher.AuthenticationRequired:
             callback, arguments = self._offerGitHubLogin, (ready,)
+        except publisher.OperationCancelled:
+            callback, arguments = self._showGitHubResult, (_("GitHub publishing was cancelled during the safety check. No changes were made."), _("GitHub publishing cancelled"))
         except Exception as error:
-            log.exception("GitHub publishing preflight failed"); callback, arguments = self._showGitHubResult, (_("GitHub publishing preflight failed: %s. Press OK to exit.") % error, _("GitHub publishing failed"))
+            log.exception("GitHub publishing preflight failed"); callback, arguments = self._showGitHubResult, (_("GitHub publishing preflight failed: %s.") % error, _("GitHub publishing failed"))
         finally:
-            self._scanLock.release()
+            self._scanActive.clear(); self._scanLock.release()
             if callback is not None: self._finishProgressThen(callback, *arguments)
     def _offerGitHubLogin(self, ready):
-        self._showConfirmation(_("Sign in to GitHub"), _("GitHub CLI is not signed in for NVDA. Sign in now? A one-time code will be copied to the clipboard and GitHub will open in your browser. Press Enter or select Yes to continue."), lambda: self._startGitHubLogin(ready), defaultYes=True, onNo=lambda: self._showGitHubResult(_("GitHub publishing was canceled. Press OK to exit.")))
+        self._showConfirmation(_("Sign in to GitHub"), _("GitHub CLI is not signed in for NVDA. Sign in now? A one-time code will be copied to the clipboard and GitHub will open in your browser. Press Enter or select Yes to continue."), lambda: self._startGitHubLogin(ready), defaultYes=True, onNo=lambda: self._showGitHubResult(_("GitHub publishing was canceled.")))
     def _startGitHubLogin(self, ready):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
         ui.message(_("Starting GitHub sign-in. The one-time code will be copied to the clipboard. Complete authorization in the browser.")); self._startProgress(keepFocus=True)
@@ -1450,31 +1109,76 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         try: threading.Thread(target=launch, name="addonDeveloperOpenGitHubCli", daemon=True).start()
         except Exception:
             log.exception("Could not start the GitHub CLI installation-page launcher"); ui.message(_("The GitHub CLI installation page could not be opened"))
-    def _offerGitHubPush(self, reports):
-        comparisons = "; ".join(_("%s: current GitHub release %s, newest local version %s") % (publisher.public_name(report), getattr(report, "github_release_version", "") or _("none"), getattr(report, "version", "") or _("unknown")) for report in reports)
-        if comparisons: ui.message(_("GitHub release version comparison: %s") % comparisons)
-        notOwned = [publisher.public_name(report) for report in reports if not getattr(report, "repository_owned_by_user", True)]
-        reports = [report for report in reports if getattr(report, "repository_owned_by_user", True)]
-        if notOwned: ui.message(_("Skipped repositories that are not owned by the signed-in GitHub account: %s") % "; ".join(notOwned))
-        versionConflicts = [report for report in reports if publisher.release_publish_action(report) == "version-conflict"]
-        reports = [report for report in reports if publisher.release_publish_action(report) != "version-conflict"]
-        if versionConflicts:
-            ui.message(_("Skipped add-ons whose current version already has a GitHub Release that does not include the current local changes. Increment each manifest version before publishing: %s") % "; ".join(publisher.public_name(report) for report in versionConflicts))
-        reports = [report for report in reports if report.changed_files or report.unpushed_commits or not report.remote or publisher.release_publish_action(report)]
+    def _offerGitHubPush(self, reports, ready=None):
+        # Everything is gathered into the confirmation itself instead of being
+        # spoken beforehand, so nothing is heard twice or cut off by the window.
+        eligible, notOwned, versionConflicts = publisher.publish_plan(reports)
+        skipped = [_("Skipped, the repository belongs to another GitHub account: %s") % publisher.public_name(report) for report in notOwned]
+        increments = [(report, publisher.next_patch_version(report.version)) for report in versionConflicts]
+        increments = [(report, version) for report, version in increments if version]
+        if ready is not None and increments:
+            summary = ngettext("Increase the version of %d add-on before publishing?", "Increase the versions of %d add-ons before publishing?", len(increments)) % len(increments)
+            details = [ngettext("Why: this version is already released on GitHub, but your copy has changes that are not in that release.", "Why: these versions are already released on GitHub, but your copies have changes that are not in those releases.", len(increments))]
+            details += [_("%s: %s becomes %s") % (publisher.public_name(report), report.version, version) for report, version in increments]
+            details += [_("The manifest, any addon_version in buildVars.py, and readme version lines are changed."), _("Nothing is pushed yet. The publishing check runs again so you can review everything first."), _("Tip: add notes for the new version to CHANGELOG.md before you confirm publishing.")]
+            message = engine.readable_message(summary, details, _("Yes increases the versions. No publishes the other add-ons without these."))
+            self._showConfirmation(_("Increment add-on versions"), message, lambda: self._startVersionIncrement(increments, ready), onNo=lambda: self._offerGitHubPush(reports))
+            return
+        skipped += [_("Skipped, version %s is already released with different code: %s. Increase its version to publish it.") % (report.version, publisher.public_name(report)) for report in versionConflicts]
+        reports = eligible
         if not reports:
             if versionConflicts:
-                message = _("No add-ons can be published yet. Their current versions already have GitHub Releases that do not include the current local changes. Increment the manifest version for: %s. Press OK to exit.") % "; ".join(publisher.public_name(report) for report in versionConflicts)
-                ui.message(message); self._showInformation(_("Manifest version increment required"), message); return
-            message = _("The newest local releases are already current on GitHub. Press OK to exit.")
-            ui.message(message); self._showInformation(_("GitHub releases are current"), message); return
+                message = engine.readable_message(_("Nothing can be published yet."), skipped)
+                self._showInformation(_("Manifest version increment required"), message); return
+            message = engine.readable_message(_("Everything is already published. GitHub has the newest version of each selected add-on."), skipped)
+            self._showInformation(_("GitHub releases are current"), message); return
         create = [publisher.public_name(report) for report in reports if not report.remote]; changed = sum(report.changed_files for report in reports)
         unpushed = sum(report.unpushed_commits for report in reports)
-        branchPlan = self._limitedDetails(reports, lambda report: _("%s: working branch %s, repository default branch %s") % (publisher.public_name(report), getattr(report, "current_branch", "") or _("unknown"), getattr(report, "default_branch", "") or _("will be determined after the first push")))
-        ui.message(_("GitHub branch plan: %s") % branchPlan)
-        message = _("Publish %d add-on projects to GitHub? %d changed files will be committed and %d existing local commits will be pushed. Missing public repositories will be created for: %s. Branches: %s. A release will be created only after its exact commit is present on the repository's default branch. Select No to make no changes.") % (len(reports), changed, unpushed, "; ".join(create) if create else _("none"), branchPlan)
-        self._showConfirmation(_("Publish add-ons to GitHub"), message, lambda: self._startGitHubPush(reports), onNo=lambda: self._showGitHubResult(_("GitHub publishing was canceled. Press OK to exit.")))
+        summary = ngettext("Publish %d add-on to GitHub?", "Publish %d add-ons to GitHub?", len(reports)) % len(reports)
+        details = [ngettext("Commit %d changed file.", "Commit %d changed files.", changed) % changed if changed else _("No files need committing."),
+                   ngettext("Push %d local commit.", "Push %d local commits.", unpushed) % unpushed if unpushed else _("No earlier local commits need pushing.")]
+        if create: details.append(_("Create a new public GitHub repository for: %s") % ", ".join(create))
+        details.append("")
+        for report in reports:
+            released = getattr(report, "github_release_version", "") or _("no release yet")
+            details.append(_("%s %s: GitHub has %s. Your branch: %s. Default branch on GitHub: %s.") % (publisher.public_name(report), report.version, released, getattr(report, "current_branch", "") or _("unknown"), getattr(report, "default_branch", "") or _("set after the first push")))
+        withoutNotes = publisher.reports_without_release_notes(reports)
+        if withoutNotes:
+            details += ["", _("No release notes found for: %s") % ", ".join(_("%s %s") % (publisher.public_name(report), report.version) for report in withoutNotes),
+                        _("Their GitHub Release would say only that it is a release package. To add notes, choose No, add a section named after the version to CHANGELOG.md, and publish again.")]
+        if skipped: details += [""] + skipped
+        details += ["", _("A GitHub Release is created only after its commit is on the repository's default branch.")]
+        message = engine.readable_message(summary, details, _("Yes publishes. No changes nothing."))
+        self._showConfirmation(_("Publish add-ons to GitHub"), message, lambda: self._startGitHubPush(reports), onNo=lambda: self._showGitHubResult(_("GitHub publishing was canceled. Nothing was changed.")))
+    def _startVersionIncrement(self, increments, ready):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Incrementing %d add-on versions") % len(increments)); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._incrementVersions, args=(increments, ready), name="addonDeveloperVersionIncrement", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start version increments"); ui.message(_("The add-on versions could not be incremented"))
+    def _incrementVersions(self, increments, ready):
+        changed = []; failed = []
+        try:
+            for report, version in increments:
+                name = publisher.public_name(report)
+                self._githubProgress(_("Incrementing %s from %s to %s") % (name, report.version, version))
+                try:
+                    publisher.increment_project_version(Path(report.manifest), Path(report.root), report.version, version); changed.append(_("%s %s") % (name, version))
+                except Exception as error:
+                    log.exception("Could not increment the version of %s", report.manifest); failed.append(_("%s: %s") % (name, error))
+        finally:
+            self._scanLock.release(); self._finishProgressThen(self._finishVersionIncrement, changed, failed, ready)
+    def _finishVersionIncrement(self, changed, failed, ready):
+        message = _("Versions incremented: %s.") % "; ".join(changed) if changed else _("No add-on versions were changed.")
+        if failed: message += _(" Versions not changed: %s.") % "; ".join(failed)
+        if not changed:
+            self._showInformation(_("Version increment failed"), message); return
+        # Keep this short: the progress window opens immediately afterward.
+        spoken = _("Versions increased: %s. Checking again before publishing.") % "; ".join(changed)
+        if failed: spoken += " " + ngettext("%d version could not be changed.", "%d versions could not be changed.", len(failed)) % len(failed)
+        ui.message(spoken); self._beginGitHubPreflight(ready)
     def _rememberExistingReleases(self, reports):
-        current = [report for report in reports if getattr(report, "repository_owned_by_user", True) and not publisher.release_needed(getattr(report, "version", ""), getattr(report, "github_release_version", "")) and getattr(report, "github_release_download_url", "") and getattr(report, "remote", "")]
+        current = publisher.reports_with_current_releases(reports)
         if not current: return
         state = engine.read_json(self._statePath, {}); metadata = state.get("submissionMetadata", {}) if isinstance(state.get("submissionMetadata"), dict) else {}
         for report in current:
@@ -1482,69 +1186,88 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         state["submissionMetadata"] = metadata; engine.atomic_json_write(self._statePath, state)
     def _startGitHubPush(self, reports):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        ui.message(_("Publishing confirmed add-on projects to GitHub")); self._startProgress(keepFocus=True)
+        ui.message(_("Publishing confirmed add-on projects to GitHub")); self._scanCancel.clear(); self._scanActive.set(); self._startProgress(keepFocus=True)
         try: threading.Thread(target=self._githubPush, args=(reports,), name="addonDeveloperGitHubPush", daemon=True).start()
         except Exception:
-            self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub publishing"); ui.message(_("GitHub publishing could not be started"))
+            self._scanActive.clear(); self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub publishing"); ui.message(_("GitHub publishing could not be started"))
     def _githubPush(self, reports):
         callback = None; arguments = ()
         try:
-            publisher.validate_publish_builds(reports, self._githubProgress)
-            published = publisher.push(reports, self._githubProgress); callback, arguments = self._offerGitHubRelease, (published,)
+            publisher.validate_publish_builds(reports, self._githubProgress, self._githubCancelled)
+            published = publisher.push(reports, self._githubProgress, self._githubCancelled); callback, arguments = self._offerGitHubRelease, (published,)
+        except publisher.OperationCancelled as cancellation:
+            names = "; ".join(publisher.public_name(item) for item in cancellation.completed)
+            message = _("GitHub publishing was cancelled after pushing: %s. The remaining add-ons were not changed. Run publishing again to create releases for the pushed add-ons.") % names if names else _("GitHub publishing was cancelled before any repository was changed.")
+            callback, arguments = self._showGitHubResult, (message, _("GitHub publishing cancelled"))
         except Exception as error:
-            log.exception("GitHub publishing failed"); callback, arguments = self._showGitHubResult, (_("GitHub publishing failed: %s. Press OK to exit.") % error, _("GitHub publishing failed"))
+            log.exception("GitHub publishing failed"); callback, arguments = self._showGitHubResult, (_("GitHub publishing failed: %s.") % error, _("GitHub publishing failed"))
         finally:
-            self._scanLock.release()
+            self._scanActive.clear(); self._scanLock.release()
             if callback is not None: self._finishProgressThen(callback, *arguments)
     def _offerGitHubRelease(self, published, allowDefaultPromotion=True, announcePush=True):
-        names = "; ".join(publisher.public_name(item) for item in published)
-        if announcePush: ui.message(_("GitHub push completed for: %s") % names)
+        # The push result travels into the next window instead of being spoken
+        # separately, where the window opening would cut it off.
+        pushed = [_("Pushed to GitHub: %s") % ", ".join(publisher.public_name(item) for item in published)] if announcePush else []
         blocked = [item for item in published if item.get("releaseBlocker")]
-        if blocked:
-            ui.message(_("GitHub release deferred for: %s") % "; ".join(_("%s: %s") % (publisher.public_name(item), item["releaseBlocker"]) for item in blocked))
+        waiting = [_("%s: %s") % (publisher.public_name(item), item["releaseBlocker"]) for item in blocked]
         promotable = [item for item in blocked if item.get("defaultBranchCanFastForward") and publisher.release_publish_action(item)]
         if allowDefaultPromotion and promotable:
-            details = self._limitedDetails(promotable, lambda item: _("%s: %s to %s") % (publisher.public_name(item), item.get("currentBranch") or _("unknown branch"), item.get("defaultBranch") or _("unknown default branch")))
-            message = _("The following release commits are on development branches, but their repository default branches have no competing commits and can be updated safely: %s. Select Yes to push each exact commit to its named default branch, verify it again, and continue to release confirmation. Select No to leave only the development branches pushed.") % details
+            summary = ngettext("Move %d release commit onto its default branch?", "Move %d release commits onto their default branches?", len(promotable)) % len(promotable)
+            details = pushed + [_("Why: a GitHub Release must come from the repository's default branch, and these commits are only on your working branch.")]
+            details += [_("%s: copy branch %s onto %s") % (publisher.public_name(item), item.get("currentBranch") or _("unknown branch"), item.get("defaultBranch") or _("unknown default branch")) for item in promotable]
+            details += [_("This is safe: the default branch has no commits that would be lost, and your own checkout is not changed.")]
+            message = engine.readable_message(summary, details, _("Yes updates the default branches, then asks about releases. No leaves only your working branches pushed."))
             self._showConfirmation(_("Update repository default branches"), message, lambda: self._startGitHubDefaultPromotion(published, promotable), onNo=lambda: self._offerGitHubRelease(published, False, False)); return
         differing = [item for item in published if not item.get("releaseBlocker") and publisher.release_publish_action(item)]
         if not differing:
             if blocked:
-                self._offerGitHubPullRequests(blocked); return
-            message = _("The newest local releases are already current on GitHub. Press OK to exit.")
-            ui.message(message); self._showInformation(_("GitHub releases are current"), message); return
-        comparisons = "; ".join(_("%s: GitHub %s, local %s, action %s") % (publisher.public_name(item), item.get("github_release_version") or _("no release"), item.get("version") or _("unknown"), _("repair matching release asset") if publisher.release_publish_action(item) == "repair" else _("create release")) for item in differing)
-        blockedText = _(" Releases deferred until their commits reach the default branch: %s.") % "; ".join(publisher.public_name(item) for item in blocked) if blocked else ""
-        onNo = (lambda: self._offerGitHubPullRequests(blocked, _("No eligible GitHub Releases were created. "))) if blocked else (lambda: self._showGitHubResult(_("Source changes were pushed, but no new GitHub Release was created. Press OK to exit.")))
-        self._showConfirmation(_("Release new add-on versions"), _("The following local versions differ from the newest GitHub Releases: %s.%s Release the eligible local versions now? Select No to leave only the source repositories pushed.") % (comparisons, blockedText), lambda: self._startGitHubRelease(differing, blocked), onNo=onNo)
+                self._offerGitHubPullRequests(blocked, pushed); return
+            message = engine.readable_message(_("Push complete. GitHub already has the newest release of each add-on."), pushed)
+            self._showInformation(_("GitHub releases are current"), message); return
+        summary = ngettext("Create %d GitHub Release now?", "Create %d GitHub Releases now?", len(differing)) % len(differing)
+        details = list(pushed)
+        for item in differing:
+            action = _("replace the missing or damaged package in its existing release") if publisher.release_publish_action(item) == "repair" else _("new release")
+            details.append(_("%s %s: %s. GitHub currently has %s.") % (publisher.public_name(item), item.get("version") or _("unknown version"), action, item.get("github_release_version") or _("no release")))
+        if blocked: details += ["", _("Waiting for the default branch, so no release yet:")] + waiting
+        message = engine.readable_message(summary, details, _("Yes creates the releases. No leaves your code pushed without new releases."))
+        onNo = (lambda: self._offerGitHubPullRequests(blocked, [_("No new GitHub Releases were created.")])) if blocked else (lambda: self._showGitHubResult(_("Your code was pushed, but no new GitHub Release was created.")))
+        self._showConfirmation(_("Release new add-on versions"), message, lambda: self._startGitHubRelease(differing, blocked), onNo=onNo)
     def _startGitHubDefaultPromotion(self, published, promotable):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        ui.message(_("Updating confirmed repository default branches")); self._startProgress(keepFocus=True)
+        ui.message(_("Updating confirmed repository default branches")); self._scanCancel.clear(); self._scanActive.set(); self._startProgress(keepFocus=True)
         try: threading.Thread(target=self._githubDefaultPromotion, args=(published, promotable), name="addonDeveloperGitHubDefaultPromotion", daemon=True).start()
         except Exception:
-            self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub default-branch update"); ui.message(_("The repository default-branch update could not be started"))
+            self._scanActive.clear(); self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub default-branch update"); ui.message(_("The repository default-branch update could not be started"))
     def _githubDefaultPromotion(self, published, promotable):
         callback = None; arguments = ()
         try:
-            updated = publisher.promote_default_branches(promotable, self._githubProgress)
+            updated = publisher.promote_default_branches(promotable, self._githubProgress, self._githubCancelled)
             byProject = {item["project_id"]: item for item in updated}
             published = [byProject.get(item["project_id"], item) for item in published]
             callback, arguments = self._offerGitHubRelease, (published, False, False)
+        except publisher.OperationCancelled as cancellation:
+            names = "; ".join(publisher.public_name(item) for item in cancellation.completed)
+            message = _("Default-branch updates were cancelled after checking: %s. No release was created.") % names if names else _("Default-branch updates were cancelled before any default branch changed. No release was created.")
+            callback, arguments = self._showGitHubResult, (message, _("GitHub publishing cancelled"))
         except Exception as error:
-            log.exception("GitHub default-branch update failed"); callback, arguments = self._showGitHubResult, (_("GitHub default-branch update failed: %s. No release was created. Press OK to exit.") % error, _("GitHub publishing failed"))
+            log.exception("GitHub default-branch update failed"); callback, arguments = self._showGitHubResult, (_("GitHub default-branch update failed: %s. No release was created.") % error, _("GitHub publishing failed"))
         finally:
-            self._scanLock.release()
+            self._scanActive.clear(); self._scanLock.release()
             if callback is not None: self._finishProgressThen(callback, *arguments)
-    def _offerGitHubPullRequests(self, blocked, prefix=""):
-        details = self._limitedDetails(blocked, lambda item: _("%s: %s") % (publisher.public_name(item), item["releaseBlocker"]))
+    def _offerGitHubPullRequests(self, blocked, context=()):
+        context = [context] if isinstance(context, str) else list(context)
+        waiting = [_("%s: %s") % (publisher.public_name(item), item["releaseBlocker"]) for item in blocked]
         available = [(item, publisher.pull_request_url(item)) for item in blocked]
         available = [(item, url) for item, url in available if url]
         if not available:
-            message = prefix + _("Source changes were pushed, but no release was created for the blocked add-ons. Release blockers: %s. Press OK to exit.") % details
-            ui.message(message); self._showInformation(_("GitHub release deferred"), message); return
-        repositories = "; ".join(publisher.public_name(item) for item, _url in available)
-        message = prefix + _("Source changes were pushed, but no release was created for the blocked add-ons. Release blockers: %s. Open GitHub comparison pages for %s so you can create and merge pull requests into the named default branches?") % (details, repositories)
-        self._showConfirmation(_("Open pull requests for deferred releases"), message, lambda: self._openGitHubPullRequestPages(available), onNo=lambda: self._showGitHubResult(_("The development branches remain pushed. No release or pull request was created. Press OK to exit.")))
+            message = engine.readable_message(_("Your code was pushed, but some releases have to wait."), context + ["", _("Why each release is waiting:")] + waiting)
+            self._showInformation(_("GitHub release deferred"), message); return
+        summary = ngettext("Open %d GitHub page to merge a pull request?", "Open %d GitHub pages to merge pull requests?", len(available)) % len(available)
+        details = context + ["", _("Your code was pushed, but these releases must wait until the code is merged into the default branch:")] + waiting
+        details += ["", _("Each page lets you create a pull request. After merging it, run publishing again to create the release.")]
+        message = engine.readable_message(summary, details, _("Yes opens the pages in your browser. No leaves your working branches pushed."))
+        self._showConfirmation(_("Open pull requests for deferred releases"), message, lambda: self._openGitHubPullRequestPages(available), onNo=lambda: self._showGitHubResult(_("Your working branches remain pushed. No release or pull request was created.")))
     def _openGitHubPullRequestPages(self, repositories):
         names = "; ".join(publisher.public_name(item) for item, _url in repositories)
         def launch():
@@ -1560,32 +1283,38 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             log.exception("Could not start GitHub pull-request page launcher"); ui.message(_("The GitHub pull-request pages could not be opened"))
     def _startGitHubRelease(self, published, blocked=None):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        ui.message(_("Packaging and publishing GitHub Releases")); self._startProgress(keepFocus=True)
+        ui.message(_("Packaging and publishing GitHub Releases")); self._scanCancel.clear(); self._scanActive.set(); self._startProgress(keepFocus=True)
         try: threading.Thread(target=self._githubRelease, args=(published, blocked or []), name="addonDeveloperGitHubRelease", daemon=True).start()
         except Exception:
-            self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub release publishing"); ui.message(_("GitHub release publishing could not be started"))
+            self._scanActive.clear(); self._stopProgress(); self._scanLock.release(); log.exception("Could not start GitHub release publishing"); ui.message(_("GitHub release publishing could not be started"))
     def _githubRelease(self, published, blocked):
         callback = None; arguments = ()
         try:
             output = Path.home() / "Documents" / "NVDA Add-on Development" / "Packages"
             state = engine.read_json(self._statePath, {}); channels = state.get("submissionChannels", {}) if isinstance(state.get("submissionChannels"), dict) else {}
-            for item in published: item["channel"] = channels.get(item["project_id"], "stable")
+            publisher.resolve_release_channels(published, channels)
             metadata = state.get("submissionMetadata", {}) if isinstance(state.get("submissionMetadata"), dict) else {}
             def checkpoint(item):
                 metadata[item["project_id"]] = item
                 state["submissionMetadata"] = metadata
                 engine.atomic_json_write(self._statePath, state)
-            released = publisher.release(published, output, self._githubProgress, checkpoint)
+            released = publisher.release(published, output, self._githubProgress, checkpoint, self._githubCancelled)
             names = "; ".join(publisher.public_name(item) for item in released)
             if blocked:
                 callback, arguments = self._offerGitHubPullRequests, (blocked, _("GitHub Releases were published and store submission details saved for: %s. ") % names)
             else:
-                callback, arguments = self._showGitHubResult, (_("GitHub Releases published and store submission details saved for: %s. Press OK to exit.") % names, _("GitHub publishing complete"))
+                callback, arguments = self._showGitHubResult, (_("GitHub Releases published and store submission details saved for: %s.") % names, _("GitHub publishing complete"))
+        except publisher.OperationCancelled as cancellation:
+            names = "; ".join(publisher.public_name(item) for item in cancellation.completed)
+            message = _("GitHub release publishing was cancelled. Released and saved for store submission: %s. The remaining releases were not created; run publishing again to create them.") % names if names else _("GitHub release publishing was cancelled before any release was created. Run publishing again to create them.")
+            callback, arguments = self._showGitHubResult, (message, _("GitHub publishing cancelled"))
         except Exception as error:
-            log.exception("GitHub release publishing failed"); callback, arguments = self._showGitHubResult, (_("GitHub release publishing failed: %s. Press OK to exit.") % error, _("GitHub publishing failed"))
+            log.exception("GitHub release publishing failed"); callback, arguments = self._showGitHubResult, (_("GitHub release publishing failed: %s.") % error, _("GitHub publishing failed"))
         finally:
-            self._scanLock.release()
+            self._scanActive.clear(); self._scanLock.release()
             if callback is not None: self._finishProgressThen(callback, *arguments)
+    def _githubCancelled(self):
+        return self._scanCancel.is_set() or self._shutdown.is_set()
     def _githubProgress(self, message):
         if not self._shutdown.is_set(): wx.CallAfter(self._updateProgressMessage, message)
     def _startSubmissionLauncher(self, results, urls):
@@ -1603,15 +1332,23 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         except OSError:
             log.exception("Could not open add-on submission resources")
             if not self._shutdown.is_set(): wx.CallAfter(ui.message, _("One or more add-on folders or the submission form could not be opened"))
-    def _finishManualCheck(self, results, awaiting, release, sameCompatibilityFamily, discoveryTruncated=False):
-        message = self._completionMessage(results)
-        if sameCompatibilityFamily:
-            message = _("NVDA %s was found, but it uses the same add-on compatibility target %s, so no manifest change is required solely for this build. ") % (release.tag, release.manifest_version) + message
-        if release.source == "cached":
-            message = _("The live NVDA release services were unavailable, so this scan used the last known release information. ") + message
-        if discoveryTruncated: message += _(" Discovery stopped at its directory or time safety limit. Add narrower development folders in settings if a project was missed.")
-        ui.message(message)
-        if awaiting: self._showProjectApprovalDialog(awaiting, release)
+    @staticmethod
+    def _discoveryLimitText(completeDepth):
+        """Explain how far a breadth-first discovery searched before its safety limit."""
+        if isinstance(completeDepth, int) and completeDepth >= 0:
+            return _("The folder search reached its limit after fully searching %d folder levels below each development folder. Projects deeper than that may have been missed; add their folders in settings.") % completeDepth
+        return _("The folder search reached its time or folder limit. If a project was missed, add its folder in settings.")
+    def _finishManualCheck(self, results, awaiting, release, sameCompatibilityFamily, discoveryTruncated=False, completeDepth=None):
+        # The outcome comes first; notes about how the scan ran follow it.
+        notes = []
+        if sameCompatibilityFamily: notes.append(_("NVDA %s uses the same compatibility target as before, %s, so this build alone needs no manifest change.") % (release.tag, release.manifest_version))
+        if release.source == "cached": notes.append(_("NVDA's release website could not be reached, so the last known release information was used."))
+        if discoveryTruncated: notes.append(self._discoveryLimitText(completeDepth))
+        message = engine.readable_text(self._completionMessage(results)) + ("\n\n" + "\n".join(notes) if notes else "")
+        if awaiting:
+            # The approval window opens next, so only the first line is spoken.
+            ui.message(engine.first_line(message)); self._showProjectApprovalDialog(awaiting, release)
+        else: self._showInformation(_("Scan results"), message)
     @staticmethod
     def _checkErrorText(error):
         detail = " ".join(str(error).split())[:300] or error.__class__.__name__
@@ -1629,14 +1366,14 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         outputPath = self._statePath.with_name(f"addonDeveloperUpdaterResult-{uuid.uuid4().hex}.json")
         try:
             settings = config.conf["addonDeveloperUpdater"]; state = engine.read_json(self._statePath, {})
-            mode = self._workerMode(manual, state, settings["periodicRescanHours"])
+            mode = engine.worker_mode(manual, state, settings["periodicRescanHours"])
             if manual or mode == "periodic":
                 self._startProgress(); progressStarted = True; progressEvent = self._progressStop; wx.CallAfter(self._setProgressMessage, _("Checking official NVDA release information"))
             release = selectedRelease or engine.latest_release(bool(settings["includePrereleases"]), self._releaseCachePath)
             if progressStarted: wx.CallAfter(self._setProgressMessage, _("Discovering add-on development projects in the isolated worker"))
             storedPaths = [str(path) for path in engine.approved_manifest_paths(state)]
             checkedAt = engine.utc_now(); previousAutomaticError = str(state.get("lastAutomaticError", "")); previousReleaseSource = str(state.get("releaseSource", ""))
-            if not manual and state.get("releaseTag") == release.tag and not self._rescanDue(state, settings["periodicRescanHours"]):
+            if not manual and state.get("releaseTag") == release.tag and not engine.rescan_due(state, settings["periodicRescanHours"]):
                 state.update({"lastCheckAt": checkedAt, "lastSuccessfulCheckAt": checkedAt, "lastCheckError": "", "lastAutomaticError": "", "automaticFailureCount": 0, "releaseSource": release.source, "releaseCheckedAt": release.checked_at, "releaseBuildVersion": release.build_version, "prerelease": release.prerelease, "releaseUrl": release.url})
                 engine.atomic_json_write(self._statePath, state)
                 if previousAutomaticError: wx.CallAfter(ui.message, _("Automatic NVDA add-on update checks are working again"))
@@ -1660,7 +1397,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 if not detail: detail = f"External worker stopped before returning details (Windows status 0x{returnCode & 0xFFFFFFFF:08X})"
                 raise RuntimeError(detail)
             manifests = [Path(path) for path in workerResult.get("manifests", []) if isinstance(path, str)]
-            discoveryTruncated = bool(workerResult.get("truncated")); previousDiscoveryTruncated = bool(state.get("lastDiscoveryTruncated"))
+            discoveryTruncated = bool(workerResult.get("truncated")); completeDepth = workerResult.get("completeDepth") if isinstance(workerResult.get("completeDepth"), int) else None; previousDiscoveryTruncated = bool(state.get("lastDiscoveryTruncated"))
             if progressStarted: wx.CallAfter(self._setProgressMessage, _("Checking %d discovered add-on manifests") % len(manifests))
             approved = engine.approved_project_ids(state)
             if "approvedProjects" not in state:
@@ -1675,7 +1412,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 identifier = engine.project_id(path)
                 try:
                     if identifier not in approved:
-                        metadata = engine.values(path); results.append(engine.ProjectResult(identifier, metadata.get("name", path.parent.name), str(path), "awaiting manual approval")); continue
+                        # Git details are gathered here, on the worker thread, so the tracking window can tell copies apart.
+                        metadata = engine.values(path); results.append(engine.add_copy_details(engine.ProjectResult(identifier, metadata.get("name", path.parent.name), str(path), "awaiting manual approval"), path)); continue
                     results.append(self._addProjectContext(engine.update(path, release, self._backupRoot, False, cancelled), path))
                 except Exception as error:
                     log.exception("Could not process add-on manifest %s", path)
@@ -1693,19 +1431,22 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             state.update({"releaseTag": release.tag, "releaseBuildVersion": release.build_version, "manifestVersion": release.manifest_version, "prerelease": release.prerelease, "releaseUrl": release.url, "releaseSource": release.source, "releaseCheckedAt": release.checked_at, "lastCheckAt": checkedAt, "lastSuccessfulCheckAt": checkedAt, "lastScanAt": checkedAt, "lastCheckError": "", "lastAutomaticError": "", "automaticFailureCount": 0, "approvedProjects": sorted(approved), "ignoredProjects": sorted(ignored), "projects": projects, "notifiedUpdates": currentUpdates, "notifiedAwaiting": currentAwaiting, "notifiedFailures": currentFailures})
             if manual and selectedRelease is not None:
                 state["manualReleaseTargetTag"] = release.tag; engine.save_manual_review(state, release, visibleResults)
-            if mode != "background": state.update({"lastDiscoveryAt": checkedAt, "lastDiscoveryDirectories": int(workerResult.get("directoriesVisited", 0)), "lastDiscoverySeconds": workerResult.get("elapsedSeconds", 0), "lastDiscoveryTruncated": discoveryTruncated})
+            if mode != "background": state.update({"lastDiscoveryAt": checkedAt, "lastDiscoveryDirectories": int(workerResult.get("directoriesVisited", 0)), "lastDiscoverySeconds": workerResult.get("elapsedSeconds", 0), "lastDiscoveryTruncated": discoveryTruncated, "lastDiscoveryCompleteDepth": completeDepth})
             engine.atomic_json_write(self._statePath, state)
             for result in results:
                 if result.status != "current": log.info("Add-on Developer Updater: %s: %s", result.path, result.status)
             awaiting = [result for result in visibleResults if "awaiting" in result.status]
-            if manual: finishCallback = (self._finishManualCheck, visibleResults, awaiting, release, sameCompatibilityFamily, discoveryTruncated)
+            if manual: finishCallback = (self._finishManualCheck, visibleResults, awaiting, release, sameCompatibilityFamily, discoveryTruncated, completeDepth)
             else:
-                if newlyActionable: wx.CallAfter(ui.message, self._completionMessage(newlyActionable))
+                if newlyActionable:
+                    # A short tone makes a background result noticeable even when its speech is missed.
+                    if settings["notificationSound"]: wx.CallAfter(tones.beep, 880, 80)
+                    wx.CallAfter(ui.message, self._completionMessage(newlyActionable))
                 if resolvedFailures: wx.CallAfter(ui.message, _("Add-on validation is working again for: %s") % "; ".join(resolvedFailures))
                 if previousAutomaticError: wx.CallAfter(ui.message, _("Automatic NVDA add-on update checks are working again"))
                 if release.source == "cached" and previousReleaseSource != "cached": wx.CallAfter(ui.message, _("Live NVDA release services are unavailable. Automatic checks are using the last known release information."))
                 elif release.source != "cached" and previousReleaseSource == "cached": wx.CallAfter(ui.message, _("Live NVDA release information is available again"))
-                if discoveryTruncated and not previousDiscoveryTruncated: wx.CallAfter(ui.message, _("Periodic add-on discovery stopped at its safety limit. Add narrower development folders in settings if a project was missed."))
+                if discoveryTruncated and not previousDiscoveryTruncated: wx.CallAfter(ui.message, self._discoveryLimitText(completeDepth))
         except Exception as error:
             message = self._checkErrorText(error); state = engine.read_json(self._statePath, {}); previousError = str(state.get("lastAutomaticError", "")); state["lastCheckAt"] = engine.utc_now(); state["lastCheckError"] = message
             if not manual:

@@ -2,6 +2,10 @@
 
 Automated checks catch packaging and logic regressions. Complete this manual checklist in both NVDA 2025.3.3 and the current stable NVDA release before publishing.
 
+## Versioning
+
+- Check the NVDA releases page. When a newer NVDA family has become stable, update `CURRENT_RELEASE_FAMILY` in `test_engine.py`, start this add-on's version at `year.release.0`, and test and raise `lastTestedNVDAVersion`.
+
 ## Installation and startup
 
 - Install the newly built package manually and restart NVDA.
@@ -13,6 +17,8 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 ## Scan and manifest workflow
 
 - Run `NVDA+Alt+Shift+U`; verify progress feedback, completion details, and continued NVDA responsiveness.
+- Confirm the Choose add-ons to track window explains in plain words what tracking means and which add-ons to leave unchecked, and that its confirmation and results use the same wording.
+- With several copies of one add-on, confirm the tracking window groups them newest first and each line states the public name, version, newest or older, already-tracked copies, GitHub or local-only state, branch, last change, and folder.
 - Confirm newly found projects remain unapproved, nothing is selected initially, and only confirmed maintained copies become available to later workflows.
 - Test the assignable approval and update-check status commands, including a project left awaiting approval.
 - Verify repeated unchanged updates and failures are announced once, backoff increases after failures, and recovery is announced.
@@ -24,7 +30,9 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 - Run the compatibility-target command against multiple disposable manifests and verify that only shared official versions above every minimum are offered, and that experimental versions require beta or development channels for every selection.
 - Confirm branch, path, minimum, current target, and uncommitted-manifest status are announced accurately.
 - Test confirmation, automatic rollback after simulated validation failure, successful undo, missing backup, and refusal to overwrite a later manifest edit.
-- Start a scan and invoke the assigned cancel command. Repeat during disposable compatibility update, downgrade, and undo batches. During a GitHub operation, confirm the command says no cancellable operation is running.
+- Start a scan and invoke the assigned cancel command. Repeat during disposable compatibility update, downgrade, and undo batches. During a multi-project GitHub publish and release, invoke cancel; confirm the current push or upload finishes, remaining projects are skipped, and the result lists exactly what was completed.
+- Scan a workspace larger than 20,000 folders; confirm the completion message states how many levels were searched completely and that shallow projects are found.
+- Apply compatibility updates and confirm the results window begins with "Compatibility update complete". Trigger two results in a row and confirm the earlier result remains below the newest.
 - Simulate a blocked external scan and confirm it is stopped at the 90-second safety limit; remove an approved disposable manifest and confirm the next background project check reports the unavailable path.
 
 ## GitHub workflow
@@ -33,11 +41,18 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 - Test a repository with only a local `file://` remote and one with a local origin plus an owned GitHub fork; confirm the correct GitHub repository is found or created.
 - Stage a source-only change and confirm it is counted. Force-stage an `outputs` package and confirm publishing stops before any commit or remote change.
 - Change a source file after the confirmation review and simulate a builder that changes source; confirm both operations stop before push.
+- Publish a released version with new local changes; confirm the increment offer names old and new versions, updates the manifest, buildVars.py, and readme, rechecks before pushing, and that No skips only those add-ons.
+- Publish a project whose minimumNVDAVersion is 2025.3 with a Python 3.12-only f-string; confirm publishing stops before pushing and names the file and line. Confirm the notes warning appears when CHANGELOG.md has no section for the new version.
+- Confirm a new release uses the matching CHANGELOG.md section as its notes, and a builder without a Version parameter still produces a verified package.
+- Open a Store form for GPL, MIT, and unlicensed projects; confirm publisher and license fields, the blank-license warning, and the settings overrides.
 - Verify an unknown upstream/default-branch comparison blocks Store readiness, and verify unsafe or ambiguous package paths are rejected.
 
 - Test signed-in, signed-out, offline, inaccessible-repository, and disabled-Issues cases. Confirm every signed-out GitHub entry point, including store readiness, offers device sign-in and retries the original operation.
 - Test without GitHub CLI installed; confirm every GitHub entry point offers the official installation page, makes no installation changes itself, and explains how to continue afterward.
 - Verify each selection and confirmation dialog retains focus and every editable field has a meaningful spoken name.
+- In every question and result window, confirm NVDA speaks the title and the first line only once, the first line states the question or outcome, Up and Down Arrow and braille move one fact per line, Tab reaches the buttons, Escape answers No or closes, and Enter in the message chooses the highlighted button.
+- With progress-bar beeps and spoken percentages enabled in NVDA, confirm a GitHub operation produces no percentage until real step counts appear.
+- Enable automatic checks and confirm the optional tone plays before a new background announcement and stays silent when turned off.
 - Verify Copy download link copies the direct `.nvda-addon` asset URL and Copy repository link copies the selected repository's GitHub page.
 - Open Issues and edit, validate, save, and delete a disposable Markdown and YAML template.
 - Confirm no push or release occurs before its explicit confirmation.
