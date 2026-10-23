@@ -19,6 +19,9 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 - Run `NVDA+Alt+Shift+U`; verify progress feedback, completion details, and continued NVDA responsiveness.
 - Confirm the Choose add-ons to track window explains in plain words what tracking means and which add-ons to leave unchecked, and that its confirmation and results use the same wording.
 - With several copies of one add-on, confirm the tracking window groups them newest first and each line states the public name, version, newest or older, already-tracked copies, GitHub or local-only state, branch, last change, and folder.
+- Open Manage tracked add-ons with NVDA+Alt+Shift+A; confirm each line starts with Tracked, Not tracked, or Hidden, that T, N, and H change the selected copy and are announced, that Git details are accurate for tracked copies, and that saving tracks, stops tracking, and hides as confirmed. Rescan and confirm hidden copies are not offered and a stopped copy's pending update is gone.
+- In the tracking window after a scan, check Hide the unchecked add-ons and confirm those copies are not offered on the next scan.
+- Open the update review window; confirm add-on names, versions, older-copy marks, the dated Add-on Store channel note, and the test-build reminder.
 - Confirm newly found projects remain unapproved, nothing is selected initially, and only confirmed maintained copies become available to later workflows.
 - Test the assignable approval and update-check status commands, including a project left awaiting approval.
 - Verify repeated unchanged updates and failures are announced once, backoff increases after failures, and recovery is announced.

@@ -9,7 +9,7 @@ from gui.settingsDialogs import SettingsPanel
 from logHandler import log
 from . import engine, publisher
 from .dialogs import (
-    _projectDisplayName, UpdateReviewDialog, ProjectApprovalDialog, GitHubPublishDialog, StoreSubmissionDialog, GitHubRepositoryUrlDialog, GitHubSingleSelectionDialog, IssueTemplateEditorDialog, CompatibilityTargetDialog, ScanTargetDialog, ConfirmationDialog, InformationDialog, OperationProgressDialog,
+    _projectDisplayName, UpdateReviewDialog, ProjectApprovalDialog, GitHubPublishDialog, StoreSubmissionDialog, GitHubRepositoryUrlDialog, GitHubSingleSelectionDialog, IssueTemplateEditorDialog, CompatibilityTargetDialog, ScanTargetDialog, ConfirmationDialog, InformationDialog, OperationProgressDialog, ManageTrackingDialog,
 )
 
 addonHandler.initTranslation()
@@ -55,7 +55,7 @@ class UpdaterSettingsPanel(SettingsPanel):
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     activeInstance = None
     def __init__(self):
-        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._manifestThread = None; self._progressDialog = None; self._progressValue = 0; self._progressDeterminate = False; self._scanTargetDialog = None; self._reviewDialog = None; self._approvalDialog = None; self._publishDialog = None; self._storeDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._githubSelectionAction = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None
+        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._manifestThread = None; self._progressDialog = None; self._progressValue = 0; self._progressDeterminate = False; self._scanTargetDialog = None; self._reviewDialog = None; self._approvalDialog = None; self._publishDialog = None; self._storeDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._githubSelectionAction = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None; self._manageDialog = None
         config_path = Path(globalVars.appArgs.configPath); self._statePath = config_path / "addonDeveloperUpdaterState.json"; self._releaseCachePath = config_path / "addonDeveloperUpdaterReleaseCache.json"; self._apiVersionCachePath = config_path / "addonDeveloperUpdaterApiVersions.json"; self._backupRoot = config_path / "addonDeveloperUpdaterBackups"
         if config.conf["addonDeveloperUpdater"]["intervalMinutes"] < 15: config.conf["addonDeveloperUpdater"]["intervalMinutes"] = 15
         if UpdaterSettingsPanel not in gui.settingsDialogs.NVDASettingsDialog.categoryClasses: gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(UpdaterSettingsPanel)
@@ -151,6 +151,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._confirmDialog.Destroy(); self._confirmDialog = None
         if self._informationDialog is not None:
             self._informationDialog.Destroy(); self._informationDialog = None
+        if self._manageDialog is not None:
+            self._manageDialog.Destroy(); self._manageDialog = None
         if self._monitor is not None and self._monitor.is_alive() and threading.current_thread() is not self._monitor: self._monitor.join(timeout=2)
         try: gui.settingsDialogs.NVDASettingsDialog.categoryClasses.remove(UpdaterSettingsPanel)
         except ValueError: pass
@@ -173,7 +175,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         elif not state.get("lastSuccessfulCheckAt"): summary = _("No check has completed yet. Press NVDA+Alt+Shift+U to run one.")
         else: summary = _("No updates or problems found.")
         details = [
-            _("Tracked add-ons: %d") % approvedCount, _("Updates available: %d") % available, _("Found but not tracked yet: %d") % awaiting, _("Could not be checked: %d") % failed,
+            _("Tracked add-ons: %d") % approvedCount, _("Updates available: %d") % available, _("Found but not tracked yet: %d") % awaiting, _("Could not be checked: %d") % failed, _("Hidden by you: %d") % len(engine.hidden_project_ids(state)),
             _("NVDA build checked: %s") % build, _("Compatibility target: %s") % compatibility, _("Release information from: %s") % source,
             _("Last successful check: %s") % self._formatCheckTime(state.get("lastSuccessfulCheckAt")), _("Last project check: %s") % self._formatCheckTime(state.get("lastScanAt")), _("Last folder search: %s") % self._formatCheckTime(state.get("lastDiscoveryAt")),
         ]
@@ -188,6 +190,69 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _formatCheckTime(value):
         try: return datetime.fromisoformat(str(value)).astimezone().strftime("%B %d, %Y at %I:%M %p")
         except (TypeError, ValueError): return _("never")
+    @scriptHandler.script(description=_("Manage tracked add-ons: track, stop tracking, or hide each found copy"), gesture="kb:NVDA+alt+shift+a", category=SCRIPT_CATEGORY)
+    def script_manageTrackedAddons(self, gesture):
+        if self._manageDialog is not None: self._manageDialog.Raise(); self._manageDialog.copyList.SetFocus(); return
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Loading add-on copies and their GitHub details")); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._loadManageEntries, name="addonDeveloperManageTracking", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start loading tracked add-ons"); ui.message(_("Tracked add-ons could not be loaded"))
+    def _loadManageEntries(self):
+        """Gather fresh Git details for every copy on a worker thread, so each line is accurate."""
+        callback = None; arguments = ()
+        try:
+            state = engine.read_json(self._statePath, {}); records = engine.visible_project_records(state)[0]
+            results = [result for item in records if isinstance(item, dict) and (result := engine.project_result_from_record(item)) is not None]
+            for result in results:
+                path = Path(result.path)
+                if path.is_file(): engine.add_copy_details(result, path)
+            if not results:
+                callback, arguments = ui.message, (_("No add-ons have been found yet. Press NVDA+Alt+Shift+U to search for them."),)
+            else:
+                publicName = lambda result: (result.summary or result.name).casefold()
+                results.sort(key=lambda result: (publicName(result), tuple(-number for number in engine.addon_version_key(result.addon_version)[0]), result.path.casefold()))
+                states = {result.project_id: engine.tracking_state(state, result.project_id) for result in results}
+                versions = {}
+                for result in results: versions.setdefault(publicName(result), []).append(result.addon_version)
+                entries = []
+                for result in results:
+                    # Other tracked copies of the same add-on, so a line can say "you already track version ...".
+                    others = [other.addon_version for other in results if other is not result and publicName(other) == publicName(result) and states[other.project_id] == "tracked"]
+                    entries.append((result, states[result.project_id], engine.describe_copy(result, versions[publicName(result)], others, translate=_)))
+                release = engine.Release(str(state.get("releaseTag", "")), str(state.get("manifestVersion", "")), bool(state.get("prerelease")), str(state.get("releaseUrl", "")), str(state.get("releaseSource", "saved")), str(state.get("releaseCheckedAt", "")), str(state.get("releaseBuildVersion", "")))
+                callback, arguments = self._showManageDialog, (entries, release)
+        except Exception as error:
+            log.exception("Tracked add-ons could not be loaded"); callback, arguments = self._showInformation, (_("Tracked add-ons could not be loaded"), _("Tracked add-ons could not be loaded: %s") % error)
+        finally:
+            self._scanLock.release(); self._finishProgressThen(callback, *arguments) if callback is not None else self._stopProgress()
+    def _showManageDialog(self, entries, release):
+        if self._manageDialog is not None: self._manageDialog.Raise(); return
+        results = [result for result, _state, _description in entries]
+        dialog = ManageTrackingDialog(gui.mainFrame, entries); self._manageDialog = dialog
+        byId = {result.project_id: result for result in results}
+        def close(_event=None):
+            if self._manageDialog is dialog: self._manageDialog = None
+            dialog.Destroy()
+        def save(_event=None):
+            changes = dialog.changes()
+            if not changes: ui.message(_("No choices were changed")); return
+            names = {identifier: _("%s %s") % (byId[identifier].summary or byId[identifier].name, byId[identifier].addon_version) for identifier in changes}
+            track = [byId[identifier] for identifier, choice in changes.items() if choice == "tracked"]
+            if track and not release.tag:
+                self._showInformation(_("Run a check first"), _("Starting to track an add-on needs a completed check. Press NVDA+Alt+Shift+U, then try again.")); return
+            groups = ((_("Start tracking:"), "tracked"), (_("Stop tracking, and offer again after scans:"), "untracked"), (_("Hide, and do not offer again:"), "hidden"))
+            details = []
+            for heading, choice in groups:
+                chosen = [names[identifier] for identifier, value in changes.items() if value == choice]
+                if chosen: details += [heading] + chosen + [""]
+            details += [_("Add-ons you start tracking are checked first; one with a manifest problem stays not tracked. Nothing in any add-on's files changes.")]
+            message = engine.readable_message(ngettext("Save changes for %d add-on?", "Save changes for %d add-ons?", len(changes)) % len(changes), details, _("Yes saves. No returns to the list."))
+            others = {identifier: choice for identifier, choice in changes.items() if choice != "tracked"}
+            changedNames = [(names[identifier], choice) for identifier, choice in others.items()]
+            self._showConfirmation(_("Save tracking changes"), message, lambda: (close(), self._startApproveProjects(track, release, others, changedNames)))
+        dialog.onSave = save; dialog.saveButton.Bind(wx.EVT_BUTTON, save); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
+        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.copyList.SetFocus)
     @scriptHandler.script(description=_("Choose which found add-on projects to track"), category=SCRIPT_CATEGORY)
     def script_reviewDiscoveredAddonProjects(self, gesture):
         state = engine.read_json(self._statePath, {}); awaiting = []
@@ -900,57 +965,73 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if self._approvalDialog is dialog: self._approvalDialog = None
             dialog.Destroy()
         def approve(_event=None):
-            selected = dialog.selectedResults()
-            if not selected: ui.message(_("No add-ons are checked. Press Space on each add-on you develop.")); return
-            summary = ngettext("Track %d add-on?", "Track %d add-ons?", len(selected)) % len(selected)
-            details = [_("%s %s, in %s") % (item.summary or item.name, item.addon_version, item.path) for item in selected]
-            details += ["", _("Tracked add-ons are checked for new NVDA versions now and after each scan, and can be published to GitHub and submitted to the Add-on Store."), _("Nothing in their files changes until you confirm an update or publication separately.")]
-            message = engine.readable_message(summary, details, _("Yes starts tracking them. No returns to the list."))
-            self._showConfirmation(_("Track add-ons"), message, lambda: (close(), self._startApproveProjects(selected, release)))
+            selected = dialog.selectedResults(); hidden = dialog.uncheckedResults() if dialog.hideUnchecked.IsChecked() else []
+            if not selected and not hidden: ui.message(_("No add-ons are checked. Press Space on each add-on you develop.")); return
+            if selected and hidden: summary = _("Track %d and hide %d?") % (len(selected), len(hidden))
+            elif selected: summary = ngettext("Track %d add-on?", "Track %d add-ons?", len(selected)) % len(selected)
+            else: summary = ngettext("Hide %d add-on?", "Hide %d add-ons?", len(hidden)) % len(hidden)
+            details = []
+            if selected: details += [_("Track:")] + [_("%s %s, in %s") % (item.summary or item.name, item.addon_version, item.path) for item in selected] + [_("Tracked add-ons are checked for new NVDA versions now and after each scan, and can be published to GitHub and submitted to the Add-on Store."), ""]
+            if hidden: details += [_("Hide, so they are not offered again:")] + [_("%s %s, in %s") % (item.summary or item.name, item.addon_version, item.path) for item in hidden] + [""]
+            details += [_("Nothing in any add-on's files changes. You can change these choices later with Manage tracked add-ons, NVDA+Alt+Shift+A.")]
+            message = engine.readable_message(summary, details, _("Yes saves these choices. No returns to the list."))
+            changes = {item.project_id: "hidden" for item in hidden}; names = [(_("%s %s") % (item.summary or item.name, item.addon_version), "hidden") for item in hidden]
+            self._showConfirmation(_("Track add-ons"), message, lambda: (close(), self._startApproveProjects(selected, release, changes, names)))
         dialog.onUpdate = approve; dialog.updateButton.Bind(wx.EVT_BUTTON, approve); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close); dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.checkList.SetFocus)
-    def _startApproveProjects(self, selected, release):
+    def _startApproveProjects(self, selected, release, changes=None, changedNames=()):
+        """Track the selected copies, and in the same save stop tracking or hide others."""
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
-        ui.message(ngettext("Checking %d add-on before tracking it", "Checking %d add-ons before tracking them", len(selected)) % len(selected)); self._startProgress(keepFocus=True)
-        try: threading.Thread(target=self._approveProjects, args=(selected, release, self._progressStop), name="addonDeveloperProjectApproval", daemon=True).start()
+        ui.message(ngettext("Checking %d add-on before tracking it", "Checking %d add-ons before tracking them", len(selected)) % len(selected) if selected else _("Saving your choices")); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._approveProjects, args=(selected, release, self._progressStop, changes, changedNames), name="addonDeveloperProjectApproval", daemon=True).start()
         except Exception: self._stopProgress(); self._scanLock.release(); log.exception("Could not start project approval"); ui.message(_("Tracking could not be started"))
-    def _approveProjects(self, selected, release, progressEvent):
+    def _approveProjects(self, selected, release, progressEvent, changes=None, changedNames=()):
         results = []; operationError = ""
         try:
-            state = engine.read_json(self._statePath, {}); approved = engine.approved_project_ids(state)
-            available = engine.available_releases(release.prerelease or bool(config.conf["addonDeveloperUpdater"]["includePrereleases"]), self._releaseCachePath)
-            refreshed = engine.matching_release(release, available)
-            if refreshed is None: raise RuntimeError(f"the selected NVDA build {release.tag} is no longer an available scan target; run the scan again")
-            release = refreshed
+            state = engine.read_json(self._statePath, {})
+            # Copies about to be tracked are unhidden; the other changes stop tracking or hide copies.
+            engine.set_tracking(state, {**(changes or {}), **{item.project_id: "tracked" for item in selected}}); approved = engine.approved_project_ids(state)
+            if selected:
+                available = engine.available_releases(release.prerelease or bool(config.conf["addonDeveloperUpdater"]["includePrereleases"]), self._releaseCachePath)
+                refreshed = engine.matching_release(release, available)
+                if refreshed is None: raise RuntimeError(f"the selected NVDA build {release.tag} is no longer an available scan target; run the scan again")
+                release = refreshed
             for index, item in enumerate(selected, 1):
                 path = Path(item.path)
-                wx.CallAfter(self._setProgressStep, progressEvent, _("Validating project %d of %d: %s") % (index, len(selected), item.name), index, len(selected))
+                wx.CallAfter(self._setProgressStep, progressEvent, _("Checking add-on %d of %d: %s") % (index, len(selected), item.summary or item.name), index, len(selected))
                 try: result = self._addProjectContext(engine.update(path, release, self._backupRoot, False), path)
                 except Exception as error: result = engine.ProjectResult(item.project_id, item.name, item.path, f"validation failed: {error}")
                 if "failed" in result.status: result.status = "awaiting manual approval; " + result.status
                 else: approved.add(result.project_id)
                 results.append(result)
-            state["approvedProjects"] = sorted(approved); state["projects"] = engine.merge_project_records(state.get("projects", []), results); engine.save_manual_review(state, release, results, merge=True); engine.atomic_json_write(self._statePath, state)
+            state["approvedProjects"] = sorted(approved); state["projects"] = engine.merge_project_records(state.get("projects", []), results)
+            if selected: engine.save_manual_review(state, release, results, merge=True)
+            engine.atomic_json_write(self._statePath, state)
         except Exception as error:
             operationError = str(error); log.exception("Project approval failed")
         finally:
-            self._scanLock.release(); self._finishProgressThen(self._finishProjectApproval, results, release, operationError)
-    def _finishProjectApproval(self, results, release, operationError=""):
+            self._scanLock.release(); self._finishProgressThen(self._finishProjectApproval, results, release, operationError, changedNames)
+    def _finishProjectApproval(self, results, release, operationError="", changedNames=()):
         if operationError:
-            message = engine.readable_message(_("The add-ons could not be tracked."), [_("Reason: %s") % operationError, _("No add-on was added to the tracked list.")]); self._showInformation(_("Tracking failed"), message); return
+            message = engine.readable_message(_("Your choices could not be saved."), [_("Reason: %s") % operationError, _("Nothing was changed.")]); self._showInformation(_("Tracking failed"), message); return
         approved = [item for item in results if "awaiting" not in item.status]; failed = [item for item in results if item not in approved]; available = [item for item in approved if item.status.startswith("update available: ")]
-        summary = ngettext("Now tracking %d add-on.", "Now tracking %d add-ons.", len(approved)) % len(approved) if approved else _("No add-ons were tracked.")
+        stopped = [name for name, choice in changedNames if choice == "untracked"]; hidden = [name for name, choice in changedNames if choice == "hidden"]
+        if approved: summary = ngettext("Now tracking %d add-on.", "Now tracking %d add-ons.", len(approved)) % len(approved)
+        elif changedNames: summary = _("Your choices are saved.")
+        else: summary = _("No add-ons were tracked.")
         details = [_("Tracked: %s") % ", ".join(f"{item.summary or item.name} {item.addon_version}".strip() for item in approved)] if approved else []
         if failed: details += ["", ngettext("%d add-on could not be tracked because its manifest.ini has a problem:", "%d add-ons could not be tracked because their manifest.ini files have problems:", len(failed)) % len(failed)] + [_("%s: %s") % (item.summary or item.name, item.status.removeprefix("awaiting manual approval; ")) for item in failed] + [_("Fix the manifest, then press NVDA+Alt+Shift+U to check again.")]
+        if stopped: details += ["", _("No longer tracked, and offered again after scans: %s") % ", ".join(stopped)]
+        if hidden: details += ["", _("Hidden, and not offered again: %s") % ", ".join(hidden)]
         message = engine.readable_message(summary, details)
         if available:
             # Only a short summary is spoken: the review window opening next would cut off anything longer.
-            ui.message(ngettext("Now tracking %d add-ons; %d has an NVDA update to review.", "Now tracking %d add-ons; %d have NVDA updates to review.", len(available)) % (len(approved), len(available)))
+            ui.message((ngettext("Now tracking %d add-on.", "Now tracking %d add-ons.", len(approved)) % len(approved)) + " " + (ngettext("%d has an NVDA update to review.", "%d have NVDA updates to review.", len(available)) % len(available)))
             self._showReviewDialog(available, release)
         else: self._showInformation(_("Tracked add-ons"), message)
     def _showReviewDialog(self, available, release):
         if self._reviewDialog is not None:
             self._reviewDialog.Raise(); self._reviewDialog.checkList.SetFocus(); return
-        dialog = UpdateReviewDialog(gui.mainFrame, available, release); self._reviewDialog = dialog
+        dialog = UpdateReviewDialog(gui.mainFrame, available, release, publisher.store_channel_note(release.manifest_version, publisher.cached_nvda_api_versions(self._apiVersionCachePath), _, publisher.cached_nvda_api_versions_date(self._apiVersionCachePath))); self._reviewDialog = dialog
         def closeDialog(_event=None):
             if self._reviewDialog is dialog: self._reviewDialog = None
             dialog.Destroy()
@@ -1370,6 +1451,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if manual or mode == "periodic":
                 self._startProgress(); progressStarted = True; progressEvent = self._progressStop; wx.CallAfter(self._setProgressMessage, _("Checking official NVDA release information"))
             release = selectedRelease or engine.latest_release(bool(settings["includePrereleases"]), self._releaseCachePath)
+            if manual:
+                # Refresh the saved Add-on Store version list so the review window can say which channel accepts the target.
+                try: publisher.nvda_api_versions(self._apiVersionCachePath)
+                except Exception: log.debug("Add-on Store version list could not be refreshed", exc_info=True)
             if progressStarted: wx.CallAfter(self._setProgressMessage, _("Discovering add-on development projects in the isolated worker"))
             storedPaths = [str(path) for path in engine.approved_manifest_paths(state)]
             checkedAt = engine.utc_now(); previousAutomaticError = str(state.get("lastAutomaticError", "")); previousReleaseSource = str(state.get("releaseSource", ""))
@@ -1399,7 +1484,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             manifests = [Path(path) for path in workerResult.get("manifests", []) if isinstance(path, str)]
             discoveryTruncated = bool(workerResult.get("truncated")); completeDepth = workerResult.get("completeDepth") if isinstance(workerResult.get("completeDepth"), int) else None; previousDiscoveryTruncated = bool(state.get("lastDiscoveryTruncated"))
             if progressStarted: wx.CallAfter(self._setProgressMessage, _("Checking %d discovered add-on manifests") % len(manifests))
-            approved = engine.approved_project_ids(state)
+            approved = engine.approved_project_ids(state); hidden = engine.hidden_project_ids(state)
             if "approvedProjects" not in state:
                 for item in state.get("projects", []) if isinstance(state.get("projects"), list) else []:
                     if not isinstance(item, dict) or not item.get("path"): continue
@@ -1411,6 +1496,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 if progressStarted: wx.CallAfter(self._setProgressStep, progressEvent, _("Checking add-on manifest %d of %d: %s") % (index, len(manifests), path.parent.name), index, len(manifests))
                 identifier = engine.project_id(path)
                 try:
+                    if identifier in hidden and identifier not in approved:
+                        # A hidden copy is recorded, so Manage tracked add-ons can unhide it, but is never offered.
+                        metadata = engine.values(path); results.append(engine.add_copy_details(engine.ProjectResult(identifier, metadata.get("name", path.parent.name), str(path), engine.HIDDEN_STATUS), path)); continue
                     if identifier not in approved:
                         # Git details are gathered here, on the worker thread, so the tracking window can tell copies apart.
                         metadata = engine.values(path); results.append(engine.add_copy_details(engine.ProjectResult(identifier, metadata.get("name", path.parent.name), str(path), "awaiting manual approval"), path)); continue

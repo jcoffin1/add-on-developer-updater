@@ -1761,7 +1761,8 @@ class FoundCopyDescriptionTests(unittest.TestCase):
         changed = engine.describe_copy(self.copy("1.0", remote="git@github.com:me/demo.git", uncommitted_changes=14, unpushed_commits=2, branch="improve/speed"), ["1.0"], [])
         self.assertIn("on GitHub as me/demo, 14 files changed but not committed, 2 commits not pushed; branch improve/speed", changed)
         self.assertIn("this branch is not linked to a GitHub branch", engine.describe_copy(self.copy("1.0", remote="https://github.com/me/demo", uncommitted_changes=0, branch="audit"), ["1.0"], []))
-        self.assertIn("only on this computer; no GitHub repository", engine.describe_copy(self.copy("1.0", branch="main"), ["1.0"], []))
+        self.assertIn("only on this computer; no GitHub repository", engine.describe_copy(self.copy("1.0", branch="main", uncommitted_changes=0), ["1.0"], []))
+        self.assertIn("GitHub state not checked", engine.describe_copy(self.copy("1.0", branch="main"), ["1.0"], []))
         self.assertIn("only on this computer; not in Git", engine.describe_copy(self.copy("1.0", branch="not a Git repository"), ["1.0"], []))
         self.assertIn("not on GitHub; its Git remote is D:/backup.git", engine.describe_copy(self.copy("1.0", remote="D:/backup.git", branch="main"), ["1.0"], []))
         self.assertEqual("", engine.github_repository_label("https://gitlab.com/me/demo"))
@@ -1784,5 +1785,61 @@ class FoundCopyDescriptionTests(unittest.TestCase):
         dialogs = (PLUGIN_FOLDER / "dialogs.py").read_text(encoding="utf-8")
         self.assertIn("engine.describe_copy(", dialogs)
         self.assertNotIn("% (result.name, labels[", dialogs)
+
+class TrackingChoiceTests(unittest.TestCase):
+    def state(self):
+        return {
+            "approvedProjects": ["tracked", "old"], "hiddenProjects": ["hidden"],
+            "projects": [{"project_id": identifier, "name": "demo", "path": f"C:/{identifier}/manifest.ini", "status": status} for identifier, status in (("tracked", "current"), ("old", "update available: 2026.2 to 2026.3"), ("hidden", engine.HIDDEN_STATUS), ("new", "awaiting manual approval"))],
+            "manualUpdateReview": {"release": {"tag": "2026.3rc1", "manifest_version": "2026.3", "prerelease": True, "url": ""}, "results": [{"project_id": "old", "name": "demo", "path": "C:/old/manifest.ini", "status": "update available: 2026.2 to 2026.3"}]},
+        }
+
+    def test_each_copy_has_one_tracking_state(self):
+        state = self.state()
+        self.assertEqual(["tracked", "tracked", "hidden", "untracked"], [engine.tracking_state(state, identifier) for identifier in ("tracked", "old", "hidden", "new")])
+
+    def test_stop_tracking_and_hide_update_lists_statuses_and_pending_review(self):
+        state = self.state()
+        engine.set_tracking(state, {"old": "untracked", "new": "hidden", "hidden": "tracked"})
+        self.assertEqual(["tracked"], state["approvedProjects"]); self.assertEqual(["new"], state["hiddenProjects"])
+        statuses = {item["project_id"]: item["status"] for item in state["projects"]}
+        self.assertEqual("awaiting manual approval", statuses["old"]); self.assertEqual(engine.HIDDEN_STATUS, statuses["new"])
+        # The stopped copy's pending NVDA update is withdrawn, so it is not updated by mistake.
+        self.assertNotIn("manualUpdateReview", state)
+        # Tracking itself is completed by the validating step, so "hidden" -> "tracked" only unhides here.
+        self.assertNotIn("hidden", state["approvedProjects"])
+
+    def test_hidden_copies_are_not_counted_as_waiting_or_failed(self):
+        records = [{"project_id": "hidden", "status": engine.HIDDEN_STATUS}]
+        updates, awaiting, failures, changed, resolved = engine.notification_state(records, {}, {}, {})
+        self.assertEqual(({}, {}, {}, set()), (updates, awaiting, failures, changed))
+
+    def test_records_from_other_versions_load_safely(self):
+        result = engine.project_result_from_record({"project_id": "id", "name": "demo", "path": "C:/demo/manifest.ini", "status": "current", "public_name": "unexpected", "futureField": 1})
+        self.assertEqual("demo", result.name)
+        self.assertIsNone(engine.project_result_from_record({"name": "missing required fields"}))
+
+    def test_copy_rank_names_the_newest_copy(self):
+        self.assertEqual("newest copy", engine.copy_rank("2026.2.54", ["2026.2.54", "2026.2.22"]))
+        self.assertEqual("older copy; the newest is 2026.2.54", engine.copy_rank("2026.2.22", ["2026.2.54", "2026.2.22"]))
+        self.assertEqual("", engine.copy_rank("1.0", ["1.0"]))
+
+class StoreChannelNoteTests(unittest.TestCase):
+    def test_note_states_the_store_channel_for_the_target(self):
+        versions = {"2026.3": {"experimental": False}, "2027.1": {"experimental": True}}
+        self.assertIn("listed NVDA 2026.3 as stable", publisher.store_channel_note("2026.3", versions))
+        self.assertTrue(publisher.store_channel_note("2026.3", versions, as_of="October 23, 2026").startswith("As of October 23, 2026: "))
+        self.assertIn("only to the beta or dev channel", publisher.store_channel_note("2027.1", versions))
+        self.assertIn("did not list NVDA 2027.2 yet", publisher.store_channel_note("2027.2", versions))
+        self.assertEqual("", publisher.store_channel_note("2026.3", {}))
+
+    def test_cached_versions_are_read_without_network_access(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "apiVersions.json"
+            cache.write_text(json.dumps([{"apiVer": {"major": 2026, "minor": 3, "patch": 0}, "experimental": False}]), encoding="utf-8")
+            with mock.patch.object(publisher.urllib.request, "urlopen", side_effect=AssertionError("network used")):
+                self.assertIn("2026.3", publisher.cached_nvda_api_versions(cache))
+            self.assertEqual({}, publisher.cached_nvda_api_versions(Path(folder) / "missing.json"))
+            self.assertEqual({}, publisher.cached_nvda_api_versions(None))
 
 if __name__ == "__main__": unittest.main()

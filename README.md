@@ -10,6 +10,10 @@ Add-on Developer Updater helps NVDA add-on developers discover development proje
 4. Use the GitHub publishing command only after reviewing the changed source and documentation.
 5. Use `NVDA+Alt+Shift+S` for the final Store-readiness check. The official submission form still requires your review and manual submission.
 
+## Managing tracked add-ons
+
+Press `NVDA+Alt+Shift+A` to open **Manage tracked add-ons**. Each copy found on your computer is listed with your current choice first: Tracked, Not tracked, or Hidden. Press T, N, or H to change it, then save and confirm. Hidden copies are never offered again until you change them; stopping tracking withdraws any pending NVDA update for that copy. The tracking window after a scan can also hide every unchecked copy at once.
+
 ## Speech and braille
 
 Questions and results open in windows whose message field has focus. NVDA speaks the first line, which always states the question or outcome, and each detail is on its own line for arrow-key and braille reading. Escape answers No or closes the window, and Enter in the message chooses the highlighted button. Results are not spoken twice, the progress bar appears only when real step counts exist, and an optional tone marks new background results.

@@ -574,6 +574,40 @@ def approved_project_ids(state: dict) -> set[str]:
     return approved
 
 
+HIDDEN_STATUS = "hidden by you"
+
+def hidden_project_ids(state: dict) -> set[str]:
+    """Return copies the user chose never to be offered again."""
+    return set(state.get("hiddenProjects", [])) if isinstance(state, dict) and isinstance(state.get("hiddenProjects"), list) else set()
+
+def project_result_from_record(item: dict) -> ProjectResult | None:
+    """Rebuild a saved record, ignoring keys from other versions of the add-on."""
+    fields = ProjectResult.__dataclass_fields__
+    try: return ProjectResult(**{key: value for key, value in item.items() if key in fields})
+    except TypeError: return None
+
+def tracking_state(state: dict, identifier: str) -> str:
+    if identifier in hidden_project_ids(state): return "hidden"
+    return "tracked" if identifier in saved_approved_project_ids(state) else "untracked"
+
+def set_tracking(state: dict, changes: dict[str, str]) -> None:
+    """Stop tracking or hide copies, or unhide copies about to be tracked.
+
+    Starting to track is completed by the validating approval step, which adds
+    the copy to approvedProjects; this only removes it from the hidden list.
+    """
+    approved = saved_approved_project_ids(state); hidden = hidden_project_ids(state); released = set()
+    for identifier, choice in changes.items():
+        if choice == "hidden": approved.discard(identifier); hidden.add(identifier); released.add(identifier)
+        elif choice == "untracked": approved.discard(identifier); hidden.discard(identifier); released.add(identifier)
+        elif choice == "tracked": hidden.discard(identifier)
+    for item in state.get("projects", []) if isinstance(state.get("projects"), list) else []:
+        if isinstance(item, dict) and changes.get(item.get("project_id")) in {"hidden", "untracked"}:
+            item["status"] = HIDDEN_STATUS if changes[item["project_id"]] == "hidden" else "awaiting manual approval"
+    state["approvedProjects"] = sorted(approved); state["hiddenProjects"] = sorted(hidden)
+    # A copy that is no longer tracked must not keep a pending compatibility update.
+    if released: finish_manual_review_items(state, released)
+
 def saved_approved_project_ids(state: dict) -> set[str]:
     """Return saved IDs without resolving paths; safe for NVDA's main thread."""
     return set(state.get("approvedProjects", [])) if isinstance(state, dict) and isinstance(state.get("approvedProjects"), list) else set()
@@ -788,6 +822,7 @@ def add_copy_details(result: ProjectResult, path: Path) -> ProjectResult:
         pass
     root = project_root(path)
     if root is None or not (root / ".git").exists():
+        result.branch = "not a Git repository"; result.remote = ""
         return result
     code, branch = _git_output(root, "branch", "--show-current")
     if code == 0: result.branch = branch or "detached"
@@ -817,6 +852,13 @@ def _spoken_date(value: str) -> str:
     except (TypeError, ValueError):
         return ""
 
+def copy_rank(version: str, versions: list[str], translate=lambda text: text) -> str:
+    """Say whether a copy is the newest among copies of one add-on; empty when it is the only copy."""
+    _ = translate; known = [item for item in versions if item and item != "unknown"]
+    if len(versions) < 2 or not known: return ""
+    newest = max(known, key=addon_version_key)
+    return _("newest copy") if version == newest else _("older copy; the newest is %s") % newest
+
 def describe_copy(result: ProjectResult, same_addon_versions: list[str], tracked_versions: list[str], home: Path | None = None, translate=lambda text: text) -> str:
     """Describe one found copy so that copies of the same add-on can be told apart by ear and in braille.
 
@@ -840,8 +882,8 @@ def describe_copy(result: ProjectResult, same_addon_versions: list[str], tracked
     repository = github_repository_label(result.remote)
     if result.remote and repository:
         state = [_("on GitHub as %s") % repository]
-        if result.uncommitted_changes > 0: state.append(_("%d files changed but not committed") % result.uncommitted_changes)
-        if result.unpushed_commits > 0: state.append(_("%d commits not pushed") % result.unpushed_commits)
+        if result.uncommitted_changes > 0: state.append(_("1 file changed but not committed") if result.uncommitted_changes == 1 else _("%d files changed but not committed") % result.uncommitted_changes)
+        if result.unpushed_commits > 0: state.append(_("1 commit not pushed") if result.unpushed_commits == 1 else _("%d commits not pushed") % result.unpushed_commits)
         if result.uncommitted_changes == 0 and result.unpushed_commits == 0: state.append(_("everything pushed"))
         elif result.uncommitted_changes == 0 and result.unpushed_commits < 0 and result.branch != "detached":
             # Without a linked GitHub branch, Git cannot tell whether this branch's commits were pushed.
@@ -849,8 +891,12 @@ def describe_copy(result: ProjectResult, same_addon_versions: list[str], tracked
         parts.append(", ".join(state))
     elif result.remote:
         parts.append(_("not on GitHub; its Git remote is %s") % result.remote)
+    elif result.uncommitted_changes < 0 and result.branch != "not a Git repository":
+        # Git was not inspected for this copy, so make no claim about GitHub.
+        parts.append(_("GitHub state not checked"))
     elif result.branch and result.branch != "not a Git repository":
-        parts.append(_("only on this computer; no GitHub repository") + (_(", %d files changed but not committed") % result.uncommitted_changes if result.uncommitted_changes > 0 else ""))
+        changed = "" if result.uncommitted_changes <= 0 else (_(", 1 file changed but not committed") if result.uncommitted_changes == 1 else _(", %d files changed but not committed") % result.uncommitted_changes)
+        parts.append(_("only on this computer; no GitHub repository") + changed)
     else:
         parts.append(_("only on this computer; not in Git"))
     if result.branch and result.branch.casefold() not in {"main", "master", "not a git repository"}:

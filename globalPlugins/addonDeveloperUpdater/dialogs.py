@@ -15,7 +15,7 @@ def _projectDisplayName(result):
     return str(getattr(result, "public_name", "") or getattr(result, "summary", "") or result.name)
 
 class UpdateReviewDialog(wx.Dialog):
-    def __init__(self, parent, results, release=None):
+    def __init__(self, parent, results, release=None, storeNote=""):
         super().__init__(parent, title=_("Review NVDA add-on compatibility updates"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.results = results; mainSizer = wx.BoxSizer(wx.VERTICAL)
         self.onUpdate = None; self.allSelectedMessage = _("All add-on updates selected")
@@ -23,14 +23,21 @@ class UpdateReviewDialog(wx.Dialog):
         if release is not None:
             build = release.tag + (f" ({release.build_version})" if release.build_version and release.build_version != release.tag else "")
             instruction = _("Selected NVDA build: %s. Manifest compatibility target: %s. ") % (build, release.manifest_version) + instruction
+            if release.prerelease: instruction += " " + _("This NVDA build is a test release, so try your add-ons with it before publishing.")
+        if storeNote: instruction += " " + storeNote
         self.instructions = wx.StaticText(self, label=instruction); self.instructions.Wrap(900); mainSizer.Add(self.instructions, 0, wx.ALL, 10)
         choices = []
+        # Public names and versions tell copies of one add-on apart; internal IDs can be shared.
+        versions = {}
+        for result in results: versions.setdefault((result.summary or result.name).casefold(), []).append(result.addon_version)
         for result in results:
             if result.branch == "not a Git repository": gitState = _("manifest is not tracked by Git")
             elif not result.branch or result.branch == "Git status unavailable": gitState = _("manifest change state is unavailable")
             elif result.manifest_changed: gitState = _("manifest has uncommitted changes")
             else: gitState = _("manifest is clean")
-            choices.append(_("%s: NVDA %s; minimum NVDA %s; branch %s; %s; %s") % (result.name, result.status.removeprefix("update available: "), result.minimum_version or _("unknown"), result.branch or _("unknown"), gitState, result.path))
+            rank = engine.copy_rank(result.addon_version, versions[(result.summary or result.name).casefold()], _)
+            label = f"{result.summary or result.name} {result.addon_version}".strip() + (f" ({rank})" if rank else "")
+            choices.append(_("%s: NVDA %s; minimum NVDA %s; branch %s; %s; %s") % (label, result.status.removeprefix("update available: "), result.minimum_version or _("unknown"), result.branch or _("unknown"), gitState, result.path))
         self.checkList = CustomCheckListBox(self, choices=choices)
         mainSizer.Add(self.checkList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
         selectionSizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -79,8 +86,13 @@ class ProjectApprovalDialog(UpdateReviewDialog):
         for result in results: versions.setdefault(publicName(result), []).append(result.addon_version)
         # Plain wording: the choice is simply which of these add-ons the user is developing.
         self.SetTitle(_("Choose add-ons to track")); self.allSelectedMessage = _("All add-ons checked")
-        self.instructions.SetLabel(_("These add-on projects were found on your computer. Check each one you are developing yourself. Tracked add-ons are checked for new NVDA versions and can be published to GitHub and submitted to the Add-on Store. Leave an add-on unchecked if you are not developing it, for example someone else's add-on you downloaded, a backup, or a test copy. Each line tells you the add-on's name and version, whether it is the newest copy found, whether you already track another copy, and whether its code is on GitHub or only on this computer. Nothing is checked yet. Space checks an add-on, and Enter continues.")); self.instructions.Wrap(850)
+        self.instructions.SetLabel(_("These add-on projects were found on your computer. Check each one you are developing yourself. Tracked add-ons are checked for new NVDA versions and can be published to GitHub and submitted to the Add-on Store. Leave an add-on unchecked if you are not developing it, for example someone else's add-on you downloaded, a backup, or a test copy. Each line tells you the add-on's name and version, whether it is the newest copy found, whether you already track another copy, and whether its code is on GitHub or only on this computer. Nothing is checked yet. Space checks an add-on, and Enter continues. To change your choices later, use Manage tracked add-ons, NVDA+Alt+Shift+A.")); self.instructions.Wrap(850)
         self.checkList.Set([engine.describe_copy(result, versions[publicName(result)], trackedVersions.get(publicName(result), []), translate=_) for result in results]); self.checkList.SetName(_("Add-on projects found on this computer")); self.updateButton.SetLabel(_("&Track checked add-ons"))
+        # Without this, every unchecked copy is offered again after each scan.
+        self.hideUnchecked = wx.CheckBox(self, label=_("&Hide the unchecked add-ons so they are not offered again"))
+        self.GetSizer().Insert(2, self.hideUnchecked, 0, wx.ALL, 10); self.hideUnchecked.MoveAfterInTabOrder(self.checkList); self.Layout()
+    def uncheckedResults(self):
+        return [result for index, result in enumerate(self.results) if not self.checkList.IsChecked(index)]
 
 class GitHubPublishDialog(UpdateReviewDialog):
     def __init__(self, parent, results):
@@ -383,6 +395,58 @@ class ScanTargetDialog(wx.Dialog):
         if key == wx.WXK_ESCAPE: self.Close(); return
         if self.targetList.HasFocus() and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             if self.onStart is not None: self.onStart()
+            return
+        event.Skip()
+
+class ManageTrackingDialog(wx.Dialog):
+    """Change whether each found copy is tracked, not tracked, or hidden.
+
+    Each list line starts with the current choice, so speech and braille state it
+    before the description.  Letters change the choice without leaving the list.
+    """
+    STATE_ORDER = ("tracked", "untracked", "hidden")
+    def __init__(self, parent, entries):
+        super().__init__(parent, title=_("Manage tracked add-ons"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.entries = entries; self.original = {result.project_id: state for result, state, _description in entries}; self.choices = dict(self.original); self.onSave = None
+        self.stateNames = {"tracked": _("Tracked"), "untracked": _("Not tracked"), "hidden": _("Hidden")}
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        instructions = wx.StaticText(self, label=_("Every add-on copy found on your computer is listed with your current choice first. Tracked add-ons are checked for new NVDA versions and can be published to GitHub and the Add-on Store. Not tracked add-ons are offered again after each scan. Hidden add-ons are not offered again until you change them here. Select an add-on, then press T for tracked, N for not tracked, or H for hidden. Press Enter or the Save button to apply your changes."))
+        instructions.Wrap(900); sizer.Add(instructions, 0, wx.ALL, 10)
+        self.copyList = wx.ListBox(self, choices=[self._label(index) for index in range(len(entries))], style=wx.LB_SINGLE); self.copyList.SetName(_("Add-on copies found on this computer"))
+        if entries: self.copyList.SetSelection(0)
+        sizer.Add(self.copyList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        row = wx.BoxSizer(wx.HORIZONTAL); row.Add(wx.StaticText(self, label=_("&Choice for the selected add-on:")), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        self.stateChoice = wx.Choice(self, choices=[self.stateNames[state] for state in self.STATE_ORDER]); self.stateChoice.SetName(_("Choice for the selected add-on")); row.Add(self.stateChoice, 0); sizer.Add(row, 0, wx.ALL, 10)
+        buttons = wx.BoxSizer(wx.HORIZONTAL); self.saveButton = wx.Button(self, label=_("&Save changes")); self.closeButton = wx.Button(self, label=_("C&lose without saving")); self.saveButton.SetDefault()
+        buttons.Add(self.saveButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); sizer.Add(buttons, 0, wx.ALL, 10)
+        self.SetSizer(sizer); self.SetMinSize((700, 400)); self.SetSize((1000, 560)); self.CentreOnScreen()
+        self.copyList.Bind(wx.EVT_LISTBOX, lambda _event: self._syncChoice()); self.stateChoice.Bind(wx.EVT_CHOICE, self._onChoice); self.Bind(wx.EVT_CHAR_HOOK, self._onKey); self._syncChoice()
+    def _label(self, index):
+        result, _state, description = self.entries[index]
+        return _("%s: %s") % (self.stateNames[self.choices[result.project_id]], description)
+    def _syncChoice(self):
+        index = self.copyList.GetSelection()
+        if index != wx.NOT_FOUND: self.stateChoice.SetSelection(self.STATE_ORDER.index(self.choices[self.entries[index][0].project_id]))
+    def _setState(self, index, state, announce=True):
+        result = self.entries[index][0]
+        if self.choices[result.project_id] != state:
+            self.choices[result.project_id] = state; self.copyList.SetString(index, self._label(index)); self.copyList.SetSelection(index)
+        self._syncChoice()
+        if announce: ui.message(self.stateNames[state])
+    def _onChoice(self, _event):
+        index = self.copyList.GetSelection(); selection = self.stateChoice.GetSelection()
+        if index != wx.NOT_FOUND and selection != wx.NOT_FOUND: self._setState(index, self.STATE_ORDER[selection], announce=False)
+    def changes(self):
+        return {identifier: state for identifier, state in self.choices.items() if state != self.original[identifier]}
+    def _onKey(self, event):
+        key = event.GetKeyCode(); listFocused = self.copyList.HasFocus()
+        if key == wx.WXK_ESCAPE: self.Close(); return
+        if listFocused and not event.HasModifiers() and key in (ord("T"), ord("t"), ord("N"), ord("n"), ord("H"), ord("h")):
+            index = self.copyList.GetSelection()
+            if index != wx.NOT_FOUND: self._setState(index, {"t": "tracked", "n": "untracked", "h": "hidden"}[chr(key).lower()])
+            return
+        if listFocused and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if self.onSave is not None: self.onSave()
             return
         event.Skip()
 

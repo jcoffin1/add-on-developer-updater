@@ -402,6 +402,38 @@ def nvda_api_versions(cache_path: Path | None = None) -> dict:
             pass
         raise
 
+def cached_nvda_api_versions(cache_path: Path | None) -> dict:
+    """Read the last saved official version list without network access, for use on NVDA's main thread."""
+    try:
+        with cache_path.open(encoding="utf-8-sig") as stream: return _parse_nvda_api_versions(json.load(stream))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return {}
+
+def cached_nvda_api_versions_date(cache_path: Path | None) -> str:
+    """Return when the saved Store version list was downloaded, as a readable date."""
+    try:
+        saved = time.localtime(cache_path.stat().st_mtime)
+        return f"{time.strftime('%B', saved)} {saved.tm_mday}, {saved.tm_year}"
+    except (AttributeError, OSError, ValueError):
+        return ""
+
+def store_channel_note(target: str, api_versions: dict, translate=lambda text: text, as_of: str = "") -> str:
+    """Explain which Add-on Store channel accepts add-ons tested with an NVDA version.
+
+    The date of the saved list is included, because NV Access moves a version
+    from experimental to stable over time and a saved list can be out of date.
+    """
+    _ = translate
+    if not api_versions: return ""
+    details = api_versions.get(target)
+    if details is None:
+        note = _("The Add-on Store did not list NVDA %s yet. Add-ons updated to it cannot be submitted to the Store until NV Access adds it.") % target
+    elif isinstance(details, dict) and details.get("experimental"):
+        note = _("The Add-on Store listed NVDA %s as experimental, so add-ons updated to it could be submitted only to the beta or dev channel.") % target
+    else:
+        note = _("The Add-on Store listed NVDA %s as stable, so updated add-ons can be submitted to the stable channel.") % target
+    return (_("As of %s: %s") % (as_of, note)) if as_of else note
+
 def normalized_version(value: str) -> str:
     normalized = (value or "").strip().removeprefix("v").removeprefix("V")
     return normalized[8:] if normalized.casefold().startswith("release-") else normalized

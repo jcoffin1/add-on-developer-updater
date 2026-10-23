@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026.2.55
+
+- Add Manage tracked add-ons, NVDA+Alt+Shift+A. Every found copy is listed with its current choice first, and T, N, or H tracks it, stops tracking it, or hides it. Tracking was previously one-way, and unchecked copies were offered again after every scan.
+- Gather fresh Git details when the window opens, so tracked copies are described accurately. They were previously described as having no GitHub repository because their details had never been read.
+- Add Hide the unchecked add-ons to the tracking window that opens after a scan.
+- Withdraw a copy's pending NVDA update when you stop tracking or hide it.
+- Show each add-on's public name and version in the update review window, and mark older copies of the same add-on.
+- State in the update review window whether the Add-on Store accepts the target NVDA version on the stable channel, with the date of that information, and remind you to test with beta and release-candidate builds before publishing. Manual scans refresh the saved Add-on Store version list.
+- Report hidden copies in the status report.
+
 ## 2026.2.54
 
 - Show each add-on's public name in the tracking window instead of its internal ID. ChatGPT Desktop Access and Codex Status Announcer share the internal ID codexStatusAnnouncer, so they previously appeared under the same name.
