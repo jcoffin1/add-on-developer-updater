@@ -35,8 +35,9 @@ Questions and results open in windows whose message field has focus. NVDA speaks
 - `NVDA+Alt+Shift+D`: set an older last-tested NVDA target for selected manifests.
 - `NVDA+Alt+G` or `NVDA+Alt+Shift+G`: select projects to publish to GitHub.
 - `NVDA+Alt+Shift+F`: select the newest released `.nvda-addon` file from the signed-in GitHub account, then copy either its direct download link or its repository link.
-- `NVDA+Alt+Shift+I`: select an add-on repository and open its GitHub Issues page.
-- `NVDA+Alt+Shift+T`: select an add-on repository, edit one of its GitHub issue templates as an accessible form or raw text, or delete it after confirmation.
+- `NVDA+Alt+Shift+I`: select an add-on repository and open its GitHub Issues page, or review its open pull requests and merge one after confirmation.
+- `NVDA+Alt+Shift+K`: check a tracked add-on's translations, compile its nvda.mo files, or create its translation template.
+- `NVDA+Alt+Shift+T`: select an add-on repository, edit one of its GitHub issue templates as an accessible form or raw text, or delete it after confirmation. Create new template adds a Translation, Bug report, Feature request, or blank form.
 - `NVDA+Alt+Shift+S`: select projects for Add-on Store readiness review.
 
 Additional commands, including **Choose which found add-on projects to track**, **Report add-on update-check status**, **Undo the most recent discovered compatibility updates**, and **Undo the most recent compatibility target changes**, can be assigned in NVDA's Input Gestures dialog under **Add-on Developer Updater**.

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026.3.0
+
+- Move to the NVDA 2026.3 release family, tested through NVDA 2026.3.
+- Review an add-on repository's open pull requests from NVDA+Alt+Shift+I: each shows its author, size, checks, and whether it can be merged. Open it in the browser, or merge or squash and merge it after a confirmation that lists every changed file. The merge is refused if the pull request changed after it was reviewed, and drafts, conflicts, and failed checks are explained instead.
+- Create new issue forms from NVDA+Alt+Shift+T, starting from a Translation, Bug report, Feature request, or blank form, even in a repository that has no templates yet. A new form is never written over an existing file.
+- Check a tracked add-on's translations with NVDA+Alt+Shift+K: completeness per language, strings needing review, compiled files that are missing or out of date, and translations whose placeholders, shortcut keys, line breaks, or spacing differ from the English text. Compile every nvda.mo, or create the translation template, from the same window. Projects with their own template tool keep using it.
+- Warn in the GitHub publishing confirmation when a release would ship a missing or out-of-date nvda.mo or a broken translation.
+
 ## 2026.2.55
 
 - Add Manage tracked add-ons, NVDA+Alt+Shift+A. Every found copy is listed with its current choice first, and T, N, or H tracks it, stops tracking it, or hides it. Tracking was previously one-way, and unchecked copies were offered again after every scan.

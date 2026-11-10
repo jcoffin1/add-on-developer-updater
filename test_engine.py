@@ -9,7 +9,7 @@ import engine
 import publisher
 
 MANIFEST = "name = demo\nsummary = Demo\nversion = 1.0\nminimumNVDAVersion = 2025.1\nlastTestedNVDAVersion = 2025.4\n"
-CURRENT_RELEASE_FAMILY = "2026.2"
+CURRENT_RELEASE_FAMILY = "2026.3"
 PLUGIN_FOLDER = Path(__file__).parent / "globalPlugins" / "addonDeveloperUpdater"
 
 def plugin_source():
@@ -49,7 +49,7 @@ class EngineTests(unittest.TestCase):
         if version != CURRENT_RELEASE_FAMILY:
             self.assertGreaterEqual(int(version.rsplit(".", 1)[1]), 0)
         self.assertEqual("2025.3.3", metadata["minimumnvdaversion"])
-        self.assertEqual("2026.2", metadata["lasttestednvdaversion"])
+        self.assertEqual("2026.3", metadata["lasttestednvdaversion"])
     def test_release_selection_does_not_trust_api_order(self):
         items = [{"tag_name": "release-2026.3beta9", "prerelease": True}, {"tag_name": "release-2026.2.0"}, {"tag_name": "release-2026.3beta11", "prerelease": True}]
         self.assertEqual("2026.3beta11", engine._select_release(items, True).tag); self.assertEqual("2026.2.0", engine._select_release(items, False).tag)
@@ -1841,5 +1841,181 @@ class StoreChannelNoteTests(unittest.TestCase):
                 self.assertIn("2026.3", publisher.cached_nvda_api_versions(cache))
             self.assertEqual({}, publisher.cached_nvda_api_versions(Path(folder) / "missing.json"))
             self.assertEqual({}, publisher.cached_nvda_api_versions(None))
+
+import translations
+
+PO_SAMPLE = '''msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\\n"
+
+#: globalPlugins/demo.py:4
+msgid "Hello {name}"
+msgstr "Bonjour {name}"
+
+#: globalPlugins/demo.py:5
+msgid "&Save"
+msgstr "&Enregistrer"
+
+#, fuzzy
+msgid "Old wording"
+msgstr "Ancienne formulation"
+
+msgctxt "button"
+msgid "Open"
+msgstr "Ouvrir"
+
+msgid "%d file"
+msgid_plural "%d files"
+msgstr[0] "%d fichier"
+msgstr[1] "%d fichiers"
+
+msgid "Broken {count}"
+msgstr "Cassé"
+
+#~ msgid "Removed"
+#~ msgstr "Supprimé"
+'''
+
+class TranslationToolTests(unittest.TestCase):
+    def project(self, folder, source):
+        root = Path(folder); (root / "globalPlugins").mkdir(parents=True)
+        (root / "manifest.ini").write_text("name = demo\nsummary = Demo\nversion = 1.0\n", encoding="utf-8")
+        (root / "globalPlugins" / "demo.py").write_text(source, encoding="utf-8")
+        return root
+
+    def test_catalogs_with_plurals_contexts_fuzzy_and_obsolete_entries_are_read(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "nvda.po"; path.write_text(PO_SAMPLE, encoding="utf-8")
+            header, entries = translations.parse_catalog(path)
+        self.assertIn("charset=UTF-8", header)
+        self.assertEqual(["%d fichier", "%d fichiers"], entries[("", "%d file")].translations)
+        self.assertEqual("Ouvrir", entries[("button", "Open")].translations[0])
+        self.assertTrue(entries[("", "Old wording")].fuzzy); self.assertFalse(entries[("", "Old wording")].translated)
+        self.assertNotIn(("", "Removed"), entries)
+
+    def test_strings_comments_and_references_are_extracted_from_code(self):
+        source = 'def f():\n    # Translators: greeting shown at start\n    ui.message(_("Hello {name}"))\n    pgettext("button", "Open")\n    ngettext("%d file", "%d files", 2)\n    _(variable)\n'
+        with tempfile.TemporaryDirectory() as folder:
+            messages = translations.extract_messages(self.project(folder, source))
+        self.assertEqual({("", "Hello {name}"), ("button", "Open"), ("", "%d file")}, set(messages))
+        self.assertEqual(["Translators: greeting shown at start"], messages[("", "Hello {name}")].comments)
+        self.assertEqual(["globalPlugins/demo.py:3"], messages[("", "Hello {name}")].references)
+        self.assertEqual("%d files", messages[("", "%d file")].plural)
+
+    def test_template_round_trips_through_the_reader(self):
+        source = 'def f():\n    # Translators: line one\n    _("Two\\nlines")\n    ngettext("%d file", "%d files", 2)\n'
+        with tempfile.TemporaryDirectory() as folder:
+            root = self.project(folder, source); messages = translations.extract_messages(root)
+            template = root / "demo.pot"; template.write_text(translations.render_template(messages, "Demo 1.0"), encoding="utf-8")
+            _header, entries = translations.parse_catalog(template)
+        self.assertEqual(set(messages), set(entries)); self.assertEqual("%d files", entries[("", "%d file")].plural)
+
+    def test_problems_are_found_and_reported_per_language(self):
+        self.assertEqual(["placeholders differ"], translations.validate("Broken {count}", "Cassé"))
+        self.assertEqual(["placeholders differ"], translations.validate("%(n)s items, %d%%", "%d%% éléments"))
+        self.assertEqual([], translations.validate("%d%% done", "%d%% terminé"))
+        self.assertEqual(["shortcut key (&) count differs"], translations.validate("&Save", "Enregistrer"))
+        with tempfile.TemporaryDirectory() as folder:
+            root = self.project(folder, 'def f():\n    _("Hello {name}")\n    _("&Save")\n    _("Broken {count}")\n    _("New text")\n')
+            po = root / "locale" / "fr" / "LC_MESSAGES" / "nvda.po"; po.parent.mkdir(parents=True); po.write_text(PO_SAMPLE, encoding="utf-8")
+            report = translations.check_project(root / "manifest.ini", name="Demo")
+            self.assertEqual("missing", report.languages[0].compiled)
+            translations.compile_catalog(po)
+            report = translations.check_project(root / "manifest.ini", name="Demo")
+        french = report.languages[0]
+        self.assertEqual(("fr", 3, 4, "current", False), (french.language, french.translated, french.total, french.compiled, french.manifest_translated))
+        self.assertTrue(any("placeholders differ" in problem for problem in french.problems))
+        summary, details = translations.report_lines(report)
+        self.assertEqual("Demo: 1 language, 1 problem to fix.", summary)
+        self.assertTrue(details[0].startswith("No translation template (.pot) exists yet"))
+
+    def test_compiled_file_is_read_by_python_gettext_and_detects_staleness(self):
+        import gettext
+        with tempfile.TemporaryDirectory() as folder:
+            po = Path(folder) / "nvda.po"; po.write_text(PO_SAMPLE, encoding="utf-8")
+            mo = translations.compile_catalog(po)
+            with mo.open("rb") as stream: catalog = gettext.GNUTranslations(stream)
+            self.assertEqual("Bonjour {name}", catalog.gettext("Hello {name}"))
+            self.assertEqual("%d fichiers", catalog.ngettext("%d file", "%d files", 2))
+            self.assertEqual("Ouvrir", catalog.pgettext("button", "Open"))
+            self.assertEqual("Old wording", catalog.gettext("Old wording"))
+            self.assertEqual("current", translations.compiled_state(po))
+            po.write_text(PO_SAMPLE.replace("Ouvrir", "Ouvrir maintenant"), encoding="utf-8")
+            self.assertEqual("out of date", translations.compiled_state(po))
+
+    def test_projects_with_their_own_template_tool_are_not_overridden(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = self.project(folder, 'def f():\n    translate("Custom function text")\n')
+            (root / "tools").mkdir(); (root / "tools" / "extract_messages.py").write_text("# project tool\n", encoding="utf-8")
+            (root / "locale").mkdir(); (root / "locale" / "demo.pot").write_text('msgid ""\nmsgstr ""\n\nmsgid "Custom function text"\nmsgstr ""\n', encoding="utf-8")
+            report = translations.check_project(root / "manifest.ini", name="Demo")
+        self.assertEqual(("tools/extract_messages.py", 0, 0), (report.template_tool, report.new_strings, report.removed_strings))
+        self.assertIn("built by this project's own tool", "\n".join(translations.report_lines(report)[1]))
+
+    def test_release_warnings_name_stale_translations(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = self.project(folder, 'def f():\n    _("Hello {name}")\n')
+            po = root / "locale" / "fr" / "LC_MESSAGES" / "nvda.po"; po.parent.mkdir(parents=True); po.write_text(PO_SAMPLE, encoding="utf-8")
+            issues = translations.publish_issues(root / "manifest.ini")
+        self.assertTrue(any(issue.startswith("fr nvda.mo is missing") for issue in issues))
+
+class PullRequestAndIssueFormTests(unittest.TestCase):
+    def pull(self, **changes):
+        values = dict(number=7, title="French update", author="Nitram1123", url="https://github.com/me/demo/pull/7", head_branch="fr", base_branch="main", head_sha="a" * 40, draft=False, mergeable="MERGEABLE", checks="passed", changed_files=2, additions=10, deletions=1, files=("locale/fr/LC_MESSAGES/nvda.po",), from_fork=True)
+        values.update(changes); return publisher.PullRequest(**values)
+
+    def test_check_results_are_summarized(self):
+        self.assertEqual("none", publisher.summarize_checks([]))
+        self.assertEqual("passed", publisher.summarize_checks([{"status": "COMPLETED", "conclusion": "SUCCESS"}, {"state": "SUCCESS"}]))
+        self.assertEqual("running", publisher.summarize_checks([{"status": "IN_PROGRESS", "conclusion": ""}, {"status": "COMPLETED", "conclusion": "SUCCESS"}]))
+        self.assertEqual("failed", publisher.summarize_checks([{"status": "COMPLETED", "conclusion": "FAILURE"}, {"status": "QUEUED"}]))
+
+    def test_merges_are_blocked_until_the_pull_request_is_ready(self):
+        self.assertEqual("", publisher.pull_request_merge_blocker(self.pull()))
+        self.assertEqual("", publisher.pull_request_merge_blocker(self.pull(mergeable="UNKNOWN")))
+        self.assertIn("draft", publisher.pull_request_merge_blocker(self.pull(draft=True)))
+        self.assertIn("conflicts", publisher.pull_request_merge_blocker(self.pull(mergeable="CONFLICTING")))
+        self.assertIn("checks failed", publisher.pull_request_merge_blocker(self.pull(checks="failed")))
+
+    def test_merge_requires_the_reviewed_commit(self):
+        repository = publisher.GitHubAddonRepository("demo", "me/demo", "https://github.com/me/demo", default_branch="main")
+        with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "_run", return_value="") as run:
+            publisher.merge_pull_request(repository, self.pull(), squash=True)
+        command = run.call_args.args[0]
+        self.assertEqual(["gh", "pr", "merge", "7", "--repo", "me/demo", "--squash", "--match-head-commit", "a" * 40], command)
+        with mock.patch.object(publisher, "_run") as run, self.assertRaisesRegex(RuntimeError, "conflicts"):
+            publisher.merge_pull_request(repository, self.pull(mergeable="CONFLICTING"))
+        run.assert_not_called()
+
+    def test_pull_requests_are_read_from_github_cli_json(self):
+        repository = publisher.GitHubAddonRepository("demo", "me/demo", "https://github.com/me/demo")
+        rows = [{"number": 11, "title": "Archive chat", "author": {"login": "Nitram1123"}, "url": "u", "headRefName": "feat", "baseRefName": "main", "headRefOid": "b" * 40, "isDraft": False, "mergeable": "MERGEABLE", "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}], "changedFiles": 10, "additions": 538, "deletions": 178, "files": [{"path": "core.py"}], "isCrossRepository": True}]
+        with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "_run", return_value=json.dumps(rows)):
+            pull = publisher.github_pull_requests(repository)[0]
+        self.assertEqual((11, "Nitram1123", "passed", ("core.py",), True), (pull.number, pull.author, pull.checks, pull.files, pull.from_fork))
+
+    def test_every_starter_form_is_valid_and_editable_in_the_accessible_form(self):
+        repository = publisher.GitHubAddonRepository("demo", "me/demo", "https://github.com/me/demo", default_branch="main")
+        for starter in publisher.ISSUE_TEMPLATE_STARTERS:
+            with self.subTest(starter=starter):
+                template = publisher.new_issue_template(repository, starter, [])
+                document = publisher.parse_issue_template_document(template)
+                publisher.validate_issue_template_document(template, document)
+                self.assertTrue(publisher.issue_template_form_supported(template, document))
+                self.assertEqual("", template.sha)
+
+    def test_new_template_names_never_replace_an_existing_file(self):
+        repository = publisher.GitHubAddonRepository("demo", "me/demo", "https://github.com/me/demo", default_branch="main")
+        existing = [publisher.GitHubIssueTemplate(".github/ISSUE_TEMPLATE/translation.yml", "translation.yml", "sha")]
+        template = publisher.new_issue_template(repository, "Translation", existing)
+        self.assertEqual(".github/ISSUE_TEMPLATE/translation_2.yml", template.path)
+        with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "github_issue_templates", return_value=existing + [publisher.GitHubIssueTemplate(template.path, template.name, "sha2")]), mock.patch.object(publisher, "_run") as run:
+            with self.assertRaisesRegex(RuntimeError, "already exists"):
+                publisher.create_github_issue_template(repository, template, template.content)
+        run.assert_not_called()
+        with mock.patch.object(publisher, "gh_path", return_value="gh"), mock.patch.object(publisher, "github_issue_templates", return_value=existing), mock.patch.object(publisher, "_run", return_value="") as run:
+            publisher.create_github_issue_template(repository, template, template.content)
+        request = json.loads(run.call_args.kwargs["input_text"])
+        self.assertNotIn("sha", request); self.assertEqual("main", request["branch"])
 
 if __name__ == "__main__": unittest.main()

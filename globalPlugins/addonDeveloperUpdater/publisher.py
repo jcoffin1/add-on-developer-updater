@@ -5,10 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    from . import python_compatibility
+    from . import python_compatibility, translations
 except ImportError:
     # Unit tests and the build tool import these modules directly from their folder.
-    import python_compatibility
+    import python_compatibility, translations
 
 try:
     from ._vendor import yaml
@@ -146,6 +146,7 @@ class ProjectPublishInfo:
     license_name: str = ""
     license_url: str = ""
     release_notes: str = ""
+    translation_issues: tuple[str, ...] = ()
 
 @dataclass(frozen=True)
 class GitHubAddonRepository:
@@ -872,6 +873,67 @@ def _validated_repository(repository: GitHubAddonRepository) -> tuple[str, str]:
     if not repository.default_branch: raise RuntimeError(f"{repository.full_name} has no default branch")
     return repository.full_name, repository.default_branch
 
+@dataclass(frozen=True)
+class PullRequest:
+    number: int
+    title: str
+    author: str
+    url: str
+    head_branch: str
+    base_branch: str
+    head_sha: str
+    draft: bool
+    mergeable: str
+    checks: str
+    changed_files: int
+    additions: int
+    deletions: int
+    files: tuple[str, ...]
+    from_fork: bool
+
+def summarize_checks(rollup) -> str:
+    """Return 'none', 'passed', 'failed', or 'running' for a pull request's status checks."""
+    states = []
+    for check in rollup if isinstance(rollup, list) else []:
+        if not isinstance(check, dict): continue
+        result = str(check.get("conclusion") or check.get("state") or "").upper(); status = str(check.get("status") or "").upper()
+        if status and status != "COMPLETED" or result in {"PENDING", "EXPECTED", ""}: states.append("running")
+        elif result in {"SUCCESS", "NEUTRAL", "SKIPPED"}: states.append("passed")
+        else: states.append("failed")
+    if not states: return "none"
+    return "failed" if "failed" in states else ("running" if "running" in states else "passed")
+
+def github_pull_requests(repository: GitHubAddonRepository) -> list[PullRequest]:
+    """List a repository's open pull requests with what is needed to review and merge them."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository.full_name): raise RuntimeError("GitHub repository name is invalid")
+    fields = "number,title,author,url,headRefName,baseRefName,headRefOid,isDraft,mergeable,statusCheckRollup,changedFiles,additions,deletions,files,isCrossRepository"
+    rows = json.loads(_run([gh_path(), "pr", "list", "--repo", repository.full_name, "--state", "open", "--limit", "100", "--json", fields]) or "[]")
+    pulls = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict): continue
+        pulls.append(PullRequest(
+            int(row.get("number") or 0), str(row.get("title") or ""), str((row.get("author") or {}).get("login") or "unknown"), str(row.get("url") or ""),
+            str(row.get("headRefName") or ""), str(row.get("baseRefName") or ""), str(row.get("headRefOid") or ""), bool(row.get("isDraft")),
+            str(row.get("mergeable") or "UNKNOWN").upper(), summarize_checks(row.get("statusCheckRollup")), int(row.get("changedFiles") or 0),
+            int(row.get("additions") or 0), int(row.get("deletions") or 0), tuple(str(item.get("path") or "") for item in row.get("files") or [] if isinstance(item, dict)), bool(row.get("isCrossRepository")),
+        ))
+    return sorted(pulls, key=lambda pull: pull.number)
+
+def pull_request_merge_blocker(pull: PullRequest) -> str:
+    """Return why a pull request cannot be merged yet, or an empty string."""
+    if pull.draft: return "it is still a draft"
+    if pull.mergeable == "CONFLICTING": return "it conflicts with the current code; the conflicts must be resolved first"
+    if pull.checks == "failed": return "its automatic checks failed"
+    if pull.checks == "running": return "its automatic checks are still running"
+    if not re.fullmatch(r"[0-9a-f]{40}", pull.head_sha): return "GitHub did not report its latest commit"
+    return ""
+
+def merge_pull_request(repository: GitHubAddonRepository, pull: PullRequest, squash: bool = False) -> None:
+    """Merge a reviewed pull request only if its latest commit is still the one that was reviewed."""
+    blocker = pull_request_merge_blocker(pull)
+    if blocker: raise RuntimeError(f"Pull request {pull.number} cannot be merged because {blocker}")
+    _run([gh_path(), "pr", "merge", str(pull.number), "--repo", repository.full_name, "--squash" if squash else "--merge", "--match-head-commit", pull.head_sha], timeout=TRANSFER_TIMEOUT_SECONDS)
+
 def github_issue_templates(repository: GitHubAddonRepository) -> list[GitHubIssueTemplate]:
     """List editable issue-template files from a repository's default branch."""
     full_name, branch = _validated_repository(repository); gh = gh_path()
@@ -903,6 +965,123 @@ def update_github_issue_template(repository: GitHubAddonRepository, template: Gi
     encoded = content.encode("utf-8")
     if not encoded or len(encoded) > 1024 * 1024: raise RuntimeError("The issue template must contain between 1 byte and 1 MB of UTF-8 text")
     request = json.dumps({"message": f"Update {template.name} issue template", "content": base64.b64encode(encoded).decode("ascii"), "sha": template.sha, "branch": branch})
+    endpoint = f"repos/{full_name}/contents/{urllib.parse.quote(template.path, safe='/')}"
+    _run([gh_path(), "api", "-X", "PUT", endpoint, "--input", "-"], input_text=request)
+
+ISSUE_TEMPLATE_STARTERS = {
+    "Translation": ("translation.yml", """name: Translation
+description: Offer a new translation, update one, or report a translation mistake.
+title: "[Translation]: "
+body:
+  - type: markdown
+    attributes:
+      value: Thank you for helping translate this add-on. Translations are gettext files in the locale folder. You can open a pull request, or attach your translated nvda.po file to this issue.
+  - type: input
+    id: language
+    attributes:
+      label: Language
+      description: The language name and code, for example French (fr) or Brazilian Portuguese (pt_BR).
+    validations:
+      required: true
+  - type: dropdown
+    id: request
+    attributes:
+      label: What would you like to do?
+      options:
+        - Start a new translation
+        - Update an existing translation
+        - Report a translation mistake
+    validations:
+      required: true
+  - type: dropdown
+    id: delivery
+    attributes:
+      label: How will you send the translation?
+      options:
+        - I will open a pull request
+        - I will attach the nvda.po file to this issue
+        - I need help getting started
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Anything else we should know, such as text that was hard to translate or a mistake you found.
+  - type: input
+    id: credit
+    attributes:
+      label: Name for the credits
+      description: Optional. How you would like to be credited in the change log.
+"""),
+    "Bug report": ("bug_report.yml", """name: Bug report
+description: Report something in the add-on that does not work as expected.
+title: "[Bug]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe what you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: The add-on version, NVDA version, and Windows version.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: NVDA log
+      description: Optional. Paste the relevant part of the NVDA log.
+      render: text
+"""),
+    "Feature request": ("feature_request.yml", """name: Feature request
+description: Suggest a new feature or an improvement.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like the add-on to do?
+    validations:
+      required: true
+  - type: textarea
+    id: reason
+    attributes:
+      label: Why would it help?
+      description: Describe the situation where you would use it.
+"""),
+    "Blank form": ("new_form.yml", """name: New form
+description: Describe when people should use this form.
+body:
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+    validations:
+      required: true
+"""),
+}
+
+def new_issue_template(repository: GitHubAddonRepository, starter: str, existing: list[GitHubIssueTemplate]) -> GitHubIssueTemplate:
+    """Return an unsaved template from a starter, with a file name not already used in the repository."""
+    filename, content = ISSUE_TEMPLATE_STARTERS[starter]
+    taken = {template.name.casefold() for template in existing}; stem, suffix = filename.rsplit(".", 1); number = 2
+    while filename.casefold() in taken: filename = f"{stem}_{number}.{suffix}"; number += 1
+    return GitHubIssueTemplate(f".github/ISSUE_TEMPLATE/{filename}", filename, "", content)
+
+def create_github_issue_template(repository: GitHubAddonRepository, template: GitHubIssueTemplate, content: str) -> None:
+    """Create a new issue template file, refusing to replace one that already exists."""
+    full_name, branch = _validated_repository(repository)
+    prefix = ".github/ISSUE_TEMPLATE/"; relative = template.path[len(prefix):] if template.path.startswith(prefix) else ""
+    if template.sha or not relative or "/" in relative or "\\" in relative or Path(relative).suffix.casefold() not in {".md", ".yml", ".yaml"}: raise RuntimeError("The new issue template's file name is invalid")
+    if template.path in {item.path for item in github_issue_templates(repository)}: raise RuntimeError(f"{template.name} already exists; edit it instead")
+    encoded = content.encode("utf-8")
+    if not encoded or len(encoded) > 1024 * 1024: raise RuntimeError("The issue template must contain between 1 byte and 1 MB of UTF-8 text")
+    # Without a sha, GitHub's contents API creates the file and fails if it appeared meanwhile.
+    request = json.dumps({"message": f"Add {template.name} issue template", "content": base64.b64encode(encoded).decode("ascii"), "branch": branch})
     endpoint = f"repos/{full_name}/contents/{urllib.parse.quote(template.path, safe='/')}"
     _run([gh_path(), "api", "-X", "PUT", endpoint, "--input", "-"], input_text=request)
 
@@ -1235,7 +1414,7 @@ def preflight(projects, values_reader, progress=None, cancelled=None) -> list[Pr
                 matching_download, matching_verified, matching_error, _matching_issues = _verify_first_release_asset(matching_urls, metadata, api_versions, channel)
         license_name, license_url = detect_license(root, manifest.parent)
         notes = release_notes(root, manifest.parent, metadata.get("version", ""), metadata.get("changelog", ""))
-        reports.append(ProjectPublishInfo(project.project_id, project.name, str(manifest), str(root), metadata.get("version", ""), metadata.get("summary", project.name), metadata.get("author", ""), remote, changed, has_git, unpushed, normalized_version(github_release), release_download, owned, package_verified, package_error, guideline_issues, channel, default_branch, current_branch, matching_tag, matching_download, matching_verified, matching_error, matching_targets_head, unpushed_error, _source_fingerprint(root, has_git), license_name, license_url, notes))
+        reports.append(ProjectPublishInfo(project.project_id, project.name, str(manifest), str(root), metadata.get("version", ""), metadata.get("summary", project.name), metadata.get("author", ""), remote, changed, has_git, unpushed, normalized_version(github_release), release_download, owned, package_verified, package_error, guideline_issues, channel, default_branch, current_branch, matching_tag, matching_download, matching_verified, matching_error, matching_targets_head, unpushed_error, _source_fingerprint(root, has_git), license_name, license_url, notes, tuple(translations.publish_issues(manifest))))
     return reports
 
 def login() -> None:

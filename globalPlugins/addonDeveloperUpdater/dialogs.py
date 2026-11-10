@@ -145,15 +145,20 @@ class GitHubRepositoryUrlDialog(wx.Dialog):
         event.Skip()
 
 class GitHubSingleSelectionDialog(wx.Dialog):
-    def __init__(self, parent, title, instruction, items, choices, actionLabel):
+    def __init__(self, parent, title, instruction, items, choices, actionLabel, extraActionLabel=None):
         super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.items = items; self.onAction = None; mainSizer = wx.BoxSizer(wx.VERTICAL)
+        self.items = items; self.onAction = None; self.extraActionLabel = extraActionLabel; mainSizer = wx.BoxSizer(wx.VERTICAL)
         mainSizer.Add(wx.StaticText(self, label=instruction), 0, wx.ALL, 10)
         self.itemList = wx.ListBox(self, choices=choices, style=wx.LB_SINGLE)
         if choices: self.itemList.SetSelection(0)
         mainSizer.Add(self.itemList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
         buttons = wx.BoxSizer(wx.HORIZONTAL); self.actionButton = wx.Button(self, label=actionLabel); self.closeButton = wx.Button(self, label=_("&Close")); self.actionButton.SetDefault()
-        buttons.Add(self.actionButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
+        buttons.Add(self.actionButton, 0, wx.RIGHT, 8)
+        # A second action for the same selection, such as reviewing pull requests next to opening Issues.
+        self.extraButton = wx.Button(self, label=extraActionLabel) if extraActionLabel else None
+        if self.extraButton is not None: buttons.Add(self.extraButton, 0, wx.RIGHT, 8)
+        if not items: self.actionButton.Disable()
+        buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
         self.SetSizer(mainSizer); self.SetMinSize((650, 320)); self.SetSize((850, 480)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
     def selectedItem(self):
         index = self.itemList.GetSelection()
@@ -186,6 +191,7 @@ class IssueTemplateEditorDialog(wx.Dialog):
         mainSizer.Add(self.notebook, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
         buttons = wx.BoxSizer(wx.HORIZONTAL); self.saveButton = wx.Button(self, label=_("&Save to GitHub")); self.deleteButton = wx.Button(self, label=_("&Delete template")); self.closeButton = wx.Button(self, label=_("&Close without saving")); self.saveButton.SetDefault()
         buttons.Add(self.saveButton, 0, wx.RIGHT, 8); buttons.Add(self.deleteButton, 0, wx.RIGHT, 8); buttons.Add(self.closeButton, 0); mainSizer.Add(buttons, 0, wx.ALL, 10)
+        if not template.sha: self.deleteButton.Disable()  # A new template does not exist on GitHub yet.
         self.SetSizer(mainSizer); self.SetMinSize((760, 540)); self.SetSize((1050, 760)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
     def _addLabeled(self, panel, sizer, label, control):
         labelControl = wx.StaticText(panel, label=label); labelControl.Wrap(380); control.SetName(label.replace("&", "").rstrip(":")); sizer.Add(labelControl, 0, wx.ALIGN_CENTER_VERTICAL); sizer.Add(control, 1, wx.EXPAND)
@@ -448,6 +454,57 @@ class ManageTrackingDialog(wx.Dialog):
         if listFocused and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             if self.onSave is not None: self.onSave()
             return
+        event.Skip()
+
+def pullRequestLabel(pull):
+    """Describe a pull request in one line, most important facts first."""
+    checks = {"passed": _("checks passed"), "failed": _("checks failed"), "running": _("checks still running"), "none": _("no automatic checks")}[pull.checks]
+    merge = {"MERGEABLE": _("can be merged"), "CONFLICTING": _("has conflicts that must be resolved first")}.get(pull.mergeable, _("GitHub is still checking whether it can be merged"))
+    origin = _(", from their own copy of the repository") if pull.from_fork else ""
+    draft = _("draft; ") if pull.draft else ""
+    return _("#%d %s, by %s%s; %s%d files changed, %d lines added, %d removed; %s; %s; branch %s into %s") % (pull.number, pull.title, pull.author, origin, draft, pull.changed_files, pull.additions, pull.deletions, checks, merge, pull.head_branch, pull.base_branch)
+
+class PullRequestDialog(wx.Dialog):
+    """List a repository's open pull requests and offer to open or merge the selected one."""
+    def __init__(self, parent, repository, pulls):
+        super().__init__(parent, title=_("Pull requests for %s") % repository.full_name, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.pulls = pulls; self.onOpen = None; self.onMerge = None
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        instructions = wx.StaticText(self, label=_("Open pull requests, oldest first. Each line gives the title, author, size, whether the automatic checks passed, and whether it can be merged. Open it in your browser to read the changes before merging. Merging adds the changes to the repository on GitHub; your own copy on this computer gets them the next time you pull."))
+        instructions.Wrap(900); sizer.Add(instructions, 0, wx.ALL, 10)
+        self.pullList = wx.ListBox(self, choices=[pullRequestLabel(pull) for pull in pulls], style=wx.LB_SINGLE); self.pullList.SetName(_("Open pull requests"))
+        if pulls: self.pullList.SetSelection(0)
+        sizer.Add(self.pullList, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        buttons = wx.BoxSizer(wx.HORIZONTAL)
+        self.openButton = wx.Button(self, label=_("&Open in browser")); self.mergeButton = wx.Button(self, label=_("&Merge")); self.squashButton = wx.Button(self, label=_("&Squash and merge")); self.closeButton = wx.Button(self, label=_("C&lose")); self.openButton.SetDefault()
+        for button in (self.openButton, self.mergeButton, self.squashButton): buttons.Add(button, 0, wx.RIGHT, 8)
+        buttons.Add(self.closeButton, 0); sizer.Add(buttons, 0, wx.ALL, 10)
+        self.SetSizer(sizer); self.SetMinSize((700, 360)); self.SetSize((1000, 520)); self.CentreOnScreen(); self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
+    def selectedPull(self):
+        index = self.pullList.GetSelection()
+        return self.pulls[index] if index != wx.NOT_FOUND else None
+    def _onKey(self, event):
+        key = event.GetKeyCode()
+        if key == wx.WXK_ESCAPE: self.Close(); return
+        if self.pullList.HasFocus() and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if self.onOpen is not None: self.onOpen()
+            return
+        event.Skip()
+
+class TranslationReportDialog(wx.Dialog):
+    """Show an add-on's translation report with the actions that can fix it."""
+    def __init__(self, parent, title, message, canCompile, canWriteTemplate):
+        super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        sizer = wx.BoxSizer(wx.VERTICAL); self.message = _messageField(self, message); sizer.Add(self.message, 1, wx.EXPAND | wx.ALL, 15)
+        buttons = wx.BoxSizer(wx.HORIZONTAL)
+        self.compileButton = wx.Button(self, label=_("&Compile translations")); self.templateButton = wx.Button(self, label=_("Create or &update translation template")); self.closeButton = wx.Button(self, label=_("C&lose"))
+        self.compileButton.Enable(canCompile); self.templateButton.Enable(canWriteTemplate)
+        for button in (self.compileButton, self.templateButton): buttons.Add(button, 0, wx.RIGHT, 8)
+        buttons.Add(self.closeButton, 0); sizer.Add(buttons, 0, wx.ALL, 15)
+        self.SetSizer(sizer); self.SetMinSize((600, 320)); self.SetSize((800, 520)); self.CentreOnScreen()
+        self.Bind(wx.EVT_CHAR_HOOK, self._onKey)
+    def _onKey(self, event):
+        if event.GetKeyCode() == wx.WXK_ESCAPE: self.Close(); return
         event.Skip()
 
 def _messageField(parent, message):

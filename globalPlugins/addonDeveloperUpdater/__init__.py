@@ -7,9 +7,9 @@ from pathlib import Path
 import addonHandler, api, config, globalPluginHandler, globalVars, gui, scriptHandler, tones, ui, wx
 from gui.settingsDialogs import SettingsPanel
 from logHandler import log
-from . import engine, publisher
+from . import engine, publisher, translations
 from .dialogs import (
-    _projectDisplayName, UpdateReviewDialog, ProjectApprovalDialog, GitHubPublishDialog, StoreSubmissionDialog, GitHubRepositoryUrlDialog, GitHubSingleSelectionDialog, IssueTemplateEditorDialog, CompatibilityTargetDialog, ScanTargetDialog, ConfirmationDialog, InformationDialog, OperationProgressDialog, ManageTrackingDialog,
+    _projectDisplayName, UpdateReviewDialog, ProjectApprovalDialog, GitHubPublishDialog, StoreSubmissionDialog, GitHubRepositoryUrlDialog, GitHubSingleSelectionDialog, IssueTemplateEditorDialog, CompatibilityTargetDialog, ScanTargetDialog, ConfirmationDialog, InformationDialog, OperationProgressDialog, ManageTrackingDialog, TranslationReportDialog, PullRequestDialog,
 )
 
 addonHandler.initTranslation()
@@ -55,7 +55,7 @@ class UpdaterSettingsPanel(SettingsPanel):
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     activeInstance = None
     def __init__(self):
-        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._manifestThread = None; self._progressDialog = None; self._progressValue = 0; self._progressDeterminate = False; self._scanTargetDialog = None; self._reviewDialog = None; self._approvalDialog = None; self._publishDialog = None; self._storeDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._githubSelectionAction = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None; self._manageDialog = None
+        super().__init__(); self._shutdown = threading.Event(); self._scanCancel = threading.Event(); self._scanActive = threading.Event(); self._wakeMonitor = threading.Event(); self._scanLock = threading.Lock(); self._progressStop = threading.Event(); self._progressThread = None; self._manifestThread = None; self._progressDialog = None; self._progressValue = 0; self._progressDeterminate = False; self._scanTargetDialog = None; self._reviewDialog = None; self._approvalDialog = None; self._publishDialog = None; self._storeDialog = None; self._repositoryDialog = None; self._githubSelectionDialog = None; self._githubSelectionAction = None; self._templateEditorDialog = None; self._downgradeDialog = None; self._confirmDialog = None; self._informationDialog = None; self._workerProcess = None; self._manageDialog = None; self._translationDialog = None; self._translationChoiceDialog = None; self._pullRequestDialog = None
         config_path = Path(globalVars.appArgs.configPath); self._statePath = config_path / "addonDeveloperUpdaterState.json"; self._releaseCachePath = config_path / "addonDeveloperUpdaterReleaseCache.json"; self._apiVersionCachePath = config_path / "addonDeveloperUpdaterApiVersions.json"; self._backupRoot = config_path / "addonDeveloperUpdaterBackups"
         if config.conf["addonDeveloperUpdater"]["intervalMinutes"] < 15: config.conf["addonDeveloperUpdater"]["intervalMinutes"] = 15
         if UpdaterSettingsPanel not in gui.settingsDialogs.NVDASettingsDialog.categoryClasses: gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(UpdaterSettingsPanel)
@@ -153,6 +153,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self._informationDialog.Destroy(); self._informationDialog = None
         if self._manageDialog is not None:
             self._manageDialog.Destroy(); self._manageDialog = None
+        for attribute in ("_translationDialog", "_translationChoiceDialog", "_pullRequestDialog"):
+            if getattr(self, attribute) is not None: getattr(self, attribute).Destroy(); setattr(self, attribute, None)
         if self._monitor is not None and self._monitor.is_alive() and threading.current_thread() is not self._monitor: self._monitor.join(timeout=2)
         try: gui.settingsDialogs.NVDASettingsDialog.categoryClasses.remove(UpdaterSettingsPanel)
         except ValueError: pass
@@ -611,6 +613,89 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if callback is not None: self._finishProgressThen(callback, *arguments)
     @scriptHandler.script(description=_("Open the Issues page for an NVDA add-on repository"), gesture="kb:NVDA+alt+shift+i", category=SCRIPT_CATEGORY)
     def script_openGitHubAddonIssues(self, gesture): self._beginGitHubProjectAction("issues")
+    @scriptHandler.script(description=_("Check translations for a tracked add-on"), gesture="kb:NVDA+alt+shift+k", category=SCRIPT_CATEGORY)
+    def script_checkAddonTranslations(self, gesture):
+        if self._translationDialog is not None: self._translationDialog.Raise(); self._translationDialog.message.SetFocus(); return
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Loading tracked add-ons")); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._loadTranslationProjects, name="addonDeveloperTranslationProjects", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start loading tracked add-ons"); ui.message(_("Tracked add-ons could not be loaded"))
+    def _trackedNewestProjects(self):
+        """Return the newest tracked copy of each add-on, with its public name; call on a worker thread."""
+        state = engine.read_json(self._statePath, {}); approved = engine.approved_project_ids(state); projects = []
+        for item in engine.newest_local_project_records(engine.visible_project_records(state)[0])[0]:
+            result = engine.project_result_from_record(item) if isinstance(item, dict) and item.get("project_id") in approved else None
+            if result is None or not Path(result.path).is_file(): continue
+            metadata = engine.values(Path(result.path)); result.summary = metadata.get("summary", result.summary); result.addon_version = metadata.get("version", result.addon_version); projects.append(result)
+        return sorted(projects, key=lambda result: (result.summary or result.name).casefold())
+    def _loadTranslationProjects(self):
+        callback = None; arguments = ()
+        try:
+            projects = self._trackedNewestProjects()
+            if not projects: callback, arguments = self._showInformation, (_("No tracked add-ons"), _("No add-ons are tracked yet. Press NVDA+Alt+Shift+U to search for add-ons, then check the ones you develop."))
+            elif len(projects) == 1: callback, arguments = self._beginTranslationCheck, (projects[0],)
+            else: callback, arguments = self._showTranslationProjectChoice, (projects,)
+        except Exception as error:
+            log.exception("Tracked add-ons could not be loaded"); callback, arguments = self._showInformation, (_("Tracked add-ons could not be loaded"), _("Tracked add-ons could not be loaded: %s") % error)
+        finally:
+            self._scanLock.release(); self._finishProgressThen(callback, *arguments) if callback is not None else self._stopProgress()
+    def _showTranslationProjectChoice(self, projects):
+        if self._translationChoiceDialog is not None: self._translationChoiceDialog.Raise(); return
+        choices = [_("%s %s; folder %s") % (project.summary or project.name, project.addon_version, Path(project.path).parent) for project in projects]
+        dialog = GitHubSingleSelectionDialog(gui.mainFrame, _("Choose an add-on to check translations"), _("Select a tracked add-on and press Enter to check its translations."), projects, choices, _("&Check translations")); self._translationChoiceDialog = dialog
+        def close(_event=None):
+            if self._translationChoiceDialog is dialog: self._translationChoiceDialog = None
+            dialog.Destroy()
+        def choose(_event=None):
+            project = dialog.selectedItem()
+            if project is None: ui.message(_("No add-on is selected")); return
+            close(); self._beginTranslationCheck(project)
+        dialog.onAction = choose; dialog.actionButton.Bind(wx.EVT_BUTTON, choose); dialog.itemList.Bind(wx.EVT_LISTBOX_DCLICK, choose); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
+        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.itemList.SetFocus)
+    def _beginTranslationCheck(self, project, action=None):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message({"compile": _("Compiling translations"), "template": _("Writing the translation template")}.get(action, _("Checking translations"))); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._checkTranslations, args=(project, action), name="addonDeveloperTranslations", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start the translation check"); ui.message(_("Translations could not be checked"))
+    def _checkTranslations(self, project, action):
+        callback = None; arguments = ()
+        try:
+            manifest = Path(project.path); name = project.summary or project.name; done = ""
+            if action == "compile":
+                compiled = [translations.compile_catalog(path) for path in sorted((manifest.parent / "locale").glob("*/LC_MESSAGES/nvda.po"))]
+                done = ngettext("Compiled %d language: %s.", "Compiled %d languages: %s.", len(compiled)) % (len(compiled), ", ".join(path.parents[1].name for path in compiled))
+            elif action == "template":
+                messages = translations.extract_messages(manifest.parent); metadata = engine.values(manifest)
+                target = translations.find_template(manifest.parent) or manifest.parent / "locale" / f"{metadata.get('name', 'addon')}.pot"
+                target.parent.mkdir(parents=True, exist_ok=True); target.write_text(translations.render_template(messages, f"{name} {metadata.get('version', '')}".strip()), encoding="utf-8", newline="\n")
+                done = ngettext("Wrote the translation template %s with %d string.", "Wrote the translation template %s with %d strings.", len(messages)) % (target, len(messages))
+            report = translations.check_project(manifest, publisher.project_root(manifest), name)
+            callback, arguments = self._showTranslationReport, (project, report, done)
+        except Exception as error:
+            log.exception("Translation check failed"); callback, arguments = self._showInformation, (_("Translations could not be checked"), _("Translations for %s could not be checked: %s") % (project.summary or project.name, error))
+        finally:
+            self._scanLock.release(); self._finishProgressThen(callback, *arguments) if callback is not None else self._stopProgress()
+    def _showTranslationReport(self, project, report, done=""):
+        if self._translationDialog is not None:
+            old = self._translationDialog; self._translationDialog = None; old.Destroy()
+        summary, details = translations.report_lines(report, _)
+        # After an action, its outcome is the first line; the report follows.
+        message = engine.readable_message(done, [summary, ""] + details) if done else engine.readable_message(summary, details)
+        dialog = TranslationReportDialog(gui.mainFrame, _("Translations: %s") % report.name, message, bool(report.languages), not report.template_tool); self._translationDialog = dialog
+        def close(_event=None):
+            if self._translationDialog is dialog: self._translationDialog = None
+            dialog.Destroy()
+        def compileAll(_event=None):
+            languages = ", ".join(language.language for language in report.languages)
+            text = engine.readable_message(ngettext("Compile %d language for %s?", "Compile %d languages for %s?", len(report.languages)) % (len(report.languages), report.name), [_("Languages: %s") % languages, _("Each language's nvda.mo is rebuilt from its nvda.po, the same way gettext's msgfmt does it. Only nvda.mo files in the locale folder change.")], _("Yes compiles. No changes nothing."))
+            self._showConfirmation(_("Compile translations"), text, lambda: (close(), self._beginTranslationCheck(project, "compile")))
+        def writeTemplate(_event=None):
+            text = engine.readable_message(_("Create or update the translation template for %s?") % report.name, [ngettext("It will list %d translatable string found in the add-on's code, with translator comments and source locations.", "It will list %d translatable strings found in the add-on's code, with translator comments and source locations.", report.source_strings) % report.source_strings, _("Existing translations are not changed. Translators use the template to find new and changed text.")], _("Yes writes the template. No changes nothing."))
+            self._showConfirmation(_("Translation template"), text, lambda: (close(), self._beginTranslationCheck(project, "template")))
+        dialog.compileButton.Bind(wx.EVT_BUTTON, compileAll); dialog.templateButton.Bind(wx.EVT_BUTTON, writeTemplate); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
+        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.message.SetFocus)
     @scriptHandler.script(description=_("Edit a GitHub issue template for an NVDA add-on repository"), gesture="kb:NVDA+alt+shift+t", category=SCRIPT_CATEGORY)
     def script_editGitHubAddonIssueTemplate(self, gesture): self._beginGitHubProjectAction("templates")
     def _beginGitHubProjectAction(self, action):
@@ -653,7 +738,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         title = _("Open an add-on repository's Issues page") if action == "issues" else _("Choose a repository whose issue template should be edited")
         instruction = _("Select a repository owned by %s. Press Enter to continue or Escape to close.") % owner
         actionLabel = _("&Open Issues") if action == "issues" else _("&Choose repository")
-        dialog = GitHubSingleSelectionDialog(gui.mainFrame, title, instruction, repositories, choices, actionLabel); self._githubSelectionDialog = dialog; self._githubSelectionAction = action
+        if action == "issues": title = _("Open an add-on repository's Issues or pull requests"); instruction = _("Select a repository owned by %s. Press Enter to open its Issues page, or choose Review pull requests. Escape closes.") % owner
+        dialog = GitHubSingleSelectionDialog(gui.mainFrame, title, instruction, repositories, choices, actionLabel, _("Review &pull requests") if action == "issues" else None); self._githubSelectionDialog = dialog; self._githubSelectionAction = action
         def close(_event=None):
             if self._githubSelectionDialog is dialog: self._githubSelectionDialog = None; self._githubSelectionAction = None
             dialog.Destroy()
@@ -666,8 +752,78 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             else:
                 if repository.archived: ui.message(_("%s is archived and its issue templates cannot be changed") % repository.full_name); return
                 close(); self._beginIssueTemplateLookup(repository)
+        def reviewPulls(_event=None):
+            repository = dialog.selectedItem()
+            if repository is None: ui.message(_("No repository is selected")); return
+            close(); self._beginPullRequestLookup(repository)
+        if dialog.extraButton is not None: dialog.extraButton.Bind(wx.EVT_BUTTON, reviewPulls)
         dialog.onAction = act; dialog.actionButton.Bind(wx.EVT_BUTTON, act); dialog.itemList.Bind(wx.EVT_LISTBOX_DCLICK, act); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
         dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.itemList.SetFocus)
+    def _beginPullRequestLookup(self, repository):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Loading open pull requests for %s") % repository.full_name); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._loadPullRequests, args=(repository,), name="addonDeveloperPullRequests", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start loading pull requests"); ui.message(_("Pull requests could not be loaded"))
+    def _loadPullRequests(self, repository, done=""):
+        callback = None; arguments = ()
+        try:
+            pulls = publisher.github_pull_requests(repository)
+            if pulls: callback, arguments = self._showPullRequestDialog, (repository, pulls, done)
+            else: callback, arguments = self._showInformation, (_("No open pull requests"), engine.readable_message(done or _("%s has no open pull requests.") % repository.full_name, [_("%s has no open pull requests left.") % repository.full_name] if done else []))
+        except publisher.GitHubCliRequired:
+            callback, arguments = self._offerGitHubCliInstall, ()
+        except publisher.AuthenticationRequired:
+            callback, arguments = self._offerGitHubProjectLogin, ("issues",)
+        except Exception as error:
+            log.exception("Pull request lookup failed"); callback, arguments = self._showInformation, (_("Pull requests could not be loaded"), _("Open pull requests for %s could not be loaded: %s") % (repository.full_name, error))
+        finally:
+            self._scanLock.release(); self._finishProgressThen(callback, *arguments) if callback is not None else self._stopProgress()
+    def _showPullRequestDialog(self, repository, pulls, done=""):
+        if self._pullRequestDialog is not None:
+            old = self._pullRequestDialog; self._pullRequestDialog = None; old.Destroy()
+        dialog = PullRequestDialog(gui.mainFrame, repository, pulls); self._pullRequestDialog = dialog
+        if done: ui.message(done)
+        def close(_event=None):
+            if self._pullRequestDialog is dialog: self._pullRequestDialog = None
+            dialog.Destroy()
+        def openPull(_event=None):
+            pull = dialog.selectedPull()
+            if pull is None: ui.message(_("No pull request is selected")); return
+            self._openGitHubUrl(pull.url, _("pull request %d") % pull.number)
+        def mergePull(squash):
+            pull = dialog.selectedPull()
+            if pull is None: ui.message(_("No pull request is selected")); return
+            blocker = publisher.pull_request_merge_blocker(pull)
+            if blocker: self._showInformation(_("Pull request cannot be merged yet"), engine.readable_message(_("Pull request %d cannot be merged yet.") % pull.number, [_("Reason: %s.") % blocker, _("Open it in your browser to see the details.")])); return
+            files = list(pull.files[:15]) + ([_("and %d more files") % (len(pull.files) - 15)] if len(pull.files) > 15 else [])
+            method = _("Squash its commits into one commit and merge it") if squash else _("Merge its commits")
+            details = [_("Title: %s") % pull.title, _("Author: %s") % pull.author, _("Branch %s into %s") % (pull.head_branch, pull.base_branch), _("%d files changed, %d lines added, %d removed:") % (pull.changed_files, pull.additions, pull.deletions)] + files
+            details += ["", _("%s into %s on GitHub. The merge is refused if anyone changed the pull request since this list was loaded. Your own copy on this computer gets the changes the next time you pull.") % (method, pull.base_branch)]
+            message = engine.readable_message(_("Merge pull request %d into %s?") % (pull.number, repository.full_name), details, _("Yes merges. No changes nothing."))
+            self._showConfirmation(_("Merge pull request"), message, lambda: (close(), self._beginPullRequestMerge(repository, pull, squash)))
+        dialog.onOpen = openPull; dialog.openButton.Bind(wx.EVT_BUTTON, openPull); dialog.mergeButton.Bind(wx.EVT_BUTTON, lambda _event: mergePull(False)); dialog.squashButton.Bind(wx.EVT_BUTTON, lambda _event: mergePull(True)); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
+        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.pullList.SetFocus)
+    def _beginPullRequestMerge(self, repository, pull, squash):
+        if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
+        ui.message(_("Merging pull request %d") % pull.number); self._startProgress(keepFocus=True)
+        try: threading.Thread(target=self._mergePullRequest, args=(repository, pull, squash), name="addonDeveloperPullRequestMerge", daemon=True).start()
+        except Exception:
+            self._stopProgress(); self._scanLock.release(); log.exception("Could not start the merge"); ui.message(_("The pull request could not be merged"))
+    def _mergePullRequest(self, repository, pull, squash):
+        merged = False; message = ""
+        try:
+            publisher.merge_pull_request(repository, pull, squash); merged = True
+            message = _("Merged pull request %d, %s, into %s.") % (pull.number, pull.title, pull.base_branch)
+        except Exception as error:
+            log.exception("Pull request merge failed"); message = engine.readable_message(_("Pull request %d was not merged.") % pull.number, [_("Reason: %s") % error, _("Nothing was changed on GitHub.")])
+        self._scanLock.release()
+        # After a merge the list is reloaded, so the next pull request can be reviewed straight away.
+        if merged: self._loadPullRequestsAfterMerge(repository, message)
+        else: self._finishProgressThen(self._showInformation, _("Merge failed"), message)
+    def _loadPullRequestsAfterMerge(self, repository, done):
+        if not self._scanLock.acquire(blocking=False): self._finishProgressThen(self._showInformation, _("Pull request merged"), done); return
+        self._loadPullRequests(repository, done)
     def _openGitHubUrl(self, url, repositoryName):
         def launch():
             try:
@@ -690,8 +846,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         callback = None; arguments = ()
         try:
             templates = publisher.github_issue_templates(repository)
-            if templates: callback, arguments = self._showIssueTemplateDialog, (repository, templates)
-            else: callback, arguments = self._showInformation, (_("No issue templates found"), _("%s has no editable Markdown or YAML files in .github/ISSUE_TEMPLATE on its default branch.") % repository.full_name)
+            # Shown even when empty, so a first form such as a Translation form can be created.
+            callback, arguments = self._showIssueTemplateDialog, (repository, templates)
         except Exception as error:
             log.exception("Issue-template lookup failed"); callback, arguments = self._showInformation, (_("Issue-template lookup failed"), _("Issue templates for %s could not be loaded: %s") % (repository.full_name, error))
         finally:
@@ -699,7 +855,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if callback is not None: self._finishProgressThen(callback, *arguments)
     def _showIssueTemplateDialog(self, repository, templates):
         choices = [_('%s; path %s') % (template.name, template.path) for template in templates]
-        dialog = GitHubSingleSelectionDialog(gui.mainFrame, _("Choose a GitHub issue template"), _("Select an issue template from %s and press Enter to edit it.") % repository.full_name, templates, choices, _("&Edit template")); self._githubSelectionDialog = dialog; self._githubSelectionAction = "template-file"
+        instruction = _("Select an issue template from %s and press Enter to edit it, or choose Create new template.") % repository.full_name if templates else _("%s has no issue templates yet. Choose Create new template to add one, such as a Translation form.") % repository.full_name
+        dialog = GitHubSingleSelectionDialog(gui.mainFrame, _("Choose a GitHub issue template"), instruction, templates, choices, _("&Edit template"), _("Create &new template")); self._githubSelectionDialog = dialog; self._githubSelectionAction = "template-file"
+        def create(_event=None):
+            close(); self._chooseIssueTemplateStarter(repository, templates)
+        dialog.extraButton.Bind(wx.EVT_BUTTON, create)
         def close(_event=None):
             if self._githubSelectionDialog is dialog: self._githubSelectionDialog = None; self._githubSelectionAction = None
             dialog.Destroy()
@@ -708,6 +868,22 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if template is None: ui.message(_("No issue template is selected")); return
             close(); self._beginIssueTemplateLoad(repository, template)
         dialog.onAction = edit; dialog.actionButton.Bind(wx.EVT_BUTTON, edit); dialog.itemList.Bind(wx.EVT_LISTBOX_DCLICK, edit); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
+        dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.itemList.SetFocus)
+    def _chooseIssueTemplateStarter(self, repository, templates):
+        starters = list(publisher.ISSUE_TEMPLATE_STARTERS)
+        descriptions = {"Translation": _("Translation: for people offering or updating a translation"), "Bug report": _("Bug report: for problems in the add-on"), "Feature request": _("Feature request: for ideas and improvements"), "Blank form": _("Blank form: start from one question")}
+        dialog = GitHubSingleSelectionDialog(gui.mainFrame, _("Create a new issue template"), _("Choose a starting point for the new form in %s. You can change every part of it before it is saved.") % repository.full_name, starters, [descriptions[starter] for starter in starters], _("&Start editing")); self._githubSelectionDialog = dialog; self._githubSelectionAction = "template-starter"
+        def close(_event=None):
+            if self._githubSelectionDialog is dialog: self._githubSelectionDialog = None; self._githubSelectionAction = None
+            dialog.Destroy()
+        def start(_event=None):
+            starter = dialog.selectedItem()
+            if starter is None: ui.message(_("No starting point is selected")); return
+            template = publisher.new_issue_template(repository, starter, templates)
+            try: document = publisher.parse_issue_template_document(template)
+            except (TypeError, ValueError): document = None
+            close(); self._showIssueTemplateEditor(repository, template, document)
+        dialog.onAction = start; dialog.actionButton.Bind(wx.EVT_BUTTON, start); dialog.itemList.Bind(wx.EVT_LISTBOX_DCLICK, start); dialog.closeButton.Bind(wx.EVT_BUTTON, close); dialog.Bind(wx.EVT_CLOSE, close)
         dialog.Show(); dialog.Raise(); wx.CallAfter(dialog.itemList.SetFocus)
     def _beginIssueTemplateLoad(self, repository, template):
         if not self._scanLock.acquire(blocking=False): ui.message(_("An add-on developer operation is already running")); return
@@ -735,7 +911,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             dialog.Destroy()
         def save(_event=None):
             content = dialog.getContent()
-            if content == template.content: ui.message(_("The issue template has not changed")); return
+            # A new template may be saved unchanged; an existing one must have changes.
+            if template.sha and content == template.content: ui.message(_("The issue template has not changed")); return
             if not content: ui.message(_("The issue template cannot be empty")); return
             self._beginIssueTemplateSaveValidation(repository, template, content, dialog)
         def delete(_event=None):
@@ -764,7 +941,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         dialog.Enable()
         if not valid:
             dialog.Raise(); dialog.initialFocus().SetFocus(); self._showInformation(_("Issue template is not valid"), _("The issue template was not saved: %s") % errorMessage); return
-        message = _("Commit these changes to %s on its %s branch? The existing file will be updated only if it has not changed on GitHub since it was loaded.") % (repository.full_name, repository.default_branch)
+        message = _("Commit these changes to %s on its %s branch? The existing file will be updated only if it has not changed on GitHub since it was loaded.") % (repository.full_name, repository.default_branch) if template.sha else _("Create %s in %s on its %s branch? It will appear in GitHub's New Issue menu.") % (template.name, repository.full_name, repository.default_branch)
         self._showConfirmation(_("Save issue template to GitHub"), message, lambda: self._startIssueTemplateSave(repository, template, content, dialog))
     def _startIssueTemplateSave(self, repository, template, content, dialog):
         if self._templateEditorDialog is not dialog: return
@@ -776,7 +953,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _saveIssueTemplate(self, repository, template, content, dialog):
         succeeded = False; message = ""
         try:
-            publisher.update_github_issue_template(repository, template, content); succeeded = True; message = _("Saved %s to %s on branch %s.") % (template.name, repository.full_name, repository.default_branch)
+            if template.sha: publisher.update_github_issue_template(repository, template, content); message = _("Saved %s to %s on branch %s.") % (template.name, repository.full_name, repository.default_branch)
+            else: publisher.create_github_issue_template(repository, template, content); message = _("Created %s in %s on branch %s. It now appears in GitHub's New Issue menu.") % (template.name, repository.full_name, repository.default_branch)
+            succeeded = True
         except Exception as error:
             log.exception("Issue-template save failed"); message = _("The issue template was not saved: %s") % error
         finally:
@@ -1227,6 +1406,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         if withoutNotes:
             details += ["", _("No release notes found for: %s") % ", ".join(_("%s %s") % (publisher.public_name(report), report.version) for report in withoutNotes),
                         _("Their GitHub Release would say only that it is a release package. To add notes, choose No, add a section named after the version to CHANGELOG.md, and publish again.")]
+        translationIssues = [_("%s: %s") % (publisher.public_name(report), issue) for report in reports for issue in getattr(report, "translation_issues", ())]
+        if translationIssues: details += ["", _("Translation problems that would ship in a release; press NVDA+Alt+Shift+K to fix them:")] + translationIssues
         if skipped: details += [""] + skipped
         details += ["", _("A GitHub Release is created only after its commit is on the repository's default branch.")]
         message = engine.readable_message(summary, details, _("Yes publishes. No changes nothing."))

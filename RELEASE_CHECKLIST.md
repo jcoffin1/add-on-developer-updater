@@ -48,6 +48,9 @@ Automated checks catch packaging and logic regressions. Complete this manual che
 - Publish a project whose minimumNVDAVersion is 2025.3 with a Python 3.12-only f-string; confirm publishing stops before pushing and names the file and line. Confirm the notes warning appears when CHANGELOG.md has no section for the new version.
 - Confirm a new release uses the matching CHANGELOG.md section as its notes, and a builder without a Version parameter still produces a verified package.
 - Open a Store form for GPL, MIT, and unlicensed projects; confirm publisher and license fields, the blank-license warning, and the settings overrides.
+- With NVDA+Alt+Shift+I, choose Review pull requests on a disposable repository: confirm each line, Enter opens the page, a draft, conflicting, or failing pull request is explained, a merge shows the changed files, and the list reloads afterward.
+- With NVDA+Alt+Shift+T on a repository without templates, create a Translation form; confirm it opens in the editor, Delete is unavailable, and it is created once.
+- With NVDA+Alt+Shift+K, check an add-on with translations; confirm counts, problems, and the compile and template actions, and that a project with its own template tool is not overridden.
 - Verify an unknown upstream/default-branch comparison blocks Store readiness, and verify unsafe or ambiguous package paths are rejected.
 
 - Test signed-in, signed-out, offline, inaccessible-repository, and disabled-Issues cases. Confirm every signed-out GitHub entry point, including store readiness, offers device sign-in and retries the original operation.
